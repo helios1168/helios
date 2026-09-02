@@ -1,0 +1,373 @@
+# optimization — foundational papers
+
+**Seeded:** 2026-09-02 · **Entries:** 113 · **DOIs resolved:** 105/105 via Crossref
+
+How to use: `/domain optimization` cites only from this file; every DOI below was resolved against the Crossref API on the seed date, so author-year strings and titles can be cited without re-searching.
+Entries marked `DOI: none (book)` or `none (book chapter)` have no DOI on record; anything not in this file is unverified and needs a fresh lookup before it is cited. Section 8 is copied verbatim (DOIs, establishes, relevance) from `/Users/ntlee/projects/td/literature/territory_bibliography.md` and re-checked here; sections 1–7 point to it rather than duplicating its entries.
+
+## 1. Linear programming and duality
+
+- **Farkas1902** — Farkas, J. (1902). *Theorie der einfachen Ungleichungen*. Journal für die reine und angewandte Mathematik 124, 1–27. DOI: 10.1515/crll.1902.124.1
+  - *establishes:* Farkas' lemma — a system of linear inequalities is infeasible exactly when a nonnegative combination of them yields a contradiction — which is the theorem of the alternative underlying LP duality.
+  - *relevance:* Every infeasibility certificate a solver returns for an over-constrained territory balance or allocation model is a Farkas vector; reading it tells you which constraints to relax.
+- **Dantzig1951** — Dantzig, G. B. (1951). *Maximization of a linear function of variables subject to linear inequalities*. In T. C. Koopmans (ed.), Activity Analysis of Production and Allocation, Cowles Commission Monograph 13, Wiley, ch. XXI, 339–347. DOI: none (book chapter)
+  - *establishes:* The simplex method: move between adjacent vertices of the feasible polyhedron along improving edges until no improving edge exists.
+  - *relevance:* Still the workhorse for the LP relaxations solved millions of times inside a branch-and-bound tree, and the algorithm whose dual form makes reoptimisation after a branch cheap.
+- **GaleKuhnTucker1951** — Gale, D., Kuhn, H. W. & Tucker, A. W. (1951). *Linear programming and the theory of games*. In T. C. Koopmans (ed.), Activity Analysis of Production and Allocation, Cowles Commission Monograph 13, Wiley, ch. XIX, 317–329. DOI: none (book chapter)
+  - *establishes:* The first published proof of the LP duality theorem, together with its equivalence to von Neumann's minimax theorem for zero-sum games.
+  - *relevance:* Duality is what turns a resource-allocation LP's shadow prices into defensible transfer prices or marginal values of one more unit of sales capacity, budget or capital.
+- **DantzigWolfe1960** — Dantzig, G. B. & Wolfe, P. (1960). *Decomposition Principle for Linear Programs*. Operations Research 8(1), 101–111. DOI: 10.1287/opre.8.1.101
+  - *establishes:* Dantzig–Wolfe decomposition: reformulate a block-angular LP as a master over convex combinations of subproblem extreme points, generating columns by pricing.
+  - *relevance:* The template for decomposing multi-region or multi-product allocation models whose blocks are only coupled by a few shared resource constraints, and the ancestor of branch-and-price for territory set-partitioning models.
+- **Dantzig1963** — Dantzig, G. B. (1963). *Linear Programming and Extensions*. Princeton University Press. DOI: 10.1515/9781400884179
+  - *establishes:* The canonical book-length treatment of the simplex method, duality, degeneracy, the transportation problem, and early stochastic and integer extensions.
+  - *relevance:* The standard reference to cite for the LP machinery beneath any allocation or pricing model; chapters on the transportation problem bear directly on assigning accounts to representatives.
+- **KleeMinty1972** — Klee, V. & Minty, G. J. (1972). *How good is the simplex algorithm?* In O. Shisha (ed.), Inequalities III, Academic Press, 159–175. DOI: none (book chapter)
+  - *establishes:* A family of deformed cubes on which Dantzig's pivot rule visits all 2^n vertices, proving the simplex method is exponential in the worst case.
+  - *relevance:* The reason to expect and tolerate occasional pathological solve times on structured LPs, and the historical motivation for the interior-point alternatives in section 3.
+- **Khachiyan1980** — Khachiyan, L. G. (1980). *Polynomial algorithms in linear programming*. USSR Computational Mathematics and Mathematical Physics 20(1), 53–72 (Russian original 1979). DOI: 10.1016/0041-5553(80)90061-0
+  - *establishes:* The ellipsoid method solves linear programs in polynomial time, settling the complexity of LP.
+  - *relevance:* Rarely used in practice but the theoretical backbone for the equivalence of separation and optimisation, which is why lazily separated cut families (as in section 8) are legitimate exact methods.
+- **Chvatal1983** — Chvátal, V. (1983). *Linear Programming*. W. H. Freeman. DOI: none (book); ISBN 0-7167-1587-2
+  - *establishes:* A rigorous but accessible treatment of the simplex method, duality, sensitivity analysis and network simplex, with the cleanest standard proof of strong duality.
+  - *relevance:* The reference for sensitivity analysis — ranging on right-hand sides and objective coefficients — needed when a business owner asks how far a quota or budget can move before the optimal territory plan changes.
+- **Schrijver1986** — Schrijver, A. (1986). *Theory of Linear and Integer Programming*. Wiley. DOI: none (book); ISBN 0-471-90854-1
+  - *establishes:* The definitive theoretical account of polyhedra, duality, total unimodularity, and the complexity of linear and integer programming.
+  - *relevance:* The source for total-unimodularity arguments, which tell you when an assignment or transportation formulation will be integral without branching — a first check before reaching for a MIP solver.
+- **BertsimasTsitsiklis1997** — Bertsimas, D. & Tsitsiklis, J. N. (1997). *Introduction to Linear Optimization*. Athena Scientific. DOI: none (book); ISBN 1-886529-19-1
+  - *establishes:* The modern graduate text on LP: geometry, simplex, duality, sensitivity, large-scale decomposition, network flows, interior-point methods and an introduction to integer programming.
+  - *relevance:* The one book to hand a new quantitative analyst before they touch a solver; its chapters on duality and sensitivity cover most questions a pricing or allocation model's stakeholders will ask.
+- **Bixby2002** — Bixby, R. E. (2002). *Solving Real-World Linear Programs: A Decade and More of Progress*. Operations Research 50(1), 3–15. DOI: 10.1287/opre.50.1.3.17780
+  - *establishes:* Documents the roughly million-fold speedup in LP solving from 1988 to 2002, attributing it to algorithmic advances (dual simplex, barrier, presolve) as much as hardware.
+  - *relevance:* The citation for the claim that national-scale LP relaxations are routine; it also explains why the dual simplex is the default inside branch-and-bound.
+
+## 2. Integer and mixed-integer programming
+
+- **Gomory1958** — Gomory, R. E. (1958). *Outline of an algorithm for integer solutions to linear programs*. Bulletin of the American Mathematical Society 64(5), 275–278. DOI: 10.1090/S0002-9904-1958-10224-4
+  - *establishes:* The first finite cutting-plane algorithm for integer programs, deriving valid inequalities (Gomory cuts) from rows of the optimal simplex tableau.
+  - *relevance:* Gomory mixed-integer cuts remain the single most effective general cut family in commercial solvers, so they are working underneath every districting or assignment MIP you solve.
+- **LandDoig1960** — Land, A. H. & Doig, A. G. (1960). *An Automatic Method of Solving Discrete Programming Problems*. Econometrica 28(3), 497–520. DOI: 10.2307/1910129
+  - *establishes:* Branch-and-bound for mixed-integer programs: solve the LP relaxation, branch on a fractional variable, and prune subproblems whose bound cannot beat the incumbent.
+  - *relevance:* The algorithmic skeleton of every exact territory-design, staffing or product-selection model; understanding it is what lets you read a solver log and diagnose a stalled gap.
+- **NemhauserWolsey1988** — Nemhauser, G. L. & Wolsey, L. A. (1988). *Integer and Combinatorial Optimization*. Wiley. DOI: 10.1002/9781118627372
+  - *establishes:* The standard reference on polyhedral theory for integer programs: valid inequalities, facets, lifting, total unimodularity, Lagrangian and Benders decomposition, and branch-and-bound.
+  - *relevance:* Where to look up the theory behind a strengthened formulation — for example, why a tighter contiguity or balance constraint can cut solve time by orders of magnitude.
+- **PadbergRinaldi1991** — Padberg, M. & Rinaldi, G. (1991). *A Branch-and-Cut Algorithm for the Resolution of Large-Scale Symmetric Traveling Salesman Problems*. SIAM Review 33(1), 60–100. DOI: 10.1137/1033004
+  - *establishes:* Branch-and-cut: separating problem-specific valid inequalities at every node of a single branch-and-bound tree, demonstrated on TSPs of thousands of cities.
+  - *relevance:* The architecture that lazily separated contiguity cuts (section 8) live inside; it is the reason a callback-based districting model can be exact rather than heuristic.
+- **BalasCeriaCornuejols1993** — Balas, E., Ceria, S. & Cornuéjols, G. (1993). *A lift-and-project cutting plane algorithm for mixed 0–1 programs*. Mathematical Programming 58, 295–324. DOI: 10.1007/BF01581273
+  - *establishes:* Lift-and-project cuts derived from the disjunction x_j ≤ 0 or x_j ≥ 1, with a finite convergence proof and the first evidence that general-purpose cuts pay off inside branch-and-bound.
+  - *relevance:* The origin of the disjunctive view of binary decisions — assign or not, open or not — that underlies the cut generation and perspective reformulations used for indicator-driven allocation models.
+- **Barnhart1998** — Barnhart, C., Johnson, E. L., Nemhauser, G. L., Savelsbergh, M. W. P. & Vance, P. H. (1998). *Branch-and-Price: Column Generation for Solving Huge Integer Programs*. Operations Research 46(3), 316–329. DOI: 10.1287/opre.46.3.316
+  - *establishes:* Branch-and-price: column generation embedded in branch-and-bound, with branching rules compatible with the pricing subproblem.
+  - *relevance:* The exact method for set-partitioning formulations of territory design, where each column is a candidate territory that is contiguous and balanced by construction.
+- **FrangioniGentile2006** — Frangioni, A. & Gentile, C. (2006). *Perspective cuts for a class of convex 0–1 mixed integer programs*. Mathematical Programming 106(2), 225–236. DOI: 10.1007/s10107-005-0594-3
+  - *establishes:* Perspective cuts: linear outer approximations of the perspective of a convex function, giving the convex hull of the semi-continuous set {(x, y): y = 0 ⇒ x = 0, f(x) ≤ z} when y is binary.
+  - *relevance:* The tightest known way to model a fixed-plus-convex cost that is switched on by an indicator, as in assigning a representative (fixed) whose workload cost is convex, or a product line with a launch cost.
+- **GunlukLinderoth2010** — Günlük, O. & Linderoth, J. (2010). *Perspective reformulations of mixed integer nonlinear programs with indicator variables*. Mathematical Programming 124, 183–205. DOI: 10.1007/s10107-010-0360-z
+  - *establishes:* A general perspective reformulation for MINLPs with indicator variables, showing it is equivalent to the convex hull for separable constraints and can be expressed as a second-order cone program.
+  - *relevance:* Turns indicator-driven portfolio and allocation problems (cardinality-constrained mean–variance, minimum-lot sizes) into conic programs that commercial solvers handle directly.
+- **AchterbergWunderling2013** — Achterberg, T. & Wunderling, R. (2013). *Mixed Integer Programming: Analyzing 12 Years of Progress*. In Facets of Combinatorial Optimization: Festschrift for Martin Grötschel, Springer, 449–481. DOI: 10.1007/978-3-642-38189-8_18
+  - *establishes:* Quantifies, by switching components off one at a time in CPLEX, how much of the 2000–2012 MIP speedup came from cutting planes, presolve, heuristics, and branching.
+  - *relevance:* Justifies leaning on a modern solver's defaults before hand-engineering, and identifies which component (usually cuts or presolve) to tune when a territory or allocation MIP stalls.
+- **Conforti2014** — Conforti, M., Cornuéjols, G. & Zambelli, G. (2014). *Integer Programming*. Graduate Texts in Mathematics 271, Springer. DOI: 10.1007/978-3-319-11008-0
+  - *establishes:* The current graduate text on integer programming: polyhedral theory, split and Gomory cuts, lattices, reformulations, and the theory behind branch-and-cut.
+  - *relevance:* The up-to-date reference for cut families and formulation strength, replacing Nemhauser–Wolsey where the two disagree on notation or recent results.
+- **Vielma2015** — Vielma, J. P. (2015). *Mixed Integer Linear Programming Formulation Techniques*. SIAM Review 57(1), 3–57. DOI: 10.1137/130915303
+  - *establishes:* A survey of how to build strong MILP formulations for disjunctive, piecewise-linear and union-of-polyhedra constraints, with the theory of ideal and locally ideal formulations.
+  - *relevance:* The guide for modelling the piecewise-linear payoff curves, tiered commissions, and either/or assignment rules that appear in sales-compensation, pricing and territory models.
+
+## 3. Convex optimization and interior point
+
+- **KuhnTucker1951** — Kuhn, H. W. & Tucker, A. W. (1951). *Nonlinear Programming*. Proceedings of the Second Berkeley Symposium on Mathematical Statistics and Probability, University of California Press, 481–492 (reprinted in Traces and Emergence of Nonlinear Programming, Birkhäuser, 2014). DOI: 10.1007/978-3-0348-0439-4_11
+  - *establishes:* The Karush–Kuhn–Tucker conditions: first-order necessary conditions for constrained optima under a constraint qualification, sufficient under convexity.
+  - *relevance:* KKT multipliers are the marginal values behind any constrained pricing or capital-allocation model, and the object that interior-point methods drive to zero complementarity.
+- **Markowitz1952** — Markowitz, H. (1952). *Portfolio Selection*. The Journal of Finance 7(1), 77–91. DOI: 10.1111/j.1540-6261.1952.tb01525.x
+  - *establishes:* Mean–variance portfolio choice as a quadratic program, introducing the efficient frontier and the idea of trading expected return against variance.
+  - *relevance:* The original convex-optimisation model in finance; the QP structure recurs in retirement glide-path design, annuity-portfolio hedging and any allocation with a quadratic risk term.
+- **Rockafellar1970** — Rockafellar, R. T. (1970). *Convex Analysis*. Princeton University Press. DOI: 10.1515/9781400873173
+  - *establishes:* The foundational theory of convex sets and functions: conjugacy, subdifferentials, Fenchel duality and the separation theorems that generalise LP duality to convex programs.
+  - *relevance:* Supplies the duality theory behind CVaR, perspective functions and Lagrangian relaxation; cite when a proof needs conjugate functions rather than LP duality.
+- **Karmarkar1984** — Karmarkar, N. (1984). *A new polynomial-time algorithm for linear programming*. Combinatorica 4(4), 373–395. DOI: 10.1007/BF02579150
+  - *establishes:* A projective interior-point method for LP that is both polynomial and practically competitive with simplex, launching the interior-point revolution.
+  - *relevance:* The ancestor of the barrier solvers that are the fastest way to solve the very large, sparse LP and QP relaxations that arise in national-scale allocation and portfolio problems.
+- **Mehrotra1992** — Mehrotra, S. (1992). *On the Implementation of a Primal-Dual Interior Point Method*. SIAM Journal on Optimization 2(4), 575–601. DOI: 10.1137/0802028
+  - *establishes:* The predictor–corrector primal-dual interior-point algorithm, which became the implementation standard in essentially every commercial barrier solver.
+  - *relevance:* What is actually running when you select the barrier method for a large convex QP; knowing its structure explains why it excels on large problems but does not warm-start well inside branch-and-bound.
+- **NesterovNemirovskii1994** — Nesterov, Y. & Nemirovskii, A. (1994). *Interior-Point Polynomial Algorithms in Convex Programming*. SIAM Studies in Applied Mathematics 13. DOI: 10.1137/1.9781611970791
+  - *establishes:* Self-concordant barriers, the theory that extends polynomial-time interior-point methods from LP to general convex programming, including second-order cone and semidefinite programs.
+  - *relevance:* The theoretical guarantee that conic reformulations of risk constraints (CVaR, robust ellipsoids, perspective cones) are solvable to high accuracy in polynomial time.
+- **Wright1997** — Wright, S. J. (1997). *Primal-Dual Interior-Point Methods*. SIAM. DOI: 10.1137/1.9781611971453
+  - *establishes:* The standard monograph on primal-dual interior-point methods for LP and QP: theory, convergence, and implementation detail including Mehrotra's predictor–corrector.
+  - *relevance:* The reference to consult when a barrier solve on a large allocation LP behaves badly (numerical trouble, crossover failures) and one needs to understand what the solver is doing.
+- **Lobo1998** — Lobo, M. S., Vandenberghe, L., Boyd, S. & Lebret, H. (1998). *Applications of second-order cone programming*. Linear Algebra and its Applications 284(1–3), 193–228. DOI: 10.1016/S0024-3795(98)10032-0
+  - *establishes:* Second-order cone programming as a unified modelling class, showing how robust LP, QCQP, sums of norms, and hyperbolic constraints reduce to SOCP.
+  - *relevance:* The practical recipe for casting robust allocation, variance-bounded portfolio, and perspective-reformulated problems as SOCPs that Gurobi, MOSEK or CPLEX solve directly.
+- **BenTalNemirovski2001** — Ben-Tal, A. & Nemirovski, A. (2001). *Lectures on Modern Convex Optimization: Analysis, Algorithms, and Engineering Applications*. MPS-SIAM Series on Optimization. DOI: 10.1137/1.9780898718829
+  - *establishes:* A unified treatment of conic (LP, SOCP, SDP) optimisation, conic duality, and the interior-point algorithms that solve them, with the robust-counterpart material that seeded robust optimisation.
+  - *relevance:* The bridge between the convex theory here and the robust models in section 6; its conic-duality chapter is the cleanest source for dualising a risk constraint.
+- **BoydVandenberghe2004** — Boyd, S. & Vandenberghe, L. (2004). *Convex Optimization*. Cambridge University Press. DOI: 10.1017/CBO9780511804441
+  - *establishes:* The standard modern textbook on convex optimisation: recognising and formulating convex problems, Lagrangian duality, KKT conditions, and interior-point methods.
+  - *relevance:* The default citation for convexity claims and duality arguments in any modelling document; its disciplined-convex-programming viewpoint is what CVXPY implements.
+
+## 4. Combinatorial optimization and network flows
+
+- **Hitchcock1941** — Hitchcock, F. L. (1941). *The Distribution of a Product from Several Sources to Numerous Localities*. Journal of Mathematics and Physics 20(1–4), 224–230. DOI: 10.1002/sapm1941201224
+  - *establishes:* The transportation problem: minimum-cost shipment from supplies to demands, with the first solution procedure predating the simplex method.
+  - *relevance:* The archetype for assigning accounts or ZIP codes to representatives under capacity limits; a territory-balance model without contiguity is a transportation problem.
+- **Kuhn1955** — Kuhn, H. W. (1955). *The Hungarian method for the assignment problem*. Naval Research Logistics Quarterly 2(1–2), 83–97. DOI: 10.1002/nav.3800020109
+  - *establishes:* A polynomial primal-dual algorithm for the assignment problem, exploiting the total unimodularity that makes the LP relaxation integral.
+  - *relevance:* The exact, fast answer for one-to-one matchings such as pairing representatives with regions or advisers with client books, and the pricing subproblem in many column-generation schemes.
+- **FordFulkerson1956** — Ford, L. R. & Fulkerson, D. R. (1956). *Maximal Flow Through a Network*. Canadian Journal of Mathematics 8, 399–404. DOI: 10.4153/CJM-1956-045-5
+  - *establishes:* The max-flow/min-cut theorem and the augmenting-path algorithm.
+  - *relevance:* Min-cut is the separation routine behind lazily generated contiguity and connectivity cuts (section 8), so this is the algorithm running inside the callback.
+- **FordFulkerson1962** — Ford, L. R. & Fulkerson, D. R. (1962). *Flows in Networks*. Princeton University Press. DOI: 10.1515/9781400875184
+  - *establishes:* The book-length theory of network flows: max-flow, min-cost flow, the out-of-kilter method, and flows with gains, plus the combinatorial duality results (Menger, König) as flow theorems.
+  - *relevance:* The canonical reference for flow-based contiguity formulations and for any model in which accounts, budget or staff move along a network.
+- **Edmonds1965** — Edmonds, J. (1965). *Paths, Trees, and Flowers*. Canadian Journal of Mathematics 17, 449–467. DOI: 10.4153/CJM-1965-045-4
+  - *establishes:* The blossom algorithm for maximum matching in general graphs, and the essay that first argued polynomial time is the right notion of a "good" algorithm.
+  - *relevance:* Non-bipartite matching arises when pairing peers (co-advisers, merged sales teams) rather than assigning across two sides; this is the exact method.
+- **EdmondsKarp1972** — Edmonds, J. & Karp, R. M. (1972). *Theoretical Improvements in Algorithmic Efficiency for Network Flow Problems*. Journal of the ACM 19(2), 248–264. DOI: 10.1145/321694.321699
+  - *establishes:* Shortest-augmenting-path max-flow and capacity scaling for min-cost flow, giving the first polynomial bounds for both.
+  - *relevance:* The guarantee that the min-cut separation used for connectivity cuts is cheap enough to call at every branch-and-bound node.
+- **Karp1972** — Karp, R. M. (1972). *Reducibility among Combinatorial Problems*. In R. E. Miller & J. W. Thatcher (eds.), Complexity of Computer Computations, Plenum, 85–103. DOI: 10.1007/978-1-4684-2001-2_9
+  - *establishes:* NP-completeness of 21 core combinatorial problems including set partitioning, knapsack, and graph partitioning.
+  - *relevance:* The reason balanced connected partitioning and capacitated assignment need branch-and-bound or heuristics rather than a polynomial algorithm; cite when explaining why a district model has no closed-form solution.
+- **GoldbergTarjan1988** — Goldberg, A. V. & Tarjan, R. E. (1988). *A new approach to the maximum-flow problem*. Journal of the ACM 35(4), 921–940. DOI: 10.1145/48014.61051
+  - *establishes:* The push–relabel max-flow algorithm, which is the basis of the fastest practical max-flow implementations.
+  - *relevance:* The algorithm to implement or import when contiguity-cut separation on a large ZIP-adjacency graph becomes the bottleneck.
+- **Orlin1993** — Orlin, J. B. (1993). *A Faster Strongly Polynomial Minimum Cost Flow Algorithm*. Operations Research 41(2), 338–350. DOI: 10.1287/opre.41.2.338
+  - *establishes:* A strongly polynomial min-cost flow algorithm via capacity scaling, the best known bound for many years.
+  - *relevance:* Min-cost flow is the right model when assignments carry both a cost and a capacity — moving accounts between representatives at a transition cost, or rebalancing a book of business.
+- **Ahuja1993** — Ahuja, R. K., Magnanti, T. L. & Orlin, J. B. (1993). *Network Flows: Theory, Algorithms, and Applications*. Prentice Hall. DOI: none (book); ISBN 0-13-617549-X
+  - *establishes:* The comprehensive text on network flows: shortest paths, max-flow, min-cost flow, assignment, matching, generalised flows and their applications.
+  - *relevance:* The reference for choosing between transportation, assignment and min-cost-flow formulations of an allocation problem, and for the network simplex that solves them.
+- **Schrijver2003** — Schrijver, A. (2003). *Combinatorial Optimization: Polyhedra and Efficiency*. Algorithms and Combinatorics 24, Springer (3 volumes). DOI: none (book); ISBN 3-540-44389-4
+  - *establishes:* The encyclopaedic reference on polyhedral combinatorics: paths, flows, matchings, matroids, submodular functions, and the polynomial-time solvability of each.
+  - *relevance:* Where to confirm whether a combinatorial substructure of a model (a matching, a cut, a matroid constraint) is polynomially solvable before deciding it needs a MIP.
+
+## 5. Mixed-integer nonlinear programming
+
+Outer approximation (Duran–Grossmann 1986, Fletcher–Leyffer 1994), LP/NLP branch-and-bound (Quesada–Grossmann 1992), Bonmin (Bonami et al. 2008), the extended supporting-hyperplane method (Kronqvist et al. 2016), and the MINLP surveys of Kronqvist et al. 2018 and Sahinidis 2019 are in section 8, copied from the td bibliography, and are not repeated here.
+
+- **Geoffrion1972** — Geoffrion, A. M. (1972). *Generalized Benders decomposition*. Journal of Optimization Theory and Applications 10(4), 237–260. DOI: 10.1007/BF00934810
+  - *establishes:* Extends Benders decomposition from linear to convex subproblems via nonlinear duality, projecting out the "easy" variables and building the master from dual cuts.
+  - *relevance:* The decomposition that separates discrete assignment decisions from a convex pricing, hedging or workload subproblem, and the precursor of logic-based Benders (section 8).
+- **McCormick1976** — McCormick, G. P. (1976). *Computability of global solutions to factorable nonconvex programs: Part I — Convex underestimating problems*. Mathematical Programming 10, 147–175. DOI: 10.1007/BF01580665
+  - *establishes:* McCormick envelopes: the convex and concave relaxations of bilinear terms, and the factorable-function framework for building convex underestimators of nonconvex programs.
+  - *relevance:* Bilinear products (price × volume, share × pool size) are the commonest nonconvexity in pricing and allocation models; McCormick relaxations are how global solvers bound them.
+- **GuptaRavindran1985** — Gupta, O. K. & Ravindran, A. (1985). *Branch and Bound Experiments in Convex Nonlinear Integer Programming*. Management Science 31(12), 1533–1546. DOI: 10.1287/mnsc.31.12.1533
+  - *establishes:* NLP-based branch-and-bound for convex MINLPs: solve a continuous NLP relaxation at each node and branch on fractional integers.
+  - *relevance:* The simplest exact method for small convex MINLPs such as cardinality-constrained portfolio selection; the baseline against which outer-approximation methods are judged.
+- **WesterlundPettersson1995** — Westerlund, T. & Pettersson, F. (1995). *An extended cutting plane method for solving convex MINLP problems*. Computers & Chemical Engineering 19(Suppl.), S131–S136. DOI: 10.1016/0098-1354(95)87027-X
+  - *establishes:* The extended cutting-plane (ECP) method: solve only MILP masters, adding a linearisation of the most violated nonlinear constraint at each iterate, with no NLP subproblems.
+  - *relevance:* The approach to reach for when the nonlinear part is cheap to linearise but an NLP solver is unavailable or unreliable — for example inside a pure-MILP solver such as HiGHS.
+- **Leyffer2001** — Leyffer, S. (2001). *Integrating SQP and Branch-and-Bound for Mixed Integer Nonlinear Programming*. Computational Optimization and Applications 18, 295–309. DOI: 10.1023/A:1011241421041
+  - *establishes:* Interleaves SQP iterations with branching so that node NLPs are not solved to optimality, with an early-branching rule that preserves correctness.
+  - *relevance:* Explains the design of modern NLP-based branch-and-bound codes and why a warm-started node solve can be truncated safely, which matters for solve-time budgets on nightly allocation runs.
+- **Grossmann2002** — Grossmann, I. E. (2002). *Review of Nonlinear Mixed-Integer and Disjunctive Programming Techniques*. Optimization and Engineering 3, 227–252. DOI: 10.1023/A:1021039126272
+  - *establishes:* A review of MINLP algorithms (branch-and-bound, outer approximation, generalised Benders, ECP) and of generalised disjunctive programming as a modelling alternative to big-M formulations.
+  - *relevance:* The bridge from logical business rules (if a territory is opened then …) to hull reformulations that are tight without big-M constants.
+- **TawarmalaniSahinidis2005** — Tawarmalani, M. & Sahinidis, N. V. (2005). *A polyhedral branch-and-cut approach to global optimization*. Mathematical Programming 103(2), 225–249. DOI: 10.1007/s10107-005-0581-8
+  - *establishes:* The BARON architecture for nonconvex MINLP: polyhedral relaxations of factorable functions, range reduction, and spatial branch-and-cut with convergence to a global optimum.
+  - *relevance:* The method to cite when a nonconvex pricing or bilinear allocation model is solved to proven global optimality rather than to a local optimum.
+- **Bonami2012** — Bonami, P., Kılınç, M. & Linderoth, J. (2012). *Algorithms and Software for Convex Mixed Integer Nonlinear Programs*. In J. Lee & S. Leyffer (eds.), Mixed Integer Nonlinear Programming, IMA Volumes in Mathematics and its Applications 154, Springer, 1–39. DOI: 10.1007/978-1-4614-1927-3_1
+  - *establishes:* A survey of convex MINLP algorithms and the software implementing them, with computational comparisons on standard test sets.
+  - *relevance:* The practical guide to solver selection (Bonmin, FilMINT, DICOPT, SBB, AlphaECP) for a convex MINLP such as a log-welfare or convex-cost districting model.
+- **Belotti2013** — Belotti, P., Kirches, C., Leyffer, S., Linderoth, J., Luedtke, J. & Mahajan, A. (2013). *Mixed-integer nonlinear optimization*. Acta Numerica 22, 1–131. DOI: 10.1017/S0962492913000032
+  - *establishes:* The definitive survey of MINLP: convex and nonconvex algorithms, relaxations, cutting planes, heuristics, and software, with the theoretical results behind each.
+  - *relevance:* The single citation for "the state of MINLP" in a methods section, and the map for locating any technique in sections 5 and 8 in the wider literature.
+- **VigerskeGleixner2018** — Vigerske, S. & Gleixner, A. (2018). *SCIP: global optimization of mixed-integer nonlinear programs in a branch-and-cut framework*. Optimization Methods and Software 33(3), 563–593. DOI: 10.1080/10556788.2017.1335312
+  - *establishes:* How the open-source SCIP framework handles nonconvex MINLP by combining expression-graph relaxations, spatial branching and its MIP branch-and-cut machinery.
+  - *relevance:* The open-source route to global MINLP solving, and the same framework whose Steiner-tree extension (SCIP-Jack, section 8) handles connectivity.
+
+## 6. Stochastic and robust optimization
+
+- **Dantzig1955** — Dantzig, G. B. (1955). *Linear Programming under Uncertainty*. Management Science 1(3–4), 197–206. DOI: 10.1287/mnsc.1.3-4.197
+  - *establishes:* Two-stage stochastic linear programming with recourse: decide now, observe the random outcome, then take corrective action at a cost.
+  - *relevance:* The framework for any allocation made before demand or market returns are known — setting territory quotas, hedging annuity guarantees, or committing sales capacity — with recourse after the year unfolds.
+- **CharnesCooper1959** — Charnes, A. & Cooper, W. W. (1959). *Chance-Constrained Programming*. Management Science 6(1), 73–79. DOI: 10.1287/mnsc.6.1.73
+  - *establishes:* Chance constraints: require each constraint to hold with at least a prescribed probability, and show when they reduce to deterministic equivalents.
+  - *relevance:* The natural language for solvency and service-level requirements — a capital buffer sufficient with 99.5% probability, a retirement income floor met in 95% of scenarios.
+- **Benders1962** — Benders, J. F. (1962). *Partitioning procedures for solving mixed-variables programming problems*. Numerische Mathematik 4, 238–252. DOI: 10.1007/BF01386316
+  - *establishes:* Benders decomposition: fix the complicating (integer) variables, solve the remaining LP, and return its dual as an optimality or feasibility cut to a master problem.
+  - *relevance:* The decomposition behind the L-shaped method and every scenario-decomposed stochastic MIP; also the exact way to split discrete design decisions from a large LP of operational consequences.
+- **VanSlykeWets1969** — Van Slyke, R. M. & Wets, R. (1969). *L-Shaped Linear Programs with Applications to Optimal Control and Stochastic Programming*. SIAM Journal on Applied Mathematics 17(4), 638–663. DOI: 10.1137/0117061
+  - *establishes:* The L-shaped method: Benders decomposition applied to two-stage stochastic LPs, with feasibility and optimality cuts aggregated over scenarios.
+  - *relevance:* The standard exact algorithm for scenario-based capacity or capital allocation models with many scenarios and a modest set of first-stage decisions.
+- **BirgeLouveaux2011** — Birge, J. R. & Louveaux, F. (2011). *Introduction to Stochastic Programming* (2nd ed.). Springer Series in Operations Research and Financial Engineering. DOI: 10.1007/978-1-4614-0237-4
+  - *establishes:* The standard textbook on stochastic programming: recourse models, chance constraints, the L-shaped method, multistage models, sampling and bounds.
+  - *relevance:* The reference for formulating multistage retirement-decumulation or asset–liability models as stochastic programs and for the value-of-information measures (EVPI, VSS) that justify them.
+- **Shapiro2009** — Shapiro, A., Dentcheva, D. & Ruszczyński, A. (2009). *Lectures on Stochastic Programming: Modeling and Theory*. MPS-SIAM Series on Optimization. DOI: 10.1137/1.9780898718751
+  - *establishes:* The rigorous theory of stochastic programming: two- and multistage models, sample average approximation, statistical inference for optimal values, and coherent risk measures in optimisation.
+  - *relevance:* The source for risk-averse stochastic programs — using CVaR or other coherent measures as objectives — which is the right formalism for retirement-income and annuity-hedging decisions.
+- **RockafellarUryasev2000** — Rockafellar, R. T. & Uryasev, S. (2000). *Optimization of conditional value-at-risk*. The Journal of Risk 2(3), 21–41. DOI: 10.21314/JOR.2000.038
+  - *establishes:* CVaR can be minimised by a linear program over scenarios via an auxiliary variable, and doing so also yields VaR.
+  - *relevance:* The workhorse for tail-risk-aware portfolio, hedging and retirement-drawdown optimisation; it makes shortfall risk a linear constraint rather than a nonconvex one.
+- **Kleywegt2002** — Kleywegt, A. J., Shapiro, A. & Homem-de-Mello, T. (2002). *The Sample Average Approximation Method for Stochastic Discrete Optimization*. SIAM Journal on Optimization 12(2), 479–502. DOI: 10.1137/S1052623499363220
+  - *establishes:* Replacing the expectation by a sample average yields a deterministic problem whose solution converges exponentially fast to the true optimum, with computable optimality-gap estimates.
+  - *relevance:* Licenses solving scenario-sampled versions of stochastic assignment or product-design problems and reporting a statistical bound on how far the sampled solution is from optimal.
+- **BenTalNemirovski1998** — Ben-Tal, A. & Nemirovski, A. (1998). *Robust Convex Optimization*. Mathematics of Operations Research 23(4), 769–805. DOI: 10.1287/moor.23.4.769
+  - *establishes:* The robust counterpart of a convex program with ellipsoidal uncertainty is itself a tractable conic program, founding modern robust optimisation.
+  - *relevance:* The tool for allocation and pricing decisions that must hold for every parameter realisation in a set, when a probability model of the parameters is not credible.
+- **BertsimasSim2004** — Bertsimas, D. & Sim, M. (2004). *The Price of Robustness*. Operations Research 52(1), 35–53. DOI: 10.1287/opre.1030.0065
+  - *establishes:* The budget-of-uncertainty (Γ) model, whose robust counterpart stays linear and applies to integer programs, with probabilistic guarantees on constraint violation.
+  - *relevance:* The most practical robust model for MIPs: territory balance or capacity constraints can be made robust to a chosen number of adverse ZIP-level deviations without leaving the LP/MIP world.
+- **BenTal2009** — Ben-Tal, A., El Ghaoui, L. & Nemirovski, A. (2009). *Robust Optimization*. Princeton Series in Applied Mathematics. DOI: 10.1515/9781400831050
+  - *establishes:* The book-length theory of robust optimisation: robust counterparts of LP, conic and multistage problems, adjustable robustness, and globalised robust counterparts.
+  - *relevance:* The reference for adjustable (multistage) robust models, which fit staged decisions such as annual territory realignment or glide-path adjustment under worst-case scenarios.
+- **DelageYe2010** — Delage, E. & Ye, Y. (2010). *Distributionally Robust Optimization Under Moment Uncertainty with Application to Data-Driven Problems*. Operations Research 58(3), 595–612. DOI: 10.1287/opre.1090.0741
+  - *establishes:* Distributionally robust optimisation over all distributions matching estimated mean and covariance within confidence sets, shown to be a tractable SDP with data-driven guarantees.
+  - *relevance:* The middle ground between stochastic and robust models for retirement and annuity decisions where only moments of returns or mortality are estimated with confidence.
+
+## 7. Heuristics and large-neighbourhood search
+
+- **LinKernighan1973** — Lin, S. & Kernighan, B. W. (1973). *An Effective Heuristic Algorithm for the Traveling-Salesman Problem*. Operations Research 21(2), 498–516. DOI: 10.1287/opre.21.2.498
+  - *establishes:* Variable-depth local search: build a compound move from a sequence of gainful exchanges, accepting the best prefix, which remains the strongest TSP local search.
+  - *relevance:* The pattern for territory-improvement moves (chains of ZIP swaps between neighbouring territories) that go beyond single-unit reassignment.
+- **Kirkpatrick1983** — Kirkpatrick, S., Gelatt, C. D. & Vecchi, M. P. (1983). *Optimization by Simulated Annealing*. Science 220(4598), 671–680. DOI: 10.1126/science.220.4598.671
+  - *establishes:* Simulated annealing: accept worsening moves with a temperature-controlled probability, borrowing the Metropolis algorithm to escape local optima.
+  - *relevance:* Still the simplest robust metaheuristic for partitioning and districting; a good first baseline when an exact model times out.
+- **Glover1986** — Glover, F. (1986). *Future paths for integer programming and links to artificial intelligence*. Computers & Operations Research 13(5), 533–549. DOI: 10.1016/0305-0548(86)90048-1
+  - *establishes:* Introduces tabu search and the term "metaheuristic", proposing adaptive memory as the mechanism for guiding local search past local optima.
+  - *relevance:* Tabu search is the heuristic of record for political and commercial districting (see Bozkaya et al. in section 8) and for assignment problems with side constraints.
+- **FeoResende1995** — Feo, T. A. & Resende, M. G. C. (1995). *Greedy Randomized Adaptive Search Procedures*. Journal of Global Optimization 6, 109–133. DOI: 10.1007/BF01096763
+  - *establishes:* GRASP: repeated randomised greedy construction followed by local search, with a restricted candidate list controlling the greediness.
+  - *relevance:* The construction-then-improve pattern used in commercial territory design (Ríos-Mercado & Fernández, section 8); grows territories from seeds so contiguity holds by construction.
+- **GloverLaguna1997** — Glover, F. & Laguna, M. (1997). *Tabu Search*. Kluwer. DOI: 10.1007/978-1-4615-6089-0
+  - *establishes:* The book-length treatment of tabu search: short- and long-term memory, aspiration criteria, intensification and diversification, and strategic oscillation.
+  - *relevance:* The reference for designing memory structures in a districting or assignment heuristic, in particular strategic oscillation across the balance-constraint boundary.
+- **MladenovicHansen1997** — Mladenović, N. & Hansen, P. (1997). *Variable neighborhood search*. Computers & Operations Research 24(11), 1097–1100. DOI: 10.1016/S0305-0548(97)00031-2
+  - *establishes:* VNS: systematically change neighbourhood structure during local search, escaping local optima by shaking in progressively larger neighbourhoods.
+  - *relevance:* A low-parameter improvement framework for territory and allocation problems where several natural move types (swap, shift, chain) exist.
+- **Shaw1998** — Shaw, P. (1998). *Using Constraint Programming and Local Search Methods to Solve Vehicle Routing Problems*. Principles and Practice of Constraint Programming (CP 1998), Lecture Notes in Computer Science 1520, Springer, 417–431. DOI: 10.1007/3-540-49481-2_30
+  - *establishes:* Large neighbourhood search: destroy part of a solution by removing related elements, then repair it with an exact (constraint-programming) reinsertion.
+  - *relevance:* The origin of LNS; the destroy-and-repair loop with a MIP repair step is the most reliable way to improve incumbent territory or assignment solutions at national scale.
+- **FischettiLodi2003** — Fischetti, M. & Lodi, A. (2003). *Local branching*. Mathematical Programming 98, 23–47. DOI: 10.1007/s10107-003-0395-5
+  - *establishes:* Local branching: add a Hamming-distance constraint around the incumbent and let the MIP solver explore the neighbourhood exactly, embedded in an outer heuristic loop.
+  - *relevance:* A solver-based LNS that needs no problem-specific neighbourhood; the first thing to try when a districting MIP finds feasible solutions but the gap closes too slowly.
+- **Danna2005** — Danna, E., Rothberg, E. & Le Pape, C. (2005). *Exploring relaxation induced neighborhoods to improve MIP solutions*. Mathematical Programming 102, 71–90. DOI: 10.1007/s10107-004-0518-7
+  - *establishes:* RINS: fix the variables on which the incumbent and the LP relaxation agree, and solve the reduced MIP as a neighbourhood search inside branch-and-bound.
+  - *relevance:* The improvement heuristic that most commercial solvers run by default; understanding it explains why incumbents improve in bursts and how to tune the solver for a plateaued allocation model.
+- **FischettiGloverLodi2005** — Fischetti, M., Glover, F. & Lodi, A. (2005). *The feasibility pump*. Mathematical Programming 104, 91–104. DOI: 10.1007/s10107-004-0570-3
+  - *establishes:* The feasibility pump: alternate LP solves and roundings to find a first feasible solution for hard MIPs by minimising the distance to the nearest integer point.
+  - *relevance:* The standard remedy when a heavily constrained territory or assignment MIP cannot find any feasible incumbent, which is a prerequisite for the LNS methods above.
+- **RopkePisinger2006** — Ropke, S. & Pisinger, D. (2006). *An Adaptive Large Neighborhood Search Heuristic for the Pickup and Delivery Problem with Time Windows*. Transportation Science 40(4), 455–472. DOI: 10.1287/trsc.1050.0135
+  - *establishes:* Adaptive LNS: a portfolio of destroy and repair operators selected by weights updated from their recent success, with simulated-annealing acceptance.
+  - *relevance:* The dominant metaheuristic design of the last two decades; its operator-weighting scheme transfers directly to territory realignment and resource-allocation heuristics.
+- **PisingerRopke2010** — Pisinger, D. & Ropke, S. (2010). *Large Neighborhood Search*. In M. Gendreau & J.-Y. Potvin (eds.), Handbook of Metaheuristics (2nd ed.), International Series in Operations Research & Management Science 146, Springer, 399–419. DOI: 10.1007/978-1-4419-1665-5_13
+  - *establishes:* The survey chapter on LNS and ALNS: neighbourhood design, adaptive operator selection, and the relation to very-large-scale neighbourhood search.
+  - *relevance:* The single citation for the LNS family in a methods section, and the design checklist for building one around a MIP-based repair step.
+
+## 8. Territory design, districting and contiguity
+
+Copied from the "Mixed-integer nonlinear programming" and "Contiguity: encodings, algorithms, preprocessing" sections of `/Users/ntlee/projects/td/literature/territory_bibliography.md` (DOIs, establishes and relevance text verbatim; the source's relevance notes refer to that project's `districting.py`). All DOIs re-resolved via Crossref on 2026-09-02.
+
+- **Kronqvist2018** — Kronqvist et al. (2018). *A review and comparison of solvers for convex MINLP*. Optimization and Engineering. DOI: 10.1007/s11081-018-9411-8
+  - *establishes:* Benchmarks solvers for convex mixed-integer nonlinear programs, including outer-approximation methods.
+  - *relevance:* Supports the claim that a concave objective over a MILP-representable set is the tractable class, and guides solver choice.
+- **Sahinidis2019** — Sahinidis (2019). *Mixed-integer nonlinear programming 2018*. Optimization and Engineering. DOI: 10.1007/s11081-019-09438-1
+  - *establishes:* Survey of mixed-integer nonlinear programming: formulations, algorithms, software.
+  - *relevance:* General MINLP citation for methods sections.
+- **Shirabe2005** — Shirabe (2005). *A Model of Contiguity for Spatial Unit Allocation*. Geographical Analysis. DOI: 10.1111/j.1538-4632.2005.00605.x
+  - *establishes:* Introduces the flow-based contiguity formulation (SHIR): a directed flow variable per district-root-and-edge pair enforces that every included vertex is reachable from a fixed root within its assigned district, as a single upfront MILP needing no lazy cuts.
+  - *relevance:* The flow-based fallback baseline for `districting.py`'s contiguity constraint; no callback machinery needed, but flow-variable count grows with n·m, so it is best used as a small/medium-instance sanity check rather than the production formulation.
+- **Shirabe2009** — Shirabe (2009). *Districting Modeling with Exact Contiguity Constraints*. Environment and Planning B: Planning and Design. DOI: 10.1068/b34104
+  - *establishes:* Companion paper restating and refining the flow-based contiguity model for districting IPs with exact contiguity constraints.
+  - *relevance:* The most commonly cited statement of the SHIR formulation; corroborates the flow-based approach as the field's most widely adopted always-on contiguity encoding.
+- **Duque2011** — Duque et al. (2011). *The p-Regions Problem*. Geographical Analysis. DOI: 10.1111/j.1538-4632.2010.00810.x
+  - *establishes:* Introduces and computationally compares three k-region MIP formulations (a spanning-forest tree model, an order/hop-distance model, and a Shirabe-style flow model), finding all three fail to reach proven optimality on 40–70% of instances with as few as 25–49 units under a 3-hour cutoff.
+  - *relevance:* The strongest available warning that changing contiguity-encoding families alone will not fix the solver's scale wall — even the flow encoding stalls well below the project's own 125-unit failure threshold absent solver-level acceleration.
+- **Zhang2024** — Zhang et al. (2024). *Linear-size formulations for connected planar graph partitioning and political districting*. Optimization Letters. DOI: 10.1007/s11590-023-02070-0
+  - *establishes:* Gives a linear-size, LP-integral extended formulation for partitioning a planar graph into k connected pieces, built on Williams' spanning-tree formulation, but shows the polytope's integrality (and its performance edge over the Hess model) is destroyed once population/value-balance constraints are added.
+  - *relevance:* A cautionary result rather than a fix — the project's g_a/g_b value totals are exactly this kind of balance constraint, so this asymptotically smallest encoding is not recommended for the Nash-welfare setting.
+- **ValidiBuchanan2022** — Validi & Buchanan (2022). *Political districting to minimize cut edges*. Mathematical Programming Computation. DOI: 10.1007/s12532-022-00221-5
+  - *establishes:* Companion paper to the contiguity-formulation survey, formulating and solving political districting with a cut-edge-minimizing compactness objective at scale using the same cut-based, lazily separated contiguity constraints.
+  - *relevance:* Reinforces that lazily generated separator cuts inside a single branch-and-cut tree, not an always-on flow formulation, is the encoding family that scales — directly paralleling `districting.py`'s own separator-cut architecture.
+- **Carvajal2013** — Carvajal et al. (2013). *Imposing Connectivity Constraints in Forest Planning Models*. Operations Research. DOI: 10.1287/opre.2013.1183
+  - *establishes:* Formulates connectivity for forest-harvest scheduling via cutset constraints separated lazily in branch-and-cut, for the harder unrooted case where no fixed root is known in advance, scaling to instances 2–3x larger than prior connectivity-constrained forest models.
+  - *relevance:* Confirms that `districting.py`'s easier rooted setting, where both sides' roots are already fixed, should scale better than this paper's harder unrooted results, and that rooted, static problems are consistently easier — supporting the project's own component-quotient preprocessing idea.
+- **AlvarezMiranda2013** — Álvarez-Miranda et al. (2013). *The Maximum Weight Connected Subgraph Problem*. Facets of Combinatorial Optimization: Festschrift for Martin Grötschel. DOI: 10.1007/978-3-642-38189-8_11
+  - *establishes:* Surveys and compares node-based versus flow-based ILP formulations for the maximum-weight connected subgraph problem, showing the node-based separator formulation is both faster and more stable under variation in node weights.
+  - *relevance:* The single most directly relevant piece of evidence for the heavy-tail failure mechanism — suggests that node-based, separator-driven contiguity formulations are inherently more robust to heavy-tailed per-zip values than flow-based ones.
+- **OehrleinHaunert2017** — Oehrlein & Haunert (2017). *A cutting-plane method for contiguity-constrained spatial aggregation*. Journal of Spatial Information Science. DOI: 10.5311/josis.2017.15.379
+  - *establishes:* Applies a lazy cutting-plane method to enforce contiguity in size-thresholded, homogeneous spatial aggregation (map generalization), separating violated connectivity cuts only as needed rather than upfront.
+  - *relevance:* A secondary corroborating source for the lazy-separator-cut family `districting.py` already uses, applied to a different downstream (map-generalization) objective.
+- **Buchanan2018** — Buchanan et al. (2018). *Algorithms for Node-Weighted Steiner Tree and Maximum-Weight Connected Subgraph*. Networks. DOI: 10.1002/net.21825
+  - *establishes:* Develops preprocessing/reduction rules (cut-vertex detection, low-degree contraction) purpose-built for exact node-weighted Steiner tree and maximum-weight connected subgraph problems, giving the first improvements over exhaustive search for this problem class.
+  - *relevance:* These reductions target exactly the sparse, mostly-zero-value glue-node structure real ZCTA data will have, shrinking the graph before any branch-and-bound runs.
+- **Fischetti2017** — Fischetti et al. (2017). *Thinning out Steiner trees: a node-based model for uniform edge costs*. Mathematical Programming Computation. DOI: 10.1007/s12532-016-0111-0
+  - *establishes:* Gives a node-only ILP formulation for Steiner trees that drops edge variables entirely under uniform edge costs, winning the DIMACS11 Steiner-tree challenge.
+  - *relevance:* A near-exact structural fit for a Rook-adjacency grid where connectivity cost is uniform per glue node or per perimeter edge, likely smaller and faster than a generic edge-based Steiner formulation.
+- **Leitner2018** — Leitner et al. (2018). *A Dual Ascent-Based Branch-and-Bound Framework for the Prize-Collecting Steiner Tree and Related Problems*. INFORMS Journal on Computing. DOI: 10.1287/ijoc.2017.0788
+  - *establishes:* Generalizes Wong's dual-ascent method to a branch-and-bound framework that unifies the Steiner tree, prize-collecting Steiner tree, maximum-weight connected subgraph, and node-weighted Steiner tree problems under one solver architecture.
+  - *relevance:* Means a single codebase/solver could cover every glue-node variant relevant to the ZCTA problem's zero-value-connector structure.
+- **Gamrath2017** — Gamrath et al. (2017). *SCIP-Jack — a solver for STP and variants with parallelization extensions*. Mathematical Programming Computation. DOI: 10.1007/s12532-016-0114-x
+  - *establishes:* Presents SCIP-Jack, the open-source SCIP-based solver for eleven Steiner-family problems including prize-collecting Steiner tree and maximum-weight connected subgraph.
+  - *relevance:* The concrete open-source reference implementation for the node-based, lazy branch-and-cut approach recommended for robustness under heavy-tailed unit values.
+- **Rehfeldt2019** — Rehfeldt et al. (2019). *Reduction techniques for the prize collecting Steiner tree problem and the maximum-weight connected subgraph problem*. Networks. DOI: 10.1002/net.21857
+  - *establishes:* Presents numerous new reduction methods for prize-collecting Steiner tree problems that shrink over 90% of benchmark instances to triviality before branch-and-bound even begins.
+  - *relevance:* The most mature published analogue to the project's own proposed component-quotient preprocessing idea, except these reductions are formally proven safe rather than a heuristic guess.
+- **RehfeldtKoch2022** — Rehfeldt & Koch (2022). *On the Exact Solution of Prize-Collecting Steiner Tree Problems*. INFORMS Journal on Computing. DOI: 10.1287/ijoc.2021.1087
+  - *establishes:* Solves prize-collecting Steiner tree benchmark instances with up to ten million edges to proven optimality in under two hours.
+  - *relevance:* Evidence that exact PCST-family solving scales far beyond the project's 400–800-ZCTA target, if the glue-node connectivity subproblem can be isolated from the Nash-welfare objective.
+- **Miyazawa2021** — Miyazawa et al. (2021). *Partitioning a graph into balanced connected classes: Formulations, separation and experiments*. European Journal of Operational Research. DOI: 10.1016/j.ejor.2020.12.059
+  - *establishes:* Studies exactly the problem of partitioning a node-weighted graph into k connected, balanced classes, contributing ILP formulations, valid inequalities, and a lazy connectivity-cut separation routine.
+  - *relevance:* The closest published problem statement to `districting.py`'s own k=2 connected-bipartition structure; its separation routines are the most likely of any surveyed paper to transplant directly into the existing lazy-cut loop as stronger valid inequalities.
+- **DuranGrossmann1986** — Duran & Grossmann (1986). *An outer-approximation algorithm for a class of mixed-integer nonlinear programs*. Mathematical Programming. DOI: 10.1007/BF02592064
+  - *establishes:* Proves finite convergence of outer approximation for convex MINLPs linear in the 0-1 variables, alternating an NLP relaxation with an MILP master that accumulates Kelley-tangent linearizations.
+  - *relevance:* The theorem `districting.py`'s own outer-approximation loop already leans on for its Nash-log cuts; it says nothing about the separately added connectivity cuts, which follow a different convergence argument.
+- **FletcherLeyffer1994** — Fletcher & Leyffer (1994). *Solving mixed integer nonlinear programs by outer approximation*. Mathematical Programming. DOI: 10.1007/BF01581153
+  - *establishes:* Repairs a gap in Duran and Grossmann's original outer-approximation algorithm that could cut off the true optimum when NLP subproblems have degenerate multipliers, tightening the master formulation while preserving finite convergence.
+  - *relevance:* Relevant only if the log-welfare linearization has degenerate KKT multipliers at near-ties, which is plausible under the project's low-rho, near-flat objective landscape.
+- **QuesadaGrossmann1992** — Quesada & Grossmann (1992). *An LP/NLP based branch and bound algorithm for convex MINLP optimization problems*. Computers & Chemical Engineering. DOI: 10.1016/0098-1354(92)80028-8
+  - *establishes:* Introduces single-tree LP/NLP-based branch-and-bound, adding outer-approximation cuts as lazy constraints inside one branch-and-bound tree rather than re-solving a fresh MILP master from scratch each round.
+  - *relevance:* The single highest-leverage fix identified for `districting.py`'s pure-scale failure mode, eliminating the repeated re-solve-from-scratch cost that lets HiGHS hit iteration/time limits above roughly 125 units.
+- **Bonami2008** — Bonami et al. (2008). *An algorithmic framework for convex mixed integer nonlinear programs*. Discrete Optimization. DOI: 10.1016/j.disopt.2006.10.011
+  - *establishes:* Describes the Bonmin solver's five convex-MINLP algorithm variants, including a hybrid single-tree outer-approximation-in-branch-and-cut, and confirms empirically that single-tree methods consistently beat multi-tree outer approximation as instance size grows.
+  - *relevance:* Independent corroboration that the single-tree architecture is the right fix for `districting.py`'s scale wall, though Bonmin itself offers no Python callback for injecting the project's own connectivity cuts.
+- **Kronqvist2016** — Kronqvist et al. (2016). *The extended supporting hyperplane algorithm for convex mixed-integer nonlinear programming*. Journal of Global Optimization. DOI: 10.1007/s10898-015-0322-3
+  - *establishes:* Introduces the extended supporting-hyperplane algorithm, which generates cuts from boundary points found via line search rather than tangents at NLP-subproblem optima, typically needing fewer cuts than plain outer approximation on mildly curved feasible regions.
+  - *relevance:* Could reduce the outer-approximation round count that heavy-tailed unit values currently inflate 2–5x, since the Nash log-welfare surface is close to piecewise-linear once dominated by many summed unit values.
+- **HookerOttosson2003** — Hooker & Ottosson (2003). *Logic-based Benders decomposition*. Mathematical Programming. DOI: 10.1007/s10107-003-0375-9
+  - *establishes:* Generalizes Benders decomposition to any master/subproblem split where subproblem infeasibility can be certified and turned into a combinatorial no-good-style cut added back to the master, proving finite convergence via exhaustion of a finite cut set.
+  - *relevance:* The correct convergence theory for `districting.py`'s separator-cut loop — a different theory from outer approximation's convex-cut argument, confirming that the two cut families inside one loop do not share a convergence proof.
+- **CodatoFischetti2006** — Codato & Fischetti (2006). *Combinatorial Benders' Cuts for Mixed-Integer Linear Programming*. Operations Research. DOI: 10.1287/opre.1060.0286
+  - *establishes:* Specializes logic-based Benders decomposition to pure 0-1 MILP masters, showing that combinatorial Benders cuts retain finite convergence because the master's feasible set is finite.
+  - *relevance:* Formalizes exactly what `districting.py`'s separator-cut loop already does, and suggests deriving one stronger aggregated cut per disconnected component rather than many weak per-edge cuts.
+- **VielmaNemhauser2011** — Vielma & Nemhauser (2011). *Modeling disjunctive constraints with a logarithmic number of binary variables and constraints*. Mathematical Programming. DOI: 10.1007/s10107-009-0295-4
+  - *establishes:* Gives piecewise-linear encodings needing only O(log k) binary variables for a k-segment approximation, instead of O(k).
+  - *relevance:* Would keep the binary count small if the Nash log-welfare objective were replaced by an epsilon-certified piecewise-linear MILP, which matters once heavy-tailed values widen the range the approximation grid must cover.
+- **Boland2015** — Boland et al. (2015). *A Criterion Space Search Algorithm for Biobjective Mixed Integer Programming: The Triangle Splitting Method*. INFORMS Journal on Computing. DOI: 10.1287/ijoc.2015.0646
+  - *establishes:* Introduces the Triangle Splitting Method, a criterion-space search algorithm that enumerates the Pareto frontier of a biobjective mixed-integer program via a sequence of epsilon-constraint MILPs.
+  - *relevance:* Gives a formally exact way to treat (g_a, g_b) as a biobjective problem and select the Nash-welfare-maximizing point from the finite frontier — useful chiefly as a verification/audit tool for the outer-approximation solution rather than a wholesale replacement.
+- **Lemarechal1995** — Lemaréchal et al. (1995). *New variants of bundle methods*. Mathematical Programming. DOI: 10.1007/BF01585555
+  - *establishes:* Diagnoses why plain Kelley cutting planes zigzag and converge slowly when the objective is nearly flat near the optimum, and fixes this with the level method, which projects the next trial point into a target-gap level set instead of taking the master's raw optimum.
+  - *relevance:* Matches `districting.py`'s reported symptom exactly — a near-flat, low-rho objective causing multi-round cut-loop thrashing — and gives a provably faster-converging alternative.
+- **BenAmeurNeto2007** — Ben-Ameur & Neto (2007). *Acceleration of cutting-plane and column generation algorithms: Applications to network design*. Networks. DOI: 10.1002/net.20137
+  - *establishes:* Gives a cheaper in-out stabilization of cutting-plane and column-generation algorithms, separating at a point between a stable interior point and the master's optimum rather than at the raw optimum.
+  - *relevance:* A lower-engineering-cost alternative to the level method for the same flat-objective thrashing problem, needing only a line-search step rather than a new subproblem type.
+- **FischettiSalvagnin2010** — Fischetti & Salvagnin (2010). *An In-Out Approach to Disjunctive Optimization*. Integration of AI and OR Techniques in Constraint Programming for Combinatorial Optimization Problems (CPAIOR 2010). DOI: 10.1007/978-3-642-13520-0_17
+  - *establishes:* Applies the in-out stabilization idea specifically to branch-and-cut masters where cuts are generated lazily against a combinatorial/disjunctive feasible set, not just a smooth convex one.
+  - *relevance:* Confirms in-out stabilization applies to the connectivity-separator cut loop itself, not only the Nash-welfare outer-approximation loop, potentially avoiding oscillation between disconnected near-tied partitions.
+- **Pisinger2005** — Pisinger (2005). *Where are the hard knapsack problems?*. Computers & Operations Research. DOI: 10.1016/j.cor.2004.03.002
+  - *establishes:* Shows 0-1 knapsack hardness is driven by weight/value correlation and coefficient spread — a few dominant-value items create a loose LP relaxation — rather than by instance size alone.
+  - *relevance:* The closest available theoretical grounding for the project's heavy-tail failure mechanism; per-zip A_z/B_z values function like knapsack coefficients, and standard remedies (coefficient scaling, pre-fixing dominant nodes) are directly testable against the C9 battery case.
+- **KarypisKumar1998** — Karypis & Kumar (1998). *Multilevel k-way Partitioning Scheme for Irregular Graphs*. Journal of Parallel and Distributed Computing. DOI: 10.1006/jpdc.1997.1404
+  - *establishes:* METIS's foundational multilevel graph-partitioning method: coarsen the graph, partition the small coarse graph, then uncoarsen with local refinement.
+  - *relevance:* A fast heuristic first pass to get a starting bipartition and fix obviously one-sided ZCTAs before running the full contiguity MILP only on the disputed boundary corridor; off-the-shelf refinement alone does not guarantee a contiguous output.
+- **GurneeShmoys2021** — Gurnee & Shmoys (2021). *Fairmandering: A column generation heuristic for fairness-optimized political districting*. SIAM Conference on Applied and Computational Discrete Algorithms (ACDA21). DOI: 10.1137/1.9781611976830.9
+  - *establishes:* Fairmandering's column-generation heuristic recursively builds an ensemble of contiguous, balanced candidate districts, then solves a set-partitioning master problem to select one column per district under an arbitrary fairness objective.
+  - *relevance:* Because every generated column is contiguous by construction, this sidesteps the free-optimum-splits-first failure mode entirely as a warm-start generator, though the master objective would need to be adapted to the two-player Nash log-sum.
+- **DeFord2021** — DeFord et al. (2021). *Recombination: A Family of Markov Chains for Redistricting*. Harvard Data Science Review. DOI: 10.1162/99608f92.eb30390f
+  - *establishes:* Introduces ReCom, a Markov chain that merges two adjacent districts, draws a random spanning tree, and cuts an edge to re-split into two guaranteed-connected pieces near a balance target, implemented in the open-source GerryChain package.
+  - *relevance:* A low-cost, pip-installable warm-start and fallback generator that never constructs an unconstrained-but-disconnected optimum in the first place, directly targeting the pre-existing-disconnection failure mode and giving the solver a feasible MIP-start incumbent.
+- **RiosMercadoFernandez2009** — Ríos-Mercado & Fernández (2009). *A reactive GRASP for a commercial territory design problem with multiple balancing requirements*. Computers & Operations Research. DOI: 10.1016/j.cor.2007.10.024
+  - *establishes:* A reactive GRASP metaheuristic for commercial territory design with contiguity and multiple balance requirements, motivated by a real beverage-distribution application.
+  - *relevance:* The closest industry analogue to the rep-territory problem; GRASP constructions grow territories from seeds and so are contiguous by construction, never encountering the free-optimum-disconnection failure mode, at the cost of no optimality bound.
+- **Bozkaya2003** — Bozkaya et al. (2003). *A tabu search heuristic and adaptive memory procedure for political districting*. European Journal of Operational Research. DOI: 10.1016/s0377-2217(01)00380-0
+  - *establishes:* A tabu search heuristic with an adaptive memory of elite solutions for political districting under population balance, compactness, and hard contiguity checked at every move.
+  - *relevance:* Same profile as the GRASP heuristic above — a practical, always-contiguous fallback for when the exact MINLP times out, with no bound on solution quality.
+- **King2018** — King et al. (2018). *The geo-graph in practice: creating United States Congressional Districts from census blocks*. Computational Optimization and Applications. DOI: 10.1007/s10589-017-9936-3
+  - *establishes:* Develops the geo-graph model for enforcing contiguity at scale when building US Congressional districts directly from census blocks.
+  - *relevance:* A further cut-engineering reference on lazy contiguity generation at real census-geography scale, useful for mining implementation detail beyond the main Validi/Buchanan/Lykhovyd papers.
