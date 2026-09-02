@@ -1,0 +1,36 @@
+# Deny-by-default. Corpora (raw, OCR, bundles, distillations) are large and regenerable;
+# only the text that downstream tools depend on is tracked. Add an explicit `!` line to track more.
+
+/*
+
+# --- allowlist ---
+!.gitignore
+!README.md
+!*/
+!*/FOUNDATIONS.md
+!*/STATUS.md
+!*/ARTIFACT_DRAFT.md
+!*/sources.tsv
+!*/corpus.toml
+!*/manifest.tsv
+!*/_tools/
+!*/_tools/*.py
+!*/_tools/*.sh
+!*.bib
+!*.csv
+!*.tsv
+
+# --- never, whatever is allowlisted above ---
+*.pdf
+*/raw/
+*/raw_flat/
+*/text/
+*/markdown/
+*/units/
+*/DISTILLATION/
+*/SYNTHESIS_INPUT.md
+*/_tools/.venv/
+*/_tools/llamacpp/
+*/_tools/*.log
+*/.marker_pid
+*/*.log
