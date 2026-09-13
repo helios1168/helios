@@ -20,7 +20,7 @@ import pkgutil
 from collections.abc import Iterable, Sequence
 from types import ModuleType
 
-from helios import commands
+from helios import __version__, commands
 
 
 def discover() -> list[ModuleType]:
@@ -35,6 +35,7 @@ def discover() -> list[ModuleType]:
 
 def build_parser(modules: Iterable[ModuleType] | None = None) -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="helios", description="Research workflow kit.")
+    root.add_argument("--version", action="store_true", help="Print version and exit.")
     parsers: dict[tuple[str, ...], argparse.ArgumentParser] = {(): root}
     groups: dict[tuple[str, ...], argparse._SubParsersAction] = {}
     commands_seen: set[tuple[str, ...]] = set()
@@ -70,6 +71,9 @@ def build_parser(modules: Iterable[ModuleType] | None = None) -> argparse.Argume
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "version", False):
+        print(f"helios {__version__}")
+        return 0
     run = getattr(args, "_run", None)
     if run is None:
         parser.print_help()

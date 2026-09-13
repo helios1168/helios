@@ -37,3 +37,8 @@ def test_real_package_builds():
 def test_no_command_prints_help(capsys):
     assert cli.main([]) == 2
     assert "helios" in capsys.readouterr().out
+
+
+def test_version_prints_version(capsys):
+    assert cli.main(["--version"]) == 0
+    assert capsys.readouterr().out == "helios 0.1.0\n"
