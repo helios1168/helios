@@ -14,6 +14,8 @@ import os
 import signal
 import subprocess
 import sys
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,7 +27,11 @@ from helios import events as events_mod
 from helios import ownership as ownership_mod
 from helios import prompt as prompt_mod
 from helios import worktree as worktree_mod
-from helios.harness.base import LaunchSpec
+from helios.harness.base import Harness, LaunchSpec
+
+_RUNNING: dict[str, subprocess.Popen[str]] = {}
+_RUNNING_LOCK = threading.Lock()
+_INTERRUPTED: set[str] = set()
 
 
 def sha256_text(text: str) -> str:
@@ -116,7 +122,7 @@ def classify_execution(
     has_candidate: bool,
     report_valid: bool,
 ) -> envelope_mod.ExecutionStatus:
-    """Map process facts and capture outcome to SPEC §4.4."""
+    """Map process facts and capture outcome to SPEC §4.4, in SPEC order."""
     if launch_failed:
         return envelope_mod.ExecutionStatus.LAUNCH_FAILED
     if interrupted:
@@ -134,32 +140,45 @@ def classify_execution(
     return envelope_mod.ExecutionStatus.MISSING_OUTPUT
 
 
-def _kill_sequence(proc: subprocess.Popen) -> int | None:
-    """SIGINT, wait 10 s, then SIGTERM, wait 5 s, then SIGKILL (SPEC §7.1)."""
+def _signal_group(proc: subprocess.Popen[str], sig: int) -> None:
+    """Send a signal to the child's process group, else the child (SPEC §7.1)."""
     try:
-        proc.send_signal(signal.SIGINT)
+        os.killpg(os.getpgid(proc.pid), sig)
+        return
+    except (ProcessLookupError, PermissionError, ValueError, OSError):
+        pass
+    try:
+        proc.send_signal(sig)
     except (ProcessLookupError, ValueError, OSError):
         pass
+
+
+def _kill_sequence(proc: subprocess.Popen[str]) -> int | None:
+    """SIGINT, wait 10 s, then SIGTERM, wait 5 s, then SIGKILL (SPEC §7.1)."""
+    _signal_group(proc, signal.SIGINT)
     try:
         return proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         pass
-    try:
-        proc.terminate()
-    except (ProcessLookupError, ValueError, OSError):
-        pass
+    _signal_group(proc, signal.SIGTERM)
     try:
         return proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
-    try:
-        proc.kill()
-    except (ProcessLookupError, ValueError, OSError):
-        pass
+    _signal_group(proc, signal.SIGKILL)
     try:
         return proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         return proc.poll()
+
+
+def stop_all_running() -> None:
+    """Run the stop sequence on every running attempt (SPEC §7.1 SIGINT)."""
+    with _RUNNING_LOCK:
+        items = list(_RUNNING.items())
+    for key, proc in items:
+        _INTERRUPTED.add(key)
+        _kill_sequence(proc)
 
 
 def _launch_and_wait(
@@ -171,12 +190,16 @@ def _launch_and_wait(
     stdout_path: Path,
     stderr_path: Path,
     timeout_s: int,
+    run_key: str,
+    on_launched: Callable[[int], None] | None = None,
 ) -> tuple[int | None, bool, bool, bool, int | None]:
     """Run one attempt; return (exit, timed_out, interrupted, launch_failed, pid).
 
-    Timeout and KeyboardInterrupt both follow the SIGINT, SIGTERM, SIGKILL
-    sequence of SPEC §7.1 step 7. The pid is the child process id, used for
-    the attempt record and liveness checks.
+    The child runs in its own session and every signal goes to its process
+    group (SPEC §7.1 step 7). ``launched`` with the child pid is recorded
+    through ``on_launched`` as soon as ``Popen`` returns, before waiting
+    (SPEC §8.2). A SIGINT to the main thread while worker threads run is
+    delivered through the shared registry (see ``stop_all_running``).
     """
     try:
         out_fh = open(stdout_path, "w")
@@ -188,34 +211,53 @@ def _launch_and_wait(
         out_fh.close()
         return None, False, False, True, None
     with out_fh, err_fh:
+        stdin_arg: int | None = None
+        stdin_value: str | None = None
+        if stdin_text is not None:
+            stdin_arg = subprocess.PIPE
+            stdin_value = stdin_text
+        else:
+            stdin_arg = subprocess.DEVNULL
         try:
             proc = subprocess.Popen(
                 argv,
                 cwd=cwd,
                 stdout=out_fh,
                 stderr=err_fh,
-                stdin=subprocess.PIPE if stdin_text is not None else None,
+                stdin=stdin_arg,
                 env=env,
                 text=True,
+                start_new_session=True,
             )
         except OSError:
             return None, False, False, True, None
         child_pid: int | None = proc.pid
-        if stdin_text is not None and proc.stdin is not None:
+        if stdin_value is not None and proc.stdin is not None:
             try:
-                proc.stdin.write(stdin_text)
+                proc.stdin.write(stdin_value)
                 proc.stdin.close()
             except (BrokenPipeError, OSError, ValueError):
                 pass
+        if on_launched is not None:
+            on_launched(child_pid)
+        with _RUNNING_LOCK:
+            _RUNNING[run_key] = proc
         try:
-            exit_code = proc.wait(timeout=timeout_s)
+            try:
+                exit_code = proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                exit_code = _kill_sequence(proc)
+                return exit_code, True, False, False, child_pid
+            except KeyboardInterrupt:
+                exit_code = _kill_sequence(proc)
+                return exit_code, False, True, False, child_pid
+            if run_key in _INTERRUPTED:
+                return exit_code, False, True, False, child_pid
             return exit_code, False, False, False, child_pid
-        except subprocess.TimeoutExpired:
-            exit_code = _kill_sequence(proc)
-            return exit_code, True, False, False, child_pid
-        except KeyboardInterrupt:
-            exit_code = _kill_sequence(proc)
-            return exit_code, False, True, False, child_pid
+        finally:
+            with _RUNNING_LOCK:
+                _RUNNING.pop(run_key, None)
+            _INTERRUPTED.discard(run_key)
 
 
 def _run_shell(
@@ -248,28 +290,23 @@ def _git(worktree: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def _commit_changes(worktree: Path, bead_id: str, summary: str) -> str | None:
-    """Commit leftover changes; return the new HEAD or None when clean."""
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=worktree,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if status.returncode != 0 or not status.stdout.strip():
-        return None
-    _git(worktree, "add", "-A")
-    status2 = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=worktree,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if not status2.stdout.strip():
-        return None
-    message = f"{bead_id}: {summary}"
+def _head_commit(worktree: Path) -> str:
+    return _git(worktree, "rev-parse", "HEAD")
+
+
+def _stage_and_commit(
+    worktree: Path, bead_id: str, summary: str, paths: list[str]
+) -> tuple[bool, str]:
+    """Stage exactly ``paths`` and commit when anything is staged (SPEC §7.1).
+
+    Returns (committed, head): ``committed`` is True when this call created
+    a commit; ``head`` is the worktree HEAD afterwards.
+    """
+    if paths:
+        _git(worktree, "add", "-A", "--", *paths)
+    staged = _git(worktree, "diff", "--cached", "--name-only")
+    if not staged.strip():
+        return False, _head_commit(worktree)
     _git(
         worktree,
         "-c",
@@ -278,9 +315,9 @@ def _commit_changes(worktree: Path, bead_id: str, summary: str) -> str | None:
         "user.name=helios",
         "commit",
         "-m",
-        message,
+        f"{bead_id}: {summary}",
     )
-    return _git(worktree, "rev-parse", "HEAD")
+    return True, _head_commit(worktree)
 
 
 def _exit_code_for(
@@ -303,6 +340,23 @@ def _exit_code_for(
     return 0 if report.status is envelope_mod.WorkStatus.DONE else 3
 
 
+def _correct_run_state(
+    *,
+    execution_status: envelope_mod.ExecutionStatus,
+    report: envelope_mod.AgentReport | None,
+    checks_passed: bool,
+) -> str:
+    """The ``bd set-state run=`` value of SPEC §7.5."""
+    if (
+        execution_status is not envelope_mod.ExecutionStatus.COMPLETED
+        or not checks_passed
+    ):
+        return "failed"
+    if report is not None and report.status is envelope_mod.WorkStatus.BLOCKED:
+        return "blocked"
+    return "waiting"
+
+
 def _event_type_for(
     *,
     execution_status: envelope_mod.ExecutionStatus,
@@ -320,6 +374,13 @@ def _event_type_for(
     if report.status is envelope_mod.WorkStatus.NEEDS_REVIEW:
         return "needs_review"
     return "failed"
+
+
+def _missing_skill(hub: Path, kind: str) -> str | None:
+    """The preflight error when ``skills/<kind>/SKILL.md`` is absent (SPEC §7.1)."""
+    if not (hub / "skills" / kind / "SKILL.md").is_file():
+        return f"skills/{kind}/SKILL.md does not exist in the hub"
+    return None
 
 
 @dataclass
@@ -368,6 +429,13 @@ def _finish_attempt(
         has_candidate=has_candidate,
         report_valid=report is not None,
     )
+    if execution is envelope_mod.ExecutionStatus.COMPLETED and (
+        (proc_exit is not None and proc_exit != 0) or native_error is not None
+    ):
+        notes.append(
+            "completed with a valid report; "
+            f"native issue ignored ({native_error or f'exit code {proc_exit}'})"
+        )
     finished_at = attempt_mod.utc_now()
 
     if transition_from is not None:
@@ -439,10 +507,15 @@ def _finish_attempt(
     )
     checks_passed = all(c.passed for c in checks)
 
-    output_commit: str | None = None
-    if report is not None and ownership.passed:
+    if not ownership.passed:
+        output_commit: str | None = None
+    else:
+        summary = report.summary if report is not None else execution.value
         try:
-            output_commit = _commit_changes(args.worktree_path, bead.id, report.summary)
+            _stage_and_commit(
+                args.worktree_path, bead.id, summary, list(ownership.allowed)
+            )
+            output_commit = _head_commit(args.worktree_path)
         except RuntimeError:
             checks.append(
                 envelope_mod.Check(
@@ -450,6 +523,7 @@ def _finish_attempt(
                 )
             )
             checks_passed = False
+            output_commit = None
 
     harness_cfg = args.config.harness.get(args.harness_name)
     verdict: str | None = None
@@ -500,6 +574,12 @@ def _finish_attempt(
         checks_passed=checks_passed,
     )
     beads_mod.apply_writeback(args.beads, bead.id, plan)
+    if not plan.close:
+        want = _correct_run_state(
+            execution_status=execution, report=report, checks_passed=checks_passed
+        )
+        if plan.run_state != want:
+            args.beads.set_state(bead.id, "run", want, plan.close_reason)
     attempt_mod.transition(attempt_dir, "finalized")
     session = f"{args.harness_name}:{native_session}" if native_session else None
     events_mod.append(
@@ -595,6 +675,67 @@ def _assemble_inputs(
     return prompt, hashes, bead_json, docs_texts, memories, unit_text
 
 
+def _dry_run_one(
+    bead_id: str,
+    *,
+    hub: Path,
+    bead: beads_mod.Bead,
+    config: config_mod.Config,
+    harness_name: str,
+    harness: Harness,
+    effective_timeout: int,
+) -> int:
+    """Print the dry-run plan; create, move or write nothing (SPEC §7.1)."""
+    adapter = harness
+    latest = attempt_mod.latest_state(hub, config.project.runs, bead_id)
+    if latest is None:
+        action = "new"
+    else:
+        action = attempt_mod.classify_recovery(
+            latest.get("state"),
+            pid_alive=attempt_mod.is_pid_alive(latest.get("pid")),
+        )
+    print(f"recovery: {action}")
+    worktree_path = hub / config.project.worktrees / bead_id
+    branch = worktree_mod.branch_name(bead_id)
+    numbers = attempt_mod.existing_attempts(hub / config.project.runs / bead_id)
+    next_n = (numbers[-1] if numbers else 0) + 1
+    attempt_path = hub / config.project.runs / bead_id / f"attempt-{next_n}"
+    report_path = attempt_mod.worktree_report_path(worktree_path, next_n)
+    prompt, _, _, _, _, _ = _assemble_inputs(
+        hub=hub,
+        config=config,
+        bead=bead,
+        worktree_path=worktree_path,
+        branch=branch,
+        attempt_id=f"{bead_id}#{next_n}",
+        report_path=report_path,
+    )
+    harness_cfg = config.harness.get(harness_name)
+    spec = LaunchSpec(
+        bead=bead_id,
+        attempt=next_n,
+        worktree=worktree_path,
+        prompt=prompt,
+        report_path=report_path,
+        report_schema_path=attempt_path / "report-schema.json",
+        raw_dir=attempt_path / "raw",
+        model=harness_cfg.model if harness_cfg else None,
+        effort=harness_cfg.effort if harness_cfg else None,
+        timeout_s=effective_timeout,
+        server_url=harness_cfg.server_url if harness_cfg else None,
+        extra_args=tuple(harness_cfg.extra_args) if harness_cfg else (),
+        env=dict(os.environ),
+    )
+    argv = adapter.argv(spec)
+    print(f"harness: {harness_name}")
+    print(f"argv: {' '.join(argv)}")
+    print(f"worktree: {worktree_path}")
+    print(f"attempt: {attempt_path}")
+    print(f"prompt_bytes: {len(prompt.encode('utf-8'))}")
+    return 0
+
+
 def run_one(
     bead_id: str,
     *,
@@ -610,6 +751,10 @@ def run_one(
     hub = hub.resolve()
     cfg = config if config is not None else config_mod.load(hub)
     bead = beads.show(bead_id)
+    skill_error = _missing_skill(hub, bead.kind)
+    if skill_error is not None:
+        print(f"preflight: {bead_id}: {skill_error}", file=sys.stderr)
+        return 2
     harness_name = config_mod.harness_for_kind(
         cfg, bead.kind, author=bead.author, override=harness_override
     )
@@ -622,6 +767,17 @@ def run_one(
         if timeout_s is not None
         else (harness_cfg.timeout_s if harness_cfg else 3600)
     )
+
+    if dry_run:
+        return _dry_run_one(
+            bead_id,
+            hub=hub,
+            bead=bead,
+            config=cfg,
+            harness_name=harness_name,
+            harness=harness,
+            effective_timeout=effective_timeout,
+        )
 
     latest = attempt_mod.latest_state(hub, cfg.project.runs, bead_id)
     if latest is not None:
@@ -645,49 +801,11 @@ def run_one(
             )
             if old_dir.is_dir():
                 try:
+                    if action == "crash_and_new":
+                        attempt_mod.transition(old_dir, "crashed")
                     attempt_mod.transition(old_dir, "finalized")
                 except (OSError, ValueError, KeyError):
                     pass
-
-    worktree_path = hub / cfg.project.worktrees / bead_id
-    branch = worktree_mod.branch_name(bead_id)
-    if dry_run:
-        numbers = attempt_mod.existing_attempts(hub / cfg.project.runs / bead_id)
-        next_n = (numbers[-1] if numbers else 0) + 1
-        attempt_path = hub / cfg.project.runs / bead_id / f"attempt-{next_n}"
-        report_path = attempt_mod.worktree_report_path(worktree_path, next_n)
-        prompt, _, _, _, _, _ = _assemble_inputs(
-            hub=hub,
-            config=cfg,
-            bead=bead,
-            worktree_path=worktree_path,
-            branch=branch,
-            attempt_id=f"{bead_id}#{next_n}",
-            report_path=report_path,
-        )
-        raw_dir = attempt_path / "raw"
-        schema_path = attempt_path / "report-schema.json"
-        spec = LaunchSpec(
-            bead=bead_id,
-            attempt=next_n,
-            worktree=worktree_path,
-            prompt=prompt,
-            report_path=report_path,
-            report_schema_path=schema_path,
-            raw_dir=raw_dir,
-            model=harness_cfg.model if harness_cfg else None,
-            effort=harness_cfg.effort if harness_cfg else None,
-            timeout_s=effective_timeout,
-            server_url=harness_cfg.server_url if harness_cfg else None,
-            extra_args=tuple(harness_cfg.extra_args) if harness_cfg else (),
-            env=dict(os.environ),
-        )
-        print(f"harness: {harness_name}")
-        print(f"argv: {' '.join(harness.argv(spec))}")
-        print(f"worktree: {worktree_path}")
-        print(f"attempt: {attempt_path}")
-        print(f"prompt_bytes: {len(prompt.encode('utf-8'))}")
-        return 0
 
     info = worktree_mod.prepare(
         hub=hub,
@@ -755,27 +873,21 @@ def run_one(
             "HELIOS_REPORT": str(report_path),
         }
     )
-    session_hint: str | None = None
-    try:
-        script_ref = env.get("HELIOS_FAKE_SCRIPT", "")
-        if script_ref:
-            try:
-                script_ref_text = Path(script_ref).read_text()
-                session_hint = str(json.loads(script_ref_text).get("session_id"))
-            except (OSError, ValueError, AttributeError):
-                session_hint = None
-    except Exception:
-        session_hint = None
+    run_key = str(attempt_obj.dir)
+
+    def _record_launched(pid: int) -> None:
+        attempt_mod.transition(attempt_obj.dir, "launched", pid=pid)
+
     events_mod.append(
         hub,
         source="helios",
         type="launched",
         bead=bead_id,
         attempt=attempt_obj.attempt_id,
-        session=f"{harness_name}:{session_hint}" if session_hint else None,
+        session=None,
         detail=f"harness {harness_name}",
     )
-    proc_exit, timed_out, interrupted, launch_failed, child_pid = _launch_and_wait(
+    proc_exit, timed_out, interrupted, launch_failed, _child = _launch_and_wait(
         argv,
         cwd=worktree_path,
         env=env,
@@ -783,8 +895,11 @@ def run_one(
         stdout_path=stdout_path,
         stderr_path=stderr_path,
         timeout_s=effective_timeout,
+        run_key=run_key,
+        on_launched=_record_launched,
     )
-    attempt_mod.transition(attempt_obj.dir, "launched", pid=child_pid)
+    if launch_failed:
+        attempt_mod.transition(attempt_obj.dir, "launch_failed")
     native = harness.parse(spec, proc_exit, stdout_path)
     finish_args = _FinishArgs(
         hub=hub,
@@ -808,7 +923,7 @@ def run_one(
         interrupted=interrupted,
         timed_out=timed_out,
         launch_failed=launch_failed,
-        transition_from="launched",
+        transition_from=None if launch_failed else "launched",
     )
 
 
@@ -935,6 +1050,10 @@ def run_many(
         units_dir=cfg.project.units,
     )
     errors = preflight_mod.check(loaded, ctx)
+    for bead in loaded:
+        missing = _missing_skill(hub, bead.kind)
+        if missing is not None:
+            errors.append(f"{bead.id}: {missing}")
     if errors:
         for line in errors:
             print(f"preflight: {line}", file=sys.stderr)
@@ -983,6 +1102,16 @@ def run_many(
             ): bid
             for bid in bead_ids
         }
-        for future in concurrent.futures.as_completed(future_of):
-            results[future_of[future]] = future.result()
+        try:
+            for future in concurrent.futures.as_completed(future_of):
+                results[future_of[future]] = future.result()
+        except KeyboardInterrupt:
+            stop_all_running()
+            for future in concurrent.futures.as_completed(future_of):
+                try:
+                    results[future_of[future]] = future.result()
+                except KeyboardInterrupt:
+                    results[future_of[future]] = 4
+                except Exception:
+                    results[future_of[future]] = 4
     return max(results.values(), default=0)
