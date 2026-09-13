@@ -8,8 +8,9 @@ All failures exit 2 before anything is created:
   argument); every path in ``docs`` exists, and every ``path#key`` resolves
   to a section (SPEC §7.2).
 - ``verify-math`` needs a substantive ``## Model``: the stripped lines that
-  are not headings, blank or the ``_empty_`` placeholder total at least 200
-  characters; line breaks do not count.
+  are not headings in the SPEC §7.2 sense, not blank and not the ``_empty_``
+  placeholder total at least 200 characters; line breaks do not count. A line
+  inside a code fence, or without a space after ``#``, counts like any other.
 - beads launched together have disjoint ``files``. Two entries overlap when
   either matches the other read as a literal path, or when neither is a
   literal path and the literal prefix of one starts with the literal prefix
@@ -29,7 +30,7 @@ from pathlib import Path
 from helios import attempt as attempt_mod
 from helios.beads import Bead
 from helios.ownership import glob_match
-from helios.prompt import find_section
+from helios.prompt import find_section, heading_lines
 
 MODEL_MIN_CHARS = 200
 
@@ -94,6 +95,8 @@ def _check_doc(bead_id: str, entry: str, ctx: PreflightContext) -> list[str]:
     path = ctx.hub / path_text
     if not path.exists():
         return [f"{bead_id}: docs path {path_text!r} does not exist"]
+    if not path.is_file():
+        return [f"{bead_id}: docs path {path_text!r} is a directory, not a file"]
     if sep:
         try:
             find_section(path.read_text(), key)
@@ -111,10 +114,11 @@ def _check_model(bead: Bead, ctx: PreflightContext) -> list[str]:
         model = find_section(path.read_text(), "Model")
     except KeyError:
         return [f"{bead.id}: unit file has no ## Model section"]
+    headings = heading_lines(model)
     substance = sum(
-        len(line.strip())
-        for line in model.splitlines()
-        if (stripped := line.strip()) and not stripped.startswith("#") and stripped != "_empty_"
+        len(stripped)
+        for n, line in enumerate(model.splitlines())
+        if (stripped := line.strip()) and n not in headings and stripped != "_empty_"
     )
     if substance < MODEL_MIN_CHARS:
         return [f"{bead.id}: ## Model is not substantive (needs 200 characters)"]

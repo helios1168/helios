@@ -6,11 +6,15 @@ stay unquoted. Each path must match a ``files`` entry or start with a prefix
 in ``project.always_allowed``. A ``files`` entry ending in ``/`` covers
 everything below that directory. Any other entry is a glob matched against
 the whole path: ``*`` and ``?`` never match ``/``, ``**`` matches any number
-of path segments, ``[...]`` is a character class. So ``src/*.py`` owns
-``src/a.py`` but not ``src/sub/a.py``. Verify kinds may touch only
+of path segments, ``[...]`` is a character class that never matches ``/`` and
+is negated by a leading ``!``. So ``src/*.py`` owns ``src/a.py`` but not
+``src/sub/a.py``. Verify kinds may touch only
 ``<verify_artifacts>/<unit>/``. Always rejected, whatever the globs say:
 ``.beads/``, ``.helios/``, ``.agents/``, the memory export directory, and
-anything matching ``project.confidential``.
+anything matching ``project.confidential``. A confidential glob without ``/``
+matches the last path segment at any depth, so ``*.pem`` matches
+``keys/a.pem``. An untracked symlink whose path matches a
+``project.link_into_worktrees`` glob is not a change.
 """
 
 from __future__ import annotations
@@ -43,12 +47,25 @@ def _run_git(worktree: Path, *args: str) -> bytes:
     return proc.stdout
 
 
-def changed_paths(worktree: Path, base_commit: str) -> list[str]:
-    """Tracked changes since ``base_commit`` plus untracked files (SPEC §7.4)."""
+def changed_paths(
+    worktree: Path, base_commit: str, *, link_into_worktrees: tuple[str, ...] = ()
+) -> list[str]:
+    """Tracked changes since ``base_commit`` plus untracked files (SPEC §7.4).
+
+    An untracked symlink whose path matches a ``link_into_worktrees`` glob is
+    a linked environment file, not a change.
+    """
     tracked = _run_git(worktree, "diff", "--name-only", "--no-renames", "-z", base_commit)
     untracked = _run_git(worktree, "ls-files", "--others", "--exclude-standard", "-z")
-    paths = tracked.split(b"\0") + untracked.split(b"\0")
-    return sorted({p.decode("utf-8") for p in paths if p})
+    paths = {p.decode("utf-8") for p in tracked.split(b"\0") if p}
+    for raw in untracked.split(b"\0"):
+        if not raw:
+            continue
+        path = raw.decode("utf-8")
+        if (worktree / path).is_symlink() and _matches_any(path, link_into_worktrees):
+            continue
+        paths.add(path)
+    return sorted(paths)
 
 
 def glob_to_regex(pattern: str) -> str:
@@ -69,11 +86,14 @@ def glob_to_regex(pattern: str) -> str:
             i += 1
         elif char == "[":
             close = pattern.find("]", i + 1)
-            if close == -1:
+            inner = pattern[i + 1 : close] if close != -1 else ""
+            if close == -1 or inner in ("", "!"):
                 out.append("\\[")
                 i += 1
             else:
-                out.append(pattern[i : close + 1])
+                if inner.startswith("!"):
+                    inner = "^" + inner[1:]
+                out.append(f"(?![/])[{inner}]")
                 i = close + 1
         else:
             out.append(re.escape(char))
@@ -102,6 +122,14 @@ def _matches_any(path: str, patterns: list[str] | tuple[str, ...]) -> bool:
     return False
 
 
+def _matches_confidential(path: str, confidential: tuple[str, ...]) -> bool:
+    """Confidential match; a glob without ``/`` hits the last segment (SPEC §7.4)."""
+    if _matches_any(path, list(confidential)):
+        return True
+    last = path.rsplit("/", 1)[-1]
+    return any("/" not in entry and glob_match(last, entry) for entry in confidential)
+
+
 def check(
     *,
     worktree: Path,
@@ -113,16 +141,17 @@ def check(
     unit: str | None = None,
     confidential: tuple[str, ...] = (),
     memory_export_dir: str = ".helios/memories",
+    link_into_worktrees: tuple[str, ...] = (),
 ) -> OwnershipResult:
     """Sort the changed paths into allowed and rejected (SPEC §7.4)."""
     rejected_prefixes = (*ALWAYS_REJECTED, memory_export_dir.rstrip("/") + "/")
     allowed: list[str] = []
     rejected: list[str] = []
-    for path in changed_paths(worktree, base_commit):
+    for path in changed_paths(worktree, base_commit, link_into_worktrees=link_into_worktrees):
         if any(_is_prefix_match(path, prefix) for prefix in rejected_prefixes):
             rejected.append(path)
             continue
-        if _matches_any(path, list(confidential)):
+        if _matches_confidential(path, confidential):
             rejected.append(path)
             continue
         if kind.startswith("verify"):

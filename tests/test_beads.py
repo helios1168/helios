@@ -119,6 +119,17 @@ def test_comment_has_matches_kind_and_marker() -> None:
     assert not comment_has(comments, "followup", "[b#1#2]")
 
 
+def test_comment_has_ignores_quoted_markers() -> None:
+    comments = [
+        Comment(
+            id="c", issue_id="hel-x", author="a",
+            text="learned: [hel-x#2#1] see [hel-x#11] for context",
+        )
+    ]
+    assert comment_has(comments, "learned", "[hel-x#2#1]")
+    assert not comment_has(comments, "learned", "[hel-x#11]")
+
+
 BD = shutil.which("bd")
 
 

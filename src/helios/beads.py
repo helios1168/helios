@@ -108,10 +108,12 @@ def comment_kind(text: str) -> str:
 
 
 def comment_has(comments: list[Comment], kind: str, marker: str) -> bool:
-    """True when a comment with that kind and marker already exists (SPEC §7.5)."""
-    return any(
-        comment_kind(c.text) == kind and marker in c.text for c in comments
-    )
+    """True when a comment starts with ``<kind>: <marker>`` (SPEC §7.5).
+
+    A marker quoted later in the text does not count.
+    """
+    prefix = f"{kind}: {marker}"
+    return any(c.text.startswith(prefix) for c in comments)
 
 
 @dataclass(frozen=True)

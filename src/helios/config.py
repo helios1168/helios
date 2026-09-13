@@ -170,6 +170,13 @@ def _check_type(dotted: str, value: Any, want: str) -> None:
         raise TypeError(f"config key {dotted!r} has the wrong type: {value!r}")
 
 
+def _validated_table(table: Any, types: dict[str, str], prefix: str) -> dict:
+    """Type-check a section table, then return it as a dict (SPEC §5)."""
+    _check_table(table, types, prefix)
+    assert isinstance(table, dict)
+    return dict(table)
+
+
 def _check_table(table: Any, types: dict[str, str], prefix: str) -> None:
     if not isinstance(table, dict):
         raise TypeError(f"config key {prefix!r} must be a table")
@@ -205,6 +212,10 @@ def _harness(table: dict) -> dict[str, HarnessConfig]:
         if not isinstance(sub, dict):
             raise TypeError(f"config key 'harness.{name}' must be a table")
         _check_table(sub, _HARNESS_TYPES, f"harness.{name}")
+        if name != "opencode" and "server_url" in sub:
+            raise ValueError(
+                f"unknown config key 'harness.{name}.server_url' (only harness.opencode has it)"
+            )
         data = dict(sub)
         if "extra_args" in data:
             data["extra_args"] = tuple(data["extra_args"])
@@ -236,13 +247,11 @@ def load(start: Path) -> Config:
             raise ValueError(f"unknown config key {key!r}")
     project = _project(raw.get("project", {}))
     agents = _agents(raw.get("agents", {}))
-    control_raw = dict(raw.get("control", {}))
-    _check_table(control_raw, _CONTROL_TYPES, "control")
+    control_raw = _validated_table(raw.get("control", {}), _CONTROL_TYPES, "control")
     for key in ("stop_at", "confirm"):
         if key in control_raw:
             control_raw[key] = tuple(control_raw[key])
-    memory_raw = dict(raw.get("memory", {}))
-    _check_table(memory_raw, _MEMORY_TYPES, "memory")
+    memory_raw = _validated_table(raw.get("memory", {}), _MEMORY_TYPES, "memory")
     return Config(
         hub=hub,
         project=project,

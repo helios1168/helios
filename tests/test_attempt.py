@@ -43,6 +43,16 @@ def test_allocation_numbers_moves_stale_writes_atomically(tmp_path: Path) -> Non
     assert [json.loads(line)["state"] for line in lines] == ["allocated", "launched"]
 
 
+def test_allocate_retries_when_n_is_taken(tmp_path: Path) -> None:
+    hub = make_repo(tmp_path / "hub")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    taken = hub / ".helios" / "runs" / "b1" / "attempt-1"
+    taken.mkdir(parents=True)
+    attempt, _ = att.allocate(hub=hub, runs_rel=".helios/runs", bead="b1", worktree=worktree)
+    assert attempt.n == 2
+
+
 def test_recovery_classification() -> None:
     assert att.classify_recovery(None, pid_alive=False) == "new"
     assert att.classify_recovery("finalized", pid_alive=False) == "new"

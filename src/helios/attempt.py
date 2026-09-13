@@ -136,8 +136,14 @@ def allocate(
     Returns the attempt and notes (SPEC §8.3).
     """
     n = next_attempt_number(runs_dir(hub, runs_rel, bead))
-    dir = attempt_dir(hub, runs_rel, bead, n)
-    dir.mkdir(parents=True, exist_ok=True)
+    while True:
+        dir = attempt_dir(hub, runs_rel, bead, n)
+        try:
+            dir.mkdir(parents=True)
+        except FileExistsError:
+            n += 1
+            continue
+        break
     notes: list[str] = []
     stale = worktree_report_path(worktree, n)
     if stale.is_file():

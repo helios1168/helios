@@ -122,6 +122,19 @@ def test_assemble_fenced_lines_are_never_headings() -> None:
             pr.find_section("## Real\n\nx\n", "Also fake")
 
 
+def test_heading_and_fence_shapes() -> None:
+    assert pr._headings("#nospace\n") == []
+    assert pr._headings("####### seven\n") == []
+    assert pr._headings("## Title\n") == [(0, 2, "Title", "Title")]
+    assert pr._headings("#\n") == [(0, 1, "", "")]
+    long_fence = "````\n``` still open\n````\n\n## After\n"
+    assert pr.find_section(long_fence, "After").startswith("## After")
+    unclosed = "## A\n\ntext\n\n```\n# never\n"
+    assert pr.find_section(unclosed, "A").count("# never") == 1
+    with pytest.raises(KeyError):
+        pr.find_section(unclosed, "never")
+
+
 def test_assemble_caps_docs_plus_memories() -> None:
     import tempfile
 
@@ -138,6 +151,44 @@ def test_assemble_caps_docs_plus_memories() -> None:
         docs_text = out.split("## Docs\n\n")[1].split("\n\n## Memories")[0]
         memories_text = out.split("## Memories\n\n")[1].split("\n\n## Attempt")[0]
         assert len((docs_text + memories_text).encode("utf-8")) <= 1000
+
+
+def test_apply_cap_keeps_longest_fitting_prefix() -> None:
+    part = lambda n, s: (n, f"### {n}\n\n" + "a" * (s - len(f"### {n}\n\n")))
+    docs = [
+        part("docs/gen/d1243_0.md", 150),
+        part("docs/gen/d1243_1.md", 101),
+        part("docs/gen/d1243_2.md", 715),
+    ]
+    mems = [part("m" * 16 + "0", 620), part("m" * 18 + "1", 620)]
+    kept_docs, kept_mems, note = pr._apply_cap(docs, mems, 1312)
+    assert pr._capped_bytes(kept_docs, kept_mems, note) <= 1312
+    assert note.startswith("[truncated for inject cap: ")
+
+
+def test_apply_cap_randomized_prefix_and_cap() -> None:
+    import random
+
+    rng = random.Random(1243)
+    for trial in range(50):
+        names = [f"item-{i}" for i in range(rng.randint(1, 6))]
+        items = [(n, f"### {n}\n\n" + "x" * rng.randint(0, 400)) for n in names]
+        docs, mems = items[: len(items) // 2], items[len(items) // 2 :]
+        cap = rng.randint(0, 1200)
+        kept_docs, kept_mems, note = pr._apply_cap(docs, mems, cap)
+        assert pr._capped_bytes(kept_docs, kept_mems, note) <= cap
+        kept_names = [n for n, _ in docs[: len(kept_docs)]] + [
+            n for n, _ in mems[: len(kept_mems)]
+        ]
+        assert kept_names == names[: len(kept_names)]
+        cut = names[len(kept_names) :]
+        if cut:
+            assert note
+            if len(pr._note_text(cut).encode("utf-8")) <= cap:
+                assert all(n in note for n in cut)
+            assert len(note.encode("utf-8")) <= cap
+        else:
+            assert note == ""
 
 
 def test_assemble_cap_never_splits_a_character() -> None:
@@ -215,6 +266,25 @@ def test_preflight_model_counts_text_not_newlines(tmp_path: Path) -> None:
     ctx = PreflightContext(hub=hub, memory_has=memory_map({}), units_dir="docs/units")
     bead = Bead(id="v1", kind="verify-math", unit="U1", parent="b1")
     assert any("substantive" in e for e in check([bead], ctx))
+
+
+def test_preflight_model_uses_section_headings_and_fences(tmp_path: Path) -> None:
+    hub = make_hub(tmp_path)
+    (hub / "docs" / "units").mkdir(parents=True)
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}), units_dir="docs/units")
+    bead = Bead(id="v1", kind="verify-math", unit="U1", parent="b1")
+    (hub / "docs" / "units" / "U1.md").write_text("# U1\n\n## Model\n\n```python\n# " + "k" * 250 + "\n```\n")
+    assert check([bead], ctx) == []
+    (hub / "docs" / "units" / "U1.md").write_text("# U1\n\n## Model\n\n#" + "k" * 250 + "\n")
+    assert check([bead], ctx) == []
+
+
+def test_preflight_docs_directory_is_an_error(tmp_path: Path) -> None:
+    hub = make_hub(tmp_path)
+    (hub / "docs" / "sub").mkdir()
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}))
+    errors = check([impl_bead(docs=["docs/sub"])], ctx)
+    assert any("directory" in e for e in errors)
 
 
 def test_globs_overlap_rule() -> None:

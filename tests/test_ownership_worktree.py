@@ -134,3 +134,37 @@ def test_worktree_prepare_creates_reuses_and_refuses(tmp_path: Path) -> None:
     )
     with pytest.raises(worktree.WorktreeError, match="something-else"):
         worktree.prepare(hub=hub, bead="b2")
+
+
+def test_confidential_basename_matches_at_any_depth(tmp_path: Path) -> None:
+    hub = make_repo(tmp_path / "hub")
+    base = head(hub)
+    (hub / "keys").mkdir()
+    (hub / "keys" / "a.pem").write_text("secret\n")
+    result = ownership.check(
+        worktree=hub, base_commit=base, files=["keys/"], confidential=("*.pem",)
+    )
+    assert result.rejected == ("keys/a.pem",)
+
+
+def test_negated_class_and_slash_never_match() -> None:
+    assert ownership.glob_match("b", "[!a]")
+    assert not ownership.glob_match("a", "[!a]")
+    assert ownership.glob_match("a", "[a/]")
+    assert not ownership.glob_match("/", "[a/]")
+
+
+def test_linked_symlink_is_not_a_change(tmp_path: Path) -> None:
+    hub = make_repo(tmp_path / "hub")
+    (hub / "cfg").mkdir()
+    (hub / "cfg" / "a.env").write_text("K=1\n")
+    subprocess.run(["git", "add", "."], cwd=hub, check=True)
+    subprocess.run(["git", "commit", "-qm", "env"], cwd=hub, check=True)
+    base = head(hub)
+    (hub / "cfg" / "link.env").symlink_to(hub / "cfg" / "a.env")
+    linked = ownership.check(
+        worktree=hub, base_commit=base, files=[], link_into_worktrees=("cfg/*.env",)
+    )
+    assert linked.passed
+    unlinked = ownership.check(worktree=hub, base_commit=base, files=[])
+    assert unlinked.rejected == ("cfg/link.env",)

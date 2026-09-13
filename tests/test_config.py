@@ -71,6 +71,20 @@ def test_unknown_nested_key_names_the_dotted_key(tmp_path: Path) -> None:
         cfg.load(write_workflow(tmp_path, "[harness.codex]\nnope = 1\n"))
 
 
+def test_table_value_with_wrong_type_names_the_key(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match=r"'control'"):
+        cfg.load(write_workflow(tmp_path, "control = 1\n"))
+    with pytest.raises(TypeError, match=r"'memory'"):
+        cfg.load(write_workflow(tmp_path, 'memory = "abc"\n'))
+
+
+def test_server_url_is_opencode_only(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"harness\.codex\.server_url"):
+        cfg.load(write_workflow(tmp_path, '[harness.codex]\nserver_url = "x"\n'))
+    loaded = cfg.load(write_workflow(tmp_path, '[harness.opencode]\nserver_url = "x"\n'))
+    assert loaded.harness["opencode"].server_url == "x"
+
+
 def test_verify_validate_has_its_own_spec(tmp_path: Path) -> None:
     assert cfg.load(tmp_path).agents.verify_validate == "other"
     loaded = cfg.load(write_workflow(tmp_path, "[agents]\nverify_validate = 'codex'\n"))

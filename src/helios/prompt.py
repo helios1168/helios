@@ -4,10 +4,11 @@
 heading: Role, Contract, Bead, Docs, Memories, Attempt. A bare docs ``path``
 includes the whole file; ``path#key`` includes the first heading of any level
 whose text equals ``key`` or whose first word equals ``key``. Sections 4 and 5
-together are capped at ``memory.inject_cap_bytes`` UTF-8 bytes, never splitting
-a character; truncation appends a line naming what was cut, and that line
-counts within the cap. The prompt never names the harness, so the bytes are
-identical across harnesses.
+together are capped at ``memory.inject_cap_bytes`` UTF-8 bytes. The docs entries
+followed by the memory values form one ordered list of items, each kept whole
+or cut whole: helios keeps the longest prefix whose bytes, plus the note line
+naming the cut items, fit within the cap. The prompt never names the harness,
+so the bytes are identical across harnesses.
 """
 
 from __future__ import annotations
@@ -19,7 +20,8 @@ from pathlib import Path
 
 BEAD_FIELDS = ("id", "title", "description", "kind", "unit", "accept", "files", "test")
 
-_HEADING = re.compile(r"^ {0,3}(#{1,6})\s+(.*?)\s*$")
+_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
 
 def strip_front_matter(text: str) -> str:
@@ -33,36 +35,39 @@ def strip_front_matter(text: str) -> str:
     return rest.lstrip("\n")
 
 
-def _is_fence(line: str) -> str | None:
-    """The fence marker opening or closing on this line, else None (SPEC §7.2)."""
-    stripped = line.strip()
-    if stripped.startswith("```"):
-        return "`"
-    if stripped.startswith("~~~"):
-        return "~"
-    return None
+def _headings(markdown: str) -> list[tuple[int, int, str, str]]:
+    """(line index, level, text, first word) for each heading outside fences.
 
-
-def _headings(markdown: str) -> list[tuple[int, str, str, int]]:
-    """(line index, level, text, first word) for each heading outside fences."""
-    found = []
-    fence: str | None = None
+    A heading starts with 1 to 6 ``#`` followed by a space or the end of the
+    line. A fence opens with 3 or more backticks or tildes and closes only on
+    a line of the same character at least as long; an unclosed fence runs to
+    the end of the file (SPEC §7.2).
+    """
+    found: list[tuple[int, int, str, str]] = []
+    fence_char: str | None = None
+    fence_len = 0
     for i, line in enumerate(markdown.splitlines()):
-        marker = _is_fence(line)
-        if marker is not None:
-            if fence is None:
-                fence = marker
-            elif fence == marker:
-                fence = None
-            continue
+        fence = _FENCE.match(line)
         if fence is not None:
+            run = fence.group(1)
+            if fence_char is None:
+                fence_char, fence_len = run[0], len(run)
+            elif run[0] == fence_char and len(run) >= fence_len and not line[fence.end() :].strip():
+                fence_char, fence_len = None, 0
+            continue
+        if fence_char is not None:
             continue
         match = _HEADING.match(line)
         if match:
-            text = match.group(2)
+            text = match.group(2) or ""
             words = text.split()
             found.append((i, len(match.group(1)), text, words[0] if words else ""))
     return found
+
+
+def heading_lines(markdown: str) -> set[int]:
+    """Line indexes holding a heading in the SPEC §7.2 sense."""
+    return {i for i, _, _, _ in _headings(markdown)}
 
 
 def find_section(markdown: str, key: str) -> str:
@@ -153,66 +158,46 @@ def _note_text(names: list[str]) -> str:
     return f"[truncated for inject cap: {', '.join(names)}]"
 
 
-def _apply_cap(
-    docs: list[tuple[str, str]], memories: list[tuple[str, str]], cap: int
-) -> tuple[list[str], list[str], str]:
-    """Cap docs plus memories at ``cap`` UTF-8 bytes, note included.
-
-    Returns the kept doc texts, the kept memory texts, and the truncation
-    note (empty when nothing was cut). Never splits a UTF-8 character.
-    """
-    kept_docs, kept_mems, cut = _fit_all(docs, memories, cap)
-    if not cut:
-        return [t for _, t in kept_docs], [t for _, t in kept_mems], ""
-    while True:
-        note = _note_text(cut)
-        room = cap - _blen(note) - 2
-        if room < 0:
-            if _blen(_GENERIC_NOTE) + 2 > cap:
-                return [], [], _truncate_bytes(_GENERIC_NOTE, cap)
-            return [], [], _GENERIC_NOTE
-        kept_docs, kept_mems, new_cut = _fit_all(docs, memories, room)
-        if set(new_cut) == set(cut):
-            return [t for _, t in kept_docs], [t for _, t in kept_mems], note
-        cut = new_cut
-
-
 _GENERIC_NOTE = "[truncated for inject cap]"
 
 
-def _fit_all(
-    docs: list[tuple[str, str]], memories: list[tuple[str, str]], budget: int
-) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[str]]:
-    kept_mems, cut_mems = _fit_named(memories, max(budget, 0))
-    rest = max(budget - _blen(_join(kept_mems)), 0)
-    kept_docs, cut_docs = _fit_named(docs, rest)
-    cut = [n for n, _ in cut_docs] + [n for n, _ in cut_mems]
-    return kept_docs, kept_mems, cut
+def _apply_cap(
+    docs: list[tuple[str, str]], memories: list[tuple[str, str]], cap: int
+) -> tuple[list[str], list[str], str]:
+    """Cap docs plus memories at ``cap`` UTF-8 bytes, note included (SPEC §7.2).
+
+    The docs entries followed by the memory values form one ordered list, each
+    kept whole or cut whole. Tries prefix lengths from longest to shortest and
+    keeps the first whose bytes, plus the note naming the cut items, fit. When
+    even the empty prefix does not fit, the note is shortened at a character
+    boundary to the cap. Returns kept doc texts, kept memory texts, and the
+    note (empty when nothing was cut).
+    """
+    items = list(docs) + list(memories)
+    for keep in range(len(items), -1, -1):
+        kept = items[:keep]
+        cut = [name for name, _ in items[keep:]]
+        note = _note_text(cut) if cut else ""
+        kept_docs = [t for _, t in kept[: len(docs)]]
+        kept_mems = [t for _, t in kept[len(docs) :]]
+        if _capped_bytes(kept_docs, kept_mems, note) <= cap:
+            return kept_docs, kept_mems, note
+    return [], [], _truncate_bytes(_note_text([n for n, _ in items]), cap)
 
 
-def _join(parts: list[tuple[str, str]]) -> str:
-    return "\n\n".join(text for _, text in parts)
+def _capped_bytes(docs: list[str], mems: list[str], note: str) -> int:
+    """Exact bytes of the Docs and Memories bodies plus the note (SPEC §7.2)."""
+    docs_body = "\n\n".join(docs)
+    mems_body = "\n\n".join(mems)
+    if note and not mems_body:
+        mems_body = note
+    elif note:
+        mems_body = f"{mems_body}\n\n{note}"
+    return _blen(docs_body) + _blen(mems_body)
 
 
 def _blen(text: str) -> int:
     return len(text.encode("utf-8"))
-
-
-def _fit_named(
-    parts: list[tuple[str, str]], budget: int
-) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    kept: list[tuple[str, str]] = []
-    used = 0
-    for i, (name, part) in enumerate(parts):
-        cost = _blen(part) + (2 if kept else 0)
-        if used + cost > budget:
-            if not kept:
-                kept.append((name, _truncate_bytes(part, budget)))
-                return kept, [(name, part)] + parts[i + 1 :]
-            return kept, parts[i:]
-        used += cost
-        kept.append((name, part))
-    return kept, []
 
 
 def _truncate_bytes(text: str, budget: int) -> str:
