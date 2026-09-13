@@ -221,9 +221,12 @@ processes. `helios.harness.get(name) -> Harness` returns the adapter.
 3. helios takes the native structured result when present, else the report file. When both
    exist and differ, it takes the native result and adds a note.
 4. The report is validated with `AgentReport.model_validate`. Failure gives `invalid_output`.
-5. The chosen report text is copied, byte for byte, to `attempt-<n>/report.json` (the captured
-   report, §8.1) before `execution_status` is stored, and no captured report is written when
-   none was found. From then on validation, recovery and write-back read only the captured
+5. The chosen report is written to `attempt-<n>/report.json` (the captured report, §8.1)
+   before `execution_status` is stored, and no captured report is written when none was found.
+   When the file was chosen, the captured report is the file's bytes. When the native result
+   was chosen, it is `json.dumps(structured, ensure_ascii=False, indent=2, sort_keys=True)`
+   plus a newline, whatever the report file holds; the file's bytes are never captured in that
+   case. From then on validation, recovery and write-back read only the captured
    report, never the worktree path again, so an agent or user deleting or editing the worktree
    report after step 8 changes nothing.
 
@@ -351,6 +354,7 @@ These apply to claude, codex, opencode and agy.
      before the first `*`, `?` or `[`; of a directory entry, the entry itself. The rule
      over-approximates on purpose: a false overlap only means the beads run separately;
    - `skills/<kind>/SKILL.md` exists in the hub for the bead kind;
+   - the bead is not closed;
    - the latest attempt of the bead is finalized, unless recovery (§8.4) applies.
 3. Resolve the harness (§5). `--harness` overrides.
 4. Prepare the worktree (§7.3).
@@ -366,9 +370,14 @@ These apply to claude, codex, opencode and agy.
    On timeout run the stop sequence and record `timed_out`. The session id comes only from the
    adapter's `parse`; `helios.run` never reads harness inputs such as `HELIOS_FAKE_SCRIPT` (an
    adapter may read its own).
-8. Parse with the adapter, capture the report (§6.2), classify execution status (§4.4).
+8. Parse with the adapter, capture the report (§6.2), classify execution status (§4.4), then
+   record the result in one `state.json` write: the terminal state of §8.2, `execution_status`
+   and the parsed `session_id`. A crash before that write leaves `launched`, which recovery
+   treats as crashed (§8.4).
 9. Run checks from helios itself: the bead `test` in the worktree (log to `checks/test.log`),
-   `typecheck` when set, ownership (§7.4).
+   `typecheck` when set, ownership (§7.4). When the captured report is missing or fails
+   `AgentReport.model_validate` while `execution_status` is `completed` (only reachable in
+   recovery, §8.4), the check `report` fails with a detail naming the problem.
 10. If ownership passed, commit the changed paths of §7.4, after its skips, in three calls with
     literal pathspecs, never the whole tree. A path may no longer exist anywhere (a `git mv` or
     `git rm` source, or a file staged and then deleted on disk), and git rejects a pathspec
@@ -383,8 +392,10 @@ These apply to claude, codex, opencode and agy.
     `output_commit` is the worktree HEAD after this step, whether helios committed, the agent
     committed, or nothing changed. When ownership failed, nothing is staged and `output_commit`
     is null.
-11. Write `envelope.json`, finalize the attempt, write back to the bead (§7.5), append the
-    event (§9.3).
+11. Write `envelope.json`, write back to the bead (§7.5), finalize the attempt, then append the
+    event (§9.3). The event append is best effort: a crash after finalize loses that line and
+    nothing else. Write-back, the event and the exit code handle a missing report (report
+    fields null, `report_error` set); no step assumes one exists.
 
 Exit codes: 0 finalized with report `done` (impl, validate) or overall verdict `verified`
 (verify kinds); 3 report `partial`, `needs_input`, `needs_review` or `blocked`, or a verdict
@@ -400,12 +411,17 @@ never launched. An attempt whose harness child was still running when the flag w
 interrupt fails with detail `interrupted`. Every launched attempt still completes steps 8 to
 11. Later SIGINTs are ignored. An attempt allocated but not yet launched when the flag is set
 never launches: it goes from `allocated` straight to `interrupted`, emits no `launched` event,
-and completes steps 8 (classified `interrupted`), 10 and 11; its checks are skipped with detail
-`interrupted`.
+and completes steps 8 (classified `interrupted`) and 11. It skips steps 9 and 10: every check,
+ownership included, is recorded as not run with detail `interrupted`, nothing is staged or
+committed, and `output_commit` is null.
 
-The handler never blocks. It only sets the flag (a `threading.Event`) and returns; a stopper
-thread started by the run waits on that event and runs the stop sequences. The handler must not
-take any lock, because the main thread may hold it when the signal arrives. The handler is
+The handler never blocks. It only calls `set()` on the flag (a `threading.Event`) and returns;
+it acquires no lock of helios's own (the Event's internal lock is fine, since only the handler
+and the stopper touch it). A stopper thread started by the run blocks in `Event.wait()`, never
+polls in a loop, and then runs the stop sequences of all running groups concurrently, so each
+group gets its SIGINT at once. Groups started after the flag is set (a check that raced it) get
+a stop sequence too. `run_many` returns only after every stop sequence has ended with its group
+gone or SIGKILL sent and the group gone; it joins the stopper without a timeout. The handler is
 installed only when `run_many` is called from the main thread (elsewhere `signal.signal` is not
 allowed, and SIGINT keeps its current behavior), and the previous handler is restored before
 `run_many` returns.
@@ -414,7 +430,9 @@ Every refusal and preflight message (lock held, live attempt, preflight errors, 
 `--dry-run`) goes to stderr.
 
 `--dry-run` prints harness, argv, worktree, attempt path and prompt size. It performs no
-recovery (§8.4) and prints the recovery action instead. When the bead lock is held or the latest
+recovery (§8.4) and prints the recovery action instead. The attempt path is the one the real run
+would use: the existing attempt when recovery resumes it, else the next `n`. For a resumed
+attempt the prompt size is that of its stored `prompt.md`. When the bead lock is held or the latest
 attempt is live, it prints the refusal and exits 2. It creates, moves or writes nothing,
 including bead updates and events.
 Several beads run in parallel up to `--max-parallel` (default 3).
@@ -463,7 +481,9 @@ so the bytes are identical across harnesses; a test asserts this.
 
 Changed paths are the union of `git diff --name-only --no-renames -z <base_commit>` (working
 tree), `git diff --cached --name-only --no-renames -z <base_commit>` (index, so a change staged
-and then reverted on disk still counts) and `git ls-files --others --exclude-standard -z`. `--no-renames` lists both sides of a rename, so a
+and then reverted on disk still counts), `git diff --cached --name-only --no-renames -z HEAD`
+(so a path the agent committed and then removed again is a change) and
+`git ls-files --others --exclude-standard -z`. `--no-renames` lists both sides of a rename, so a
 deleted path is checked too; `-z` keeps non-ASCII paths unquoted. An untracked symlink whose
 path matches a `project.link_into_worktrees` glob (§7.3) is not a change.
 
@@ -534,7 +554,8 @@ happen only under the lock. The lock dies with its process, so it never goes sta
 `n` is one more than the highest existing `attempt-<n>` directory. The directory is created with
 an exclusive `mkdir`; if it already exists (a concurrent run took `n`), helios tries `n + 1`.
 `state.json` is written right after the `mkdir`, but a process can die between the two. Every
-reader (preflight, recovery, `helios ps`) treats an attempt directory without `state.json` as
+reader (preflight, recovery, `helios ps`) treats an attempt directory whose `state.json` is
+missing or unreadable (empty, not valid JSON, not an object, or without a string `state`) as
 state `allocated` with `pid` null, `session_id` null and `execution_status` null; reading it
 never raises. Preflight reads attempt state without the lock, so it must accept this case and
 leave the decision to recovery under the lock. Before launch helios checks the
@@ -552,8 +573,9 @@ When `helios run` finds the latest attempt not finalized:
   (idempotent, §7.5), then finalize. No new attempt. A stored `execution_status` (§8.2) is
   kept; only an attempt without one is classified again. Validation reads the captured
   `attempt-<n>/report.json` (§6.2 step 5). A stored `completed` whose captured report is
-  missing or no longer validates keeps `completed` and fails with a helios check `report`
-  whose detail names the problem (exit 5), so the bead is not closed.
+  missing, not JSON, not an object, or fails `AgentReport.model_validate` keeps `completed`,
+  fails the helios check `report` whose detail names the problem, sets `run=failed`, and
+  exits 5, so the bead is not closed.
 - state `interrupted`, `timed_out`, `crashed` or `launch_failed` with no live process: write
   `envelope.json` with that state as the execution status, finalize, then allocate a new
   attempt.
