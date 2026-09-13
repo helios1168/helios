@@ -70,6 +70,29 @@ def heading_lines(markdown: str) -> set[int]:
     return {i for i, _, _, _ in _headings(markdown)}
 
 
+def model_section(markdown: str) -> str:
+    """The ``## Model`` section of a unit file (SPEC §7.1 step 2).
+
+    Starts at the first level 2 heading whose text is exactly ``Model`` (not
+    a ``path#key`` first-word match) and runs to the next heading of level 1
+    or 2. Raises KeyError when absent.
+    """
+    lines = markdown.splitlines()
+    start = None
+    for i, level, text, _first in _headings(markdown):
+        if level == 2 and text == "Model":
+            start = i
+            break
+    if start is None:
+        raise KeyError("heading '## Model' not found")
+    end = len(lines)
+    for i, level, _text, _first in _headings(markdown):
+        if i > start and level <= 2:
+            end = i
+            break
+    return "\n".join(lines[start:end]).rstrip() + "\n"
+
+
 def find_section(markdown: str, key: str) -> str:
     """The first heading whose text equals ``key`` or whose first word does.
 

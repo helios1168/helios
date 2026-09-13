@@ -7,9 +7,11 @@ All failures exit 2 before anything is created:
 - every name in ``memories`` exists (the memory lookup is a required
   argument); every path in ``docs`` exists, and every ``path#key`` resolves
   to a section (SPEC §7.2).
-- ``verify-math`` needs a substantive ``## Model``: the stripped lines that
+- ``verify-math`` needs a substantive ``## Model``: the section starts at the
+  first level 2 heading whose text is exactly ``Model`` and runs to the next
+  heading of level 1 or 2. Its body counts the stripped lines that
   are not headings in the SPEC §7.2 sense, not blank and not the ``_empty_``
-  placeholder total at least 200 characters; line breaks do not count. A line
+  placeholder, totaling at least 200 characters; line breaks do not count. A line
   inside a code fence, or without a space after ``#``, counts like any other.
 - beads launched together have disjoint ``files``. Two entries overlap when
   either matches the other read as a literal path, or when neither is a
@@ -30,7 +32,7 @@ from pathlib import Path
 from helios import attempt as attempt_mod
 from helios.beads import Bead
 from helios.ownership import glob_match
-from helios.prompt import find_section, heading_lines
+from helios.prompt import find_section, heading_lines, model_section
 
 MODEL_MIN_CHARS = 200
 
@@ -111,7 +113,7 @@ def _check_model(bead: Bead, ctx: PreflightContext) -> list[str]:
     if not path.is_file():
         return [f"{bead.id}: unit file {path} does not exist"]
     try:
-        model = find_section(path.read_text(), "Model")
+        model = model_section(path.read_text())
     except KeyError:
         return [f"{bead.id}: unit file has no ## Model section"]
     headings = heading_lines(model)

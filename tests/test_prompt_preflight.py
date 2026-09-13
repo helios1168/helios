@@ -135,6 +135,14 @@ def test_heading_and_fence_shapes() -> None:
         pr.find_section(unclosed, "never")
 
 
+def test_heading_whitespace_shapes() -> None:
+    assert pr.find_section("   ## B\n\nbody\n", "B").startswith("   ## B")
+    assert pr.find_section("#\tA\n\nbody\n", "A").startswith("#\tA")
+    assert pr.find_section("## B\n\nbody\n", "B").startswith("## B")
+    with pytest.raises(KeyError):
+        pr.find_section("    ## B\n\nbody\n", "B")
+
+
 def test_assemble_caps_docs_plus_memories() -> None:
     import tempfile
 
@@ -268,14 +276,33 @@ def test_preflight_model_counts_text_not_newlines(tmp_path: Path) -> None:
     assert any("substantive" in e for e in check([bead], ctx))
 
 
-def test_preflight_model_uses_section_headings_and_fences(tmp_path: Path) -> None:
+def test_preflight_model_section_is_exact_level_two(tmp_path: Path) -> None:
     hub = make_hub(tmp_path)
     (hub / "docs" / "units").mkdir(parents=True)
     ctx = PreflightContext(hub=hub, memory_has=memory_map({}), units_dir="docs/units")
     bead = Bead(id="v1", kind="verify-math", unit="U1", parent="b1")
-    (hub / "docs" / "units" / "U1.md").write_text("# U1\n\n## Model\n\n```python\n# " + "k" * 250 + "\n```\n")
+    unit = hub / "docs" / "units" / "U1.md"
+    unit.write_text(
+        "# U: t\n\nStatus: open\n\n## Brief\n\n### Model scope\n\n"
+        + "s" * 300
+        + "\n\n## Model\n\n_empty_\n\n## Verify\n\n_empty_\n"
+    )
+    assert any("substantive" in e for e in check([bead], ctx))
+    unit.write_text(
+        "# U: t\n\n## Model\n\n"
+        + "a" * 150
+        + "\n\n### Model detail\n\n"
+        + "b" * 100
+        + "\n\n## Verify\n\n_empty_\n"
+    )
     assert check([bead], ctx) == []
-    (hub / "docs" / "units" / "U1.md").write_text("# U1\n\n## Model\n\n#" + "k" * 250 + "\n")
+    unit.write_text("# U\n\n   ## Model\n\n" + "z" * 250 + "\n")
+    assert check([bead], ctx) == []
+    unit.write_text("# U\n\n    ## Model\n\n" + "z" * 250 + "\n")
+    assert any("no ## Model" in e for e in check([bead], ctx))
+    unit.write_text("# U1\n\n## Model\n\n```python\n# " + "k" * 250 + "\n```\n")
+    assert check([bead], ctx) == []
+    unit.write_text("# U1\n\n## Model\n\n#" + "k" * 250 + "\n")
     assert check([bead], ctx) == []
 
 
