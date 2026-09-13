@@ -271,8 +271,10 @@ report `needs_input` naming it.
    - every name in `memories` exists (preflight takes the memory lookup as a required argument);
      every path in `docs` is an existing file (a directory is an error), and every `path#key`
      resolves to a section (§7.2);
-   - `verify-math` needs a substantive `## Model`: the lines that are not headings in the §7.2
-     sense, not blank (whitespace only) and not the `_empty_` placeholder, each stripped of
+   - `verify-math` needs a substantive `## Model`. That section starts at the first level 2
+     heading whose text is exactly `Model` (not a `path#key` first-word match, so `### Model
+     scope` never counts) and runs to the next heading of level 1 or 2. Its body counts the
+     lines that are not headings in the §7.2 sense, not blank (whitespace only) and not the `_empty_` placeholder, each stripped of
      surrounding whitespace, total at least 200 characters; line breaks do not count. A line
      inside a code fence, or `#text` without a space, is counted like any other line;
    - beads launched together have disjoint `files`. Two entries overlap when either matches the
@@ -317,8 +319,9 @@ heading:
    whitespace-separated word equals `key` (so `#5.` selects `## 5. Configuration` and `#9.3`
    selects `### 9.3 Events`). The section runs from that heading up to the next heading of the
    same or a higher level, so it includes its subsections. A heading is a line outside code
-   fences that starts with 1 to 6 `#` followed by a space or the end of the line; its level is
-   the number of `#`. A fence opens with a line starting (after up to three spaces) with three
+   fences that starts, after up to three spaces, with 1 to 6 `#` followed by a space, a tab or
+   the end of the line; its level is the number of `#` and its text is the rest of the line,
+   stripped. A fence opens with a line starting (after up to three spaces) with three
    or more backticks or tildes, and closes with a line of the same character at least as long
    as the opener; an unclosed fence runs to the end of the file. A key with no match is a
    preflight error.
