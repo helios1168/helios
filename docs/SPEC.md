@@ -356,18 +356,18 @@ These apply to claude, codex, opencode and agy.
    `HELIOS_BEAD`, `HELIOS_ATTEMPT`, `HELIOS_HARNESS`, `HELIOS_HUB`, `HELIOS_REPORT`. Record
    `launched` with the child pid in `state.json` as soon as `Popen` returns, before waiting.
    Every signal goes to the child's process group (`os.killpg`). The stop sequence is SIGINT,
-   wait 10 s, SIGTERM, wait 5 s, SIGKILL. On timeout run the stop sequence and record
-   `timed_out`. When helios receives SIGINT (KeyboardInterrupt in its main thread, including
-   while worker threads run other beads), it runs the stop sequence on every running attempt
-   and records each one `interrupted`. Each attempt still goes through steps 8 to 11, and the
-   run exits 4. The session id comes only from the adapter's `parse`; nothing reads harness
-   inputs such as `HELIOS_FAKE_SCRIPT` for it.
+   wait up to 10 s, SIGTERM, wait up to 5 s, SIGKILL. A wait ends early only when the whole
+   group is gone (`os.killpg(pgid, 0)` raises `ProcessLookupError`), not when the leader exits.
+   On timeout run the stop sequence and record `timed_out`. The session id comes only from the
+   adapter's `parse`; `helios.run` never reads harness inputs such as `HELIOS_FAKE_SCRIPT` (an
+   adapter may read its own).
 8. Parse with the adapter, capture the report (§6.2), classify execution status (§4.4).
 9. Run checks from helios itself: the bead `test` in the worktree (log to `checks/test.log`),
    `typecheck` when set, ownership (§7.4).
-10. If ownership passed, stage exactly the changed paths of §7.4, after its skips
-    (`git add -A -- <paths>`, never the whole tree). Commit as `<bead>: <report summary>` when
-    anything is staged. `output_commit` is the worktree HEAD after this step, whether helios
+10. If ownership passed, stage exactly the changed paths of §7.4, after its skips, with
+    literal pathspecs (`git add -A -- ':(literal)<path>' ...`, never the whole tree). Commit
+    only those paths (`git commit -m <message> -- ':(literal)<path>' ...`) as
+    `<bead>: <report summary>` when any of them differs from HEAD. `output_commit` is the worktree HEAD after this step, whether helios
     committed, the agent committed, or nothing changed. When ownership failed, nothing is
     staged and `output_commit` is null.
 11. Write `envelope.json`, finalize the attempt, write back to the bead (§7.5), append the
@@ -376,10 +376,20 @@ These apply to claude, codex, opencode and agy.
 Exit codes: 0 finalized with report `done` (impl, validate) or overall verdict `verified`
 (verify kinds); 3 report `partial`, `needs_input`, `needs_review` or `blocked`, or a verdict
 other than verified; 4 execution failure; 5 a helios check failed; 2 usage or preflight. With
-several beads the exit code is the highest per-bead code.
+several beads the exit code is the highest per-bead code. A run that received SIGINT exits 4.
+
+Interrupts: `helios run` installs a SIGINT handler for its whole life, so KeyboardInterrupt is
+never raised. The first SIGINT sets a run-wide interrupt flag and runs the stop sequence on the
+process group of every running child. That covers harness processes and the step 9 check
+processes, which are also started with `start_new_session=True`. Beads not yet launched are
+never launched. An attempt whose harness child was still running when the flag was set records
+`interrupted`; an attempt already classified in step 8 keeps its status. A check stopped by the
+interrupt fails with detail `interrupted`. Every launched attempt still completes steps 8 to
+11. Later SIGINTs are ignored.
 
 `--dry-run` prints harness, argv, worktree, attempt path and prompt size. It performs no
-recovery (§8.4) and prints the recovery action instead. It creates, moves or writes nothing,
+recovery (§8.4) and prints the recovery action instead. When the bead lock is held or the latest
+attempt is live, it prints the refusal and exits 2. It creates, moves or writes nothing,
 including bead updates and events.
 Several beads run in parallel up to `--max-parallel` (default 3).
 
@@ -425,8 +435,9 @@ so the bytes are identical across harnesses; a test asserts this.
 
 ### 7.4 Ownership
 
-Changed paths are `git diff --name-only --no-renames -z <base_commit>` plus
-`git ls-files --others --exclude-standard -z`. `--no-renames` lists both sides of a rename, so a
+Changed paths are the union of `git diff --name-only --no-renames -z <base_commit>` (working
+tree), `git diff --cached --name-only --no-renames -z <base_commit>` (index, so a change staged
+and then reverted on disk still counts) and `git ls-files --others --exclude-standard -z`. `--no-renames` lists both sides of a rename, so a
 deleted path is checked too; `-z` keeps non-ASCII paths unquoted. An untracked symlink whose
 path matches a `project.link_into_worktrees` glob (§7.3) is not a change.
 
@@ -458,7 +469,8 @@ later in the text does not count.
 - close: an `impl` or `validate` bead closes when execution completed, the report is `done`,
   and all helios checks passed. A verify bead closes only when additionally the overall verdict
   is verified. Otherwise the bead stays `in_progress` and its state is recorded with
-  `bd set-state <bead> run=<state>`. The state is the first that applies:
+  one `bd set-state <bead> run=<state>` call with the final state. The state is the first that
+  applies:
   - `failed`: any execution failure (§4.4) or failed helios check;
   - `blocked`: report `blocked`;
   - `waiting`: report `partial`, `needs_input` or `needs_review`, or a verify verdict other than verified.
@@ -477,12 +489,18 @@ captured report), `checks/`, `envelope.json`. The agent writes its report inside
 
 `allocated`, then `launched`, then one of `native_completed`, `interrupted`, `timed_out`,
 `crashed`, `launch_failed`, then `validated` or `invalid`, then `finalized`. `state.json` is
-`{"state", "attempt_id", "pid", "session_id", "updated"}` and is written to a temp file and
+`{"state", "attempt_id", "pid", "session_id", "execution_status", "updated"}`, where
+`execution_status` is null until step 8 classifies the attempt and never changes after. It is written to a temp file and
 moved with `os.replace`. Every transition appends one line to `state.log`. `launched` is
 recorded with the pid as soon as the process starts, so a running attempt is always `launched`
 with a live pid.
 
 ### 8.3 Allocation
+
+A run holds an exclusive, non-blocking `fcntl.flock` on `<runs>/<bead>/lock` from before
+recovery (§8.4) until its attempt is finalized. A run that cannot take the lock refuses with
+exit 2 and prints the `helios attach` and `helios stop` commands. Recovery and allocation
+happen only under the lock. The lock dies with its process, so it never goes stale.
 
 `n` is one more than the highest existing `attempt-<n>` directory. The directory is created with
 an exclusive `mkdir`; if it already exists (a concurrent run took `n`), helios tries `n + 1`. Before launch helios checks the
@@ -497,11 +515,13 @@ When `helios run` finds the latest attempt not finalized:
 
 - `pid` alive: refuse, and print the `helios attach` and `helios stop` commands.
 - state `native_completed`, `validated` or `invalid`: redo validation, checks and write-back
-  (idempotent, §7.5), then finalize. No new attempt.
-- state `interrupted`, `timed_out`, `crashed` or `launch_failed` with no live process: finalize
-  with that state as the execution status, then allocate a new attempt.
-- state `allocated` or `launched` with no live process: record `crashed`, finalize, allocate a
-  new attempt.
+  (idempotent, §7.5), then finalize. No new attempt. A stored `execution_status` (§8.2) is
+  kept; only an attempt without one is classified again.
+- state `interrupted`, `timed_out`, `crashed` or `launch_failed` with no live process: write
+  `envelope.json` with that state as the execution status, finalize, then allocate a new
+  attempt.
+- state `allocated` or `launched` with no live process: record `crashed`, write `envelope.json`
+  with `crashed`, finalize, allocate a new attempt.
 
 ### 8.5 Stale evidence
 
