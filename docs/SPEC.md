@@ -212,33 +212,42 @@ processes. `helios.harness.get(name) -> Harness` returns the adapter.
 
 ### 6.3 Per harness
 
-Flags below were read from the installed CLIs' help on 2026-09-13. Exact stdout shapes come
-from the recorded fixtures in `tests/fixtures/native/<harness>/`, which the orchestrator
-records from live runs. An adapter must parse the fixtures; it must not invent output shapes. If
-a needed fixture is missing, report `needs_input` naming it.
+Flags and shapes below were checked against live runs on 2026-09-13; the recorded output is in
+`tests/fixtures/native/<harness>/` (`fresh`, `resume`, `error`; see its README). An adapter
+must parse the fixtures; it must not invent output shapes. If a needed fixture is missing,
+report `needs_input` naming it.
 
 - **claude** (Claude Code): fresh turn `claude -p --output-format json --json-schema <schema
   JSON text> --permission-mode bypassPermissions [--model M] [--effort E] <prompt>`; resume adds
-  `--resume <session_id>`. stdout is one JSON object with `session_id`, `is_error`,
-  `structured_output` and `result`. Never pass `--bare`. Attach:
+  `--resume <session_id>` and keeps the same `session_id`. stdout is one JSON object:
+  `session_id`, `is_error`, `subtype`, `terminal_reason`, `structured_output` (the schema
+  result, absent on error), `result` (text). A native error is `is_error: true`, with
+  `api_error_status` when the API refused, and exit code 1. Never pass `--bare`. Attach:
   `claude --resume <session_id>` with cwd the worktree.
 - **codex** (Codex CLI): fresh `codex exec --json --output-schema <schema path> -o
   <raw_dir>/last-message.json -C <worktree> --skip-git-repo-check
   --dangerously-bypass-approvals-and-sandbox [-m M] [-c model_reasoning_effort="E"] -` with the
   prompt on stdin; resume `codex exec resume <session_id> --json --output-schema ... -o ... -`.
-  stdout is JSON lines; the session id is in the first event that carries a thread or session
-  id; the structured result is the JSON in the `-o` file. Never `--last`. Attach:
-  `codex resume <session_id>`.
+  stdout is JSON lines: `thread.started` with `thread_id` (the session id, unchanged on
+  resume), `turn.started`, `item.completed`, then `turn.completed` or, on failure, `error` and
+  `turn.failed` with exit code 1. The structured result is the JSON in the `-o` file, which is
+  not written when the turn fails. Never `--last`. Attach: `codex resume <session_id>`.
 - **opencode**: fresh `opencode run --format json --dir <worktree> --title <bead>#<attempt>
-  [-m M] [--variant E] [--attach <server_url>] --auto <prompt>`; resume adds `-s <session_id>`.
-  stdout is JSON lines; events carry `sessionID`. No schema channel: the report file is the only
-  source. Attach: `opencode attach <server_url> --dir <worktree> -s <session_id>` when a server
-  is set, else `opencode <worktree> -s <session_id>`. Stop with a server:
+  [-m M] [--variant E] [--attach <server_url>] --auto <prompt>`; resume adds `-s <session_id>`
+  and keeps the id. stdout is JSON lines, each with `type`, `timestamp`, `sessionID` and `part`;
+  types seen: `step_start`, `text`, `tool_use` (`part.tool`, `part.state`), `step_finish`
+  (`part.reason`, `part.tokens`), and `error` (`error.name`, `error.data.message`) with exit
+  code 1. No schema channel: the report file is the only source. Attach:
+  `opencode attach <server_url> --dir <worktree> -s <session_id>` when a server is set, else
+  `opencode <worktree> -s <session_id>`. Stop with a server:
   `POST <server_url>/session/<session_id>/abort`.
-- **agy** (Antigravity CLI): fresh `agy -p --output-format json --json-schema <schema path>
-  --dangerously-skip-permissions [--model M] [--effort E] <prompt>` with cwd the worktree;
-  resume adds `--conversation <session_id>`. Session id and structured result per fixture.
-  Attach: `agy --conversation <session_id>`.
+- **agy** (Antigravity CLI): the prompt is the value of `-p`, so `-p` comes last: fresh
+  `agy --output-format json --json-schema <schema path> --dangerously-skip-permissions
+  [--model M] [--effort E] -p <prompt>` with cwd the worktree; resume adds
+  `--conversation <session_id>` and keeps the id. stdout is one JSON object:
+  `conversation_id` (the session id), `status` (`SUCCESS` or `ERROR`), `structured_output`,
+  `response`, `error` (on failure, with exit code 1), `num_turns`, `usage`. Attach:
+  `agy --conversation <session_id>`.
 - **fake**: `python -m helios.harness.fake` driven by the JSON file in env
   `HELIOS_FAKE_SCRIPT`: `{"exit_code": 0, "sleep_s": 0, "stdout": "...", "session_id": "s1",
   "report": {...} | null, "report_text": "..." | null, "ignore_sigint": false}`. It writes
