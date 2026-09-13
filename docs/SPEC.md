@@ -144,6 +144,15 @@ Fields: `schema_version`, `task_id`, `attempt`, `attempt_id` (`<bead>#<n>`), `ki
 | `invalid_output` | a report exists but fails the schema; the error goes in `report_error` |
 | `launch_failed` | the binary is missing or exec failed |
 
+helios takes the first value that applies, in this order:
+1. `launch_failed`: `Popen` raised.
+2. `interrupted`: helios received SIGINT or `helios stop` stopped the attempt. This holds whatever the child printed or wrote.
+3. `timed_out`: helios hit the timeout.
+4. `completed`: a valid report was captured. A nonzero exit or a native error only adds a note.
+5. `invalid_output`: a report exists but fails validation.
+6. `crashed`: the exit code is nonzero or the adapter set a native error.
+7. `missing_output`: none of the above.
+
 Execution failure is never a scientific verdict. A crashed verifier does not refute anything.
 
 ## 5. Configuration
@@ -336,28 +345,42 @@ These apply to claude, codex, opencode and agy.
      one starts with the literal prefix of the other. The literal prefix of a glob is its text
      before the first `*`, `?` or `[`; of a directory entry, the entry itself. The rule
      over-approximates on purpose: a false overlap only means the beads run separately;
+   - `skills/<kind>/SKILL.md` exists in the hub for the bead kind;
    - the latest attempt of the bead is finalized, unless recovery (§8.4) applies.
 3. Resolve the harness (§5). `--harness` overrides.
 4. Prepare the worktree (§7.3).
 5. Allocate the attempt (§8).
 6. Assemble the prompt (§7.2); write `prompt.md` and `input.json` with the input hashes.
-7. Launch with `subprocess.Popen(argv, cwd=worktree, stdout=stdout file, stderr=stderr.log)`,
-   environment plus `HELIOS_BEAD`, `HELIOS_ATTEMPT`, `HELIOS_HARNESS`, `HELIOS_HUB`,
-   `HELIOS_REPORT`. On timeout send SIGINT, wait 10 s, then SIGTERM, wait 5 s, then SIGKILL. On
-   KeyboardInterrupt do the same and record `interrupted`.
+7. Launch with `subprocess.Popen(argv, cwd=worktree, stdin=<stdin_text, else DEVNULL>,
+   stdout=stdout file, stderr=stderr.log, start_new_session=True)`, environment plus
+   `HELIOS_BEAD`, `HELIOS_ATTEMPT`, `HELIOS_HARNESS`, `HELIOS_HUB`, `HELIOS_REPORT`. Record
+   `launched` with the child pid in `state.json` as soon as `Popen` returns, before waiting.
+   Every signal goes to the child's process group (`os.killpg`). The stop sequence is SIGINT,
+   wait 10 s, SIGTERM, wait 5 s, SIGKILL. On timeout run the stop sequence and record
+   `timed_out`. When helios receives SIGINT (KeyboardInterrupt in its main thread, including
+   while worker threads run other beads), it runs the stop sequence on every running attempt
+   and records each one `interrupted`. Each attempt still goes through steps 8 to 11, and the
+   run exits 4. The session id comes only from the adapter's `parse`; nothing reads harness
+   inputs such as `HELIOS_FAKE_SCRIPT` for it.
 8. Parse with the adapter, capture the report (§6.2), classify execution status (§4.4).
 9. Run checks from helios itself: the bead `test` in the worktree (log to `checks/test.log`),
    `typecheck` when set, ownership (§7.4).
-10. If the tree has uncommitted changes and ownership passed, commit them as
-    `<bead>: <report summary>`. Record `output_commit`.
+10. If ownership passed, stage exactly the changed paths of §7.4, after its skips
+    (`git add -A -- <paths>`, never the whole tree). Commit as `<bead>: <report summary>` when
+    anything is staged. `output_commit` is the worktree HEAD after this step, whether helios
+    committed, the agent committed, or nothing changed. When ownership failed, nothing is
+    staged and `output_commit` is null.
 11. Write `envelope.json`, finalize the attempt, write back to the bead (§7.5), append the
     event (§9.3).
 
 Exit codes: 0 finalized with report `done` (impl, validate) or overall verdict `verified`
 (verify kinds); 3 report `partial`, `needs_input`, `needs_review` or `blocked`, or a verdict
-other than verified; 4 execution failure; 5 a helios check failed; 2 usage or preflight.
+other than verified; 4 execution failure; 5 a helios check failed; 2 usage or preflight. With
+several beads the exit code is the highest per-bead code.
 
-`--dry-run` prints harness, argv, worktree, attempt path and prompt size, and creates nothing.
+`--dry-run` prints harness, argv, worktree, attempt path and prompt size. It performs no
+recovery (§8.4) and prints the recovery action instead. It creates, moves or writes nothing,
+including bead updates and events.
 Several beads run in parallel up to `--max-parallel` (default 3).
 
 ### 7.2 Prompt assembly
@@ -435,7 +458,10 @@ later in the text does not count.
 - close: an `impl` or `validate` bead closes when execution completed, the report is `done`,
   and all helios checks passed. A verify bead closes only when additionally the overall verdict
   is verified. Otherwise the bead stays `in_progress` and its state is recorded with
-  `bd set-state <bead> run=<state>` where state is `waiting`, `failed` or `blocked`.
+  `bd set-state <bead> run=<state>`. The state is the first that applies:
+  - `failed`: any execution failure (§4.4) or failed helios check;
+  - `blocked`: report `blocked`;
+  - `waiting`: report `partial`, `needs_input` or `needs_review`, or a verify verdict other than verified.
 - helios never reopens, relabels or deletes beads in this wave.
 
 ## 8. Attempt lifecycle
@@ -452,7 +478,9 @@ captured report), `checks/`, `envelope.json`. The agent writes its report inside
 `allocated`, then `launched`, then one of `native_completed`, `interrupted`, `timed_out`,
 `crashed`, `launch_failed`, then `validated` or `invalid`, then `finalized`. `state.json` is
 `{"state", "attempt_id", "pid", "session_id", "updated"}` and is written to a temp file and
-moved with `os.replace`. Every transition appends one line to `state.log`.
+moved with `os.replace`. Every transition appends one line to `state.log`. `launched` is
+recorded with the pid as soon as the process starts, so a running attempt is always `launched`
+with a live pid.
 
 ### 8.3 Allocation
 
