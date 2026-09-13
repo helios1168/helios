@@ -1,0 +1,300 @@
+{
+  "$defs": {
+    "Checker": {
+      "additionalProperties": false,
+      "description": "A command that re-checks the artifact, and what it returned.",
+      "properties": {
+        "command": {
+          "title": "Command",
+          "type": "string"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit Code"
+        },
+        "output_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output Path"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "title": "Checker",
+      "type": "object"
+    },
+    "Finding": {
+      "additionalProperties": false,
+      "description": "One claim with its evidence (SPEC \u00a74.2).",
+      "properties": {
+        "artifact": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Repo-relative path or exact command.",
+          "title": "Artifact"
+        },
+        "assumptions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Assumptions",
+          "type": "array"
+        },
+        "bound": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Domain, sizes, tolerance or instance names for the scope.",
+          "title": "Bound"
+        },
+        "checker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Checker"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "claim": {
+          "title": "Claim",
+          "type": "string"
+        },
+        "covers": {
+          "description": "Block or requirement ids.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Covers",
+          "type": "array"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "method": {
+          "$ref": "#/$defs/Method"
+        },
+        "notes": {
+          "default": "",
+          "title": "Notes",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "verdict": {
+          "$ref": "#/$defs/Verdict"
+        }
+      },
+      "required": [
+        "id",
+        "claim",
+        "verdict",
+        "method",
+        "scope"
+      ],
+      "title": "Finding",
+      "type": "object"
+    },
+    "Method": {
+      "description": "How the evidence was produced. The method alone never implies a verdict.",
+      "enum": [
+        "proof",
+        "machine_checked_proof",
+        "exhaustive_finite_check",
+        "numerical_certificate",
+        "certified_solve",
+        "empirical_support",
+        "counterexample",
+        "review"
+      ],
+      "title": "Method",
+      "type": "string"
+    },
+    "Scope": {
+      "enum": [
+        "universal",
+        "bounded",
+        "instance"
+      ],
+      "title": "Scope",
+      "type": "string"
+    },
+    "TestRun": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "title": "Command",
+          "type": "string"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit Code"
+        },
+        "failed": {
+          "title": "Failed",
+          "type": "integer"
+        },
+        "passed": {
+          "title": "Passed",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "command",
+        "passed",
+        "failed"
+      ],
+      "title": "TestRun",
+      "type": "object"
+    },
+    "Verdict": {
+      "enum": [
+        "verified",
+        "refuted",
+        "inconclusive",
+        "unsupported"
+      ],
+      "title": "Verdict",
+      "type": "string"
+    },
+    "WorkStatus": {
+      "description": "Agent-declared state of the work (SPEC \u00a74.1).",
+      "enum": [
+        "done",
+        "partial",
+        "needs_input",
+        "needs_review",
+        "blocked"
+      ],
+      "title": "WorkStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Written by the agent to the report path named in its prompt (SPEC \u00a74.1).",
+  "properties": {
+    "files_changed": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Files Changed",
+      "type": "array"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/Finding"
+      },
+      "title": "Findings",
+      "type": "array"
+    },
+    "followups": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Followups",
+      "type": "array"
+    },
+    "learned": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Learned",
+      "type": "array"
+    },
+    "missing_context": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Missing Context",
+      "type": "array"
+    },
+    "question": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Required when status is needs_input.",
+      "title": "Question"
+    },
+    "schema_version": {
+      "const": "1",
+      "default": "1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/WorkStatus"
+    },
+    "summary": {
+      "description": "One line; becomes the commit message tail and bead note.",
+      "title": "Summary",
+      "type": "string"
+    },
+    "tests": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TestRun"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "status",
+    "summary"
+  ],
+  "title": "AgentReport",
+  "type": "object"
+}

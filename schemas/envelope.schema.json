@@ -1,0 +1,562 @@
+{
+  "$defs": {
+    "AgentReport": {
+      "additionalProperties": false,
+      "description": "Written by the agent to the report path named in its prompt (SPEC \u00a74.1).",
+      "properties": {
+        "files_changed": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Files Changed",
+          "type": "array"
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/Finding"
+          },
+          "title": "Findings",
+          "type": "array"
+        },
+        "followups": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Followups",
+          "type": "array"
+        },
+        "learned": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Learned",
+          "type": "array"
+        },
+        "missing_context": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Missing Context",
+          "type": "array"
+        },
+        "question": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Required when status is needs_input.",
+          "title": "Question"
+        },
+        "schema_version": {
+          "const": "1",
+          "default": "1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/WorkStatus"
+        },
+        "summary": {
+          "description": "One line; becomes the commit message tail and bead note.",
+          "title": "Summary",
+          "type": "string"
+        },
+        "tests": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TestRun"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "status",
+        "summary"
+      ],
+      "title": "AgentReport",
+      "type": "object"
+    },
+    "Check": {
+      "additionalProperties": false,
+      "description": "A check helios ran itself after the attempt (bead test, ownership, typecheck).",
+      "properties": {
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Command"
+        },
+        "detail": {
+          "default": "",
+          "title": "Detail",
+          "type": "string"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit Code"
+        },
+        "log_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Log Path"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "passed": {
+          "title": "Passed",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "passed"
+      ],
+      "title": "Check",
+      "type": "object"
+    },
+    "Checker": {
+      "additionalProperties": false,
+      "description": "A command that re-checks the artifact, and what it returned.",
+      "properties": {
+        "command": {
+          "title": "Command",
+          "type": "string"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit Code"
+        },
+        "output_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output Path"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "title": "Checker",
+      "type": "object"
+    },
+    "ExecutionStatus": {
+      "description": "Process facts recorded by helios, never by the agent (SPEC \u00a74.4).",
+      "enum": [
+        "completed",
+        "interrupted",
+        "timed_out",
+        "crashed",
+        "missing_output",
+        "invalid_output",
+        "launch_failed"
+      ],
+      "title": "ExecutionStatus",
+      "type": "string"
+    },
+    "Finding": {
+      "additionalProperties": false,
+      "description": "One claim with its evidence (SPEC \u00a74.2).",
+      "properties": {
+        "artifact": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Repo-relative path or exact command.",
+          "title": "Artifact"
+        },
+        "assumptions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Assumptions",
+          "type": "array"
+        },
+        "bound": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Domain, sizes, tolerance or instance names for the scope.",
+          "title": "Bound"
+        },
+        "checker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Checker"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "claim": {
+          "title": "Claim",
+          "type": "string"
+        },
+        "covers": {
+          "description": "Block or requirement ids.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Covers",
+          "type": "array"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "method": {
+          "$ref": "#/$defs/Method"
+        },
+        "notes": {
+          "default": "",
+          "title": "Notes",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "verdict": {
+          "$ref": "#/$defs/Verdict"
+        }
+      },
+      "required": [
+        "id",
+        "claim",
+        "verdict",
+        "method",
+        "scope"
+      ],
+      "title": "Finding",
+      "type": "object"
+    },
+    "Method": {
+      "description": "How the evidence was produced. The method alone never implies a verdict.",
+      "enum": [
+        "proof",
+        "machine_checked_proof",
+        "exhaustive_finite_check",
+        "numerical_certificate",
+        "certified_solve",
+        "empirical_support",
+        "counterexample",
+        "review"
+      ],
+      "title": "Method",
+      "type": "string"
+    },
+    "Scope": {
+      "enum": [
+        "universal",
+        "bounded",
+        "instance"
+      ],
+      "title": "Scope",
+      "type": "string"
+    },
+    "TestRun": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "title": "Command",
+          "type": "string"
+        },
+        "exit_code": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit Code"
+        },
+        "failed": {
+          "title": "Failed",
+          "type": "integer"
+        },
+        "passed": {
+          "title": "Passed",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "command",
+        "passed",
+        "failed"
+      ],
+      "title": "TestRun",
+      "type": "object"
+    },
+    "Verdict": {
+      "enum": [
+        "verified",
+        "refuted",
+        "inconclusive",
+        "unsupported"
+      ],
+      "title": "Verdict",
+      "type": "string"
+    },
+    "WorkStatus": {
+      "description": "Agent-declared state of the work (SPEC \u00a74.1).",
+      "enum": [
+        "done",
+        "partial",
+        "needs_input",
+        "needs_review",
+        "blocked"
+      ],
+      "title": "WorkStatus",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Written by helios to .helios/runs/<bead>/attempt-<n>/envelope.json (SPEC \u00a74.3).",
+  "properties": {
+    "artifacts": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Artifacts",
+      "type": "array"
+    },
+    "attempt": {
+      "minimum": 1,
+      "title": "Attempt",
+      "type": "integer"
+    },
+    "attempt_id": {
+      "description": "'<bead>#<attempt>'.",
+      "title": "Attempt Id",
+      "type": "string"
+    },
+    "base_commit": {
+      "title": "Base Commit",
+      "type": "string"
+    },
+    "checks": {
+      "items": {
+        "$ref": "#/$defs/Check"
+      },
+      "title": "Checks",
+      "type": "array"
+    },
+    "execution_status": {
+      "$ref": "#/$defs/ExecutionStatus"
+    },
+    "exit_code": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Exit Code"
+    },
+    "finished_at": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Finished At"
+    },
+    "harness": {
+      "enum": [
+        "claude",
+        "codex",
+        "opencode",
+        "agy",
+        "fake"
+      ],
+      "title": "Harness",
+      "type": "string"
+    },
+    "input_hashes": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "sha256 per input: prompt, bead, each doc and memory, unit file.",
+      "title": "Input Hashes",
+      "type": "object"
+    },
+    "kind": {
+      "description": "Stage id of the bead, SPEC \u00a73.",
+      "title": "Kind",
+      "type": "string"
+    },
+    "model": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Model"
+    },
+    "notes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Notes",
+      "type": "array"
+    },
+    "output_commit": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Output Commit"
+    },
+    "report": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AgentReport"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "report_error": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Report Error"
+    },
+    "schema_version": {
+      "const": "1",
+      "default": "1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "session_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Session Id"
+    },
+    "started_at": {
+      "title": "Started At",
+      "type": "string"
+    },
+    "steered": {
+      "description": "Extra user turns, SPEC \u00a79.",
+      "items": {
+        "type": "string"
+      },
+      "title": "Steered",
+      "type": "array"
+    },
+    "task_id": {
+      "description": "Bead id.",
+      "title": "Task Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "task_id",
+    "attempt",
+    "attempt_id",
+    "kind",
+    "harness",
+    "started_at",
+    "base_commit",
+    "input_hashes",
+    "execution_status"
+  ],
+  "title": "Envelope",
+  "type": "object"
+}
