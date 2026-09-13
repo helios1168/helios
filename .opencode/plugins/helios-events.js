@@ -14,7 +14,7 @@ function locate(dir) {
 }
 
 export const HeliosEvents = async ({ directory }) => {
-  const { hub, bead } = locate(process.env.HELIOS_HUB_DIR ?? directory)
+  const { hub, bead } = locate(directory)
   const file = path.join(process.env.HELIOS_HUB ?? hub, ".helios", "events.jsonl")
   return {
     event: async ({ event }) => {

@@ -1,0 +1,55 @@
+# Claim backends (SPEC §15). A claim's backend must be listed here and must allow the claim's
+# method and scope. Adding a tool is a row here, a runner module and a reference skill.
+# `install` is printed when the runner cannot import its tool.
+
+[backend.sympy]
+runner = "helios.claims.backends.sympy"
+methods = ["proof", "counterexample"]
+scopes = ["universal", "instance"]
+install = "uv add sympy"
+note = "Identities are also evaluated at 10 random rational points; a failed simplify is inconclusive."
+
+[backend.numeric]
+runner = "helios.claims.backends.numeric"
+methods = ["numerical_certificate", "counterexample"]
+scopes = ["instance", "bounded"]
+install = ""
+note = "State the tolerance in bound."
+
+[backend.hypothesis]
+runner = "helios.claims.backends.hypothesis"
+methods = ["empirical_support", "counterexample"]
+scopes = ["bounded"]
+install = "uv add hypothesis"
+
+[backend.z3]
+runner = "helios.claims.backends.z3"
+methods = ["exhaustive_finite_check", "proof", "counterexample"]
+scopes = ["bounded", "universal"]
+install = "uv add z3-solver"
+note = "universal only for quantified linear arithmetic with no bound; an unsat core is not a proof object."
+
+[backend.manual]
+runner = ""
+methods = ["proof", "review"]
+scopes = ["universal", "bounded", "instance"]
+install = ""
+note = "Not run by claims check; the verifier reads it."
+
+[backend.lean]
+runner = "helios.claims.backends.lean"
+methods = ["machine_checked_proof"]
+scopes = ["universal"]
+install = "brew install elan-init"
+
+[backend.dreal]
+runner = "helios.claims.backends.dreal"
+methods = ["numerical_certificate", "counterexample"]
+scopes = ["bounded"]
+install = "uv add dreal"
+
+[backend.vipr]
+runner = "helios.claims.backends.vipr"
+methods = ["certified_solve"]
+scopes = ["instance"]
+install = "SCIP built with exact mode, viprchk on PATH"

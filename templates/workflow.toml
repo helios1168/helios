@@ -1,0 +1,53 @@
+# .agents/workflow.toml: every project fact helios needs (SPEC §5).
+# Every key is optional; the value shown is the default. Unknown keys are an error.
+
+[project]
+test = "uv run pytest -q"          # run with bash -c from the worktree root
+typecheck = ""                     # empty disables
+units = "docs/units"
+verify_artifacts = "tools/verify"
+experiments = "experiments"
+worktrees = ".claude/worktrees"
+runs = ".helios/runs"
+link_into_worktrees = []           # hub-relative globs symlinked into each new worktree
+confidential = []                  # globs never staged, pushed or printed
+always_allowed = ["tests/"]        # prefixes any impl bead may touch
+# program = "pkg.model.program"    # module exposing REGISTRY (SPEC §15)
+# claims = "pkg.model.claims"      # module with @claim functions
+
+[agents]                           # agent spec: "harness", "harness:profile" or "other"
+orchestrate = "claude"
+implement = "codex"
+model = "claude"
+verify_code = "other"
+verify_math = "other"
+verify_order = ["claude", "codex", "opencode", "agy"]
+
+[harness.claude]
+# binary = "claude"
+# model = "opus"
+# effort = "high"
+# timeout_s = 3600
+# extra_args = []
+
+[harness.codex]
+
+[harness.opencode]
+# server_url = "http://127.0.0.1:4096"
+
+[harness.agy]
+
+[control]
+default = "manual"                 # manual | until | auto
+until = "verify-code"
+stop_at = ["frame", "model", "report"]
+confirm = ["merge"]
+
+[memory]
+backend = "beads"                  # beads | files
+export_dir = ".helios/memories"
+inject_cap_bytes = 32000
+
+[tolerance]
+# tier1 = 1e-8
+# tier2 = 5e-3
