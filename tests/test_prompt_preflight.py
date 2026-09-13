@@ -1,0 +1,158 @@
+"""Prompt and preflight tests (SPEC §7.1 step 2, §7.2)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from helios import prompt as pr
+from helios.beads import Bead
+from helios.preflight import PreflightContext, check, memory_map
+
+
+def make_hub(tmp_path: Path) -> Path:
+    hub = tmp_path / "hub"
+    (hub / "skills" / "impl").mkdir(parents=True)
+    (hub / "skills" / "impl" / "SKILL.md").write_text(
+        "---\nname: impl\n---\n\n# Implementation bead\n\nDo the work.\n"
+    )
+    (hub / "AGENTS.md").write_text(
+        "# helios\n\n## Worker contract\n\nWork exactly one bead.\n\n## Orchestrator\n\nMerges.\n"
+    )
+    (hub / "docs").mkdir()
+    (hub / "docs" / "SPEC.md").write_text(
+        "# spec\n\n## 5. Configuration\n\nConfig words.\n\n## 7. Run\n\nRun words.\n"
+    )
+    return hub
+
+
+BEAD = {
+    "id": "b1",
+    "title": "t",
+    "description": "d",
+    "kind": "impl",
+    "unit": None,
+    "accept": "do it",
+    "files": ["src/"],
+    "test": "uv run pytest -q",
+}
+
+
+def base_kwargs(hub: Path) -> dict:
+    return dict(
+        kind="impl",
+        skills_dir=hub / "skills",
+        agents_path=hub / "AGENTS.md",
+        bead=dict(BEAD),
+        docs=["docs/SPEC.md#5. Configuration"],
+        hub=hub,
+        memories={"m1": "memory one"},
+        worktree=hub / ".claude" / "worktrees" / "b1",
+        branch="worktree-b1",
+        attempt_id="b1#1",
+        report_path=hub / ".helios" / "attempt-1" / "report.json",
+        report_schema='{"title": "AgentReport"}',
+        inject_cap_bytes=32000,
+    )
+
+
+def test_assemble_order_extraction_and_harness_invariance() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        hub = make_hub(Path(tmp))
+        first = pr.assemble(**base_kwargs(hub))
+        second = pr.assemble(**base_kwargs(hub))
+        assert first == second
+        headings = [l for l in first.splitlines() if l.startswith("## ")]
+        order = [
+            "## Role",
+            "## Contract",
+            "## Bead",
+            "## Docs",
+            "## Memories",
+            "## Attempt",
+        ]
+        assert [h for h in headings if h in order] == order
+        assert "Do the work." in first and "name: impl" not in first
+        assert "Work exactly one bead." in first and "Merges." not in first
+        assert "Config words." in first and "Run words." not in first
+        assert '"id": "b1"' in first and "b1#1" in first
+
+
+def test_assemble_caps_docs_plus_memories() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        hub = make_hub(Path(tmp))
+        (hub / "docs" / "BIG.md").write_text("# big\n\n" + "x" * 5000 + "\n")
+        kwargs = base_kwargs(hub)
+        kwargs["docs"] = ["docs/BIG.md"]
+        kwargs["memories"] = {"m1": "y" * 5000}
+        kwargs["inject_cap_bytes"] = 1000
+        out = pr.assemble(**kwargs)
+        assert "truncated for inject cap" in out
+        assert "docs/BIG.md" in out or "m1" in out
+
+
+def impl_bead(**kw) -> Bead:
+    base = dict(
+        id="b1", kind="impl", files=["src/"], test="uv run pytest -q",
+        docs=[], memories=[],
+    )
+    base.update(kw)
+    return Bead(**base)
+
+
+def test_preflight_needs_files_test_docs_and_memories(tmp_path: Path) -> None:
+    hub = make_hub(tmp_path)
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}))
+    errors = check(
+        [impl_bead(files=[], test="", docs=["docs/MISSING.md"], memories=["nope"])], ctx
+    )
+    assert any("needs `files`" in e for e in errors)
+    assert any("needs `test`" in e for e in errors)
+    assert any("MISSING" in e for e in errors)
+    assert any("nope" in e for e in errors)
+    assert check([impl_bead()], PreflightContext(hub=hub, memory_has=memory_map({}))) == []
+
+
+def test_preflight_verify_math_model_and_overlap(tmp_path: Path) -> None:
+    hub = make_hub(tmp_path)
+    (hub / "docs" / "units").mkdir(parents=True)
+    (hub / "docs" / "units" / "U1.md").write_text("# U1\n\n## Model\n\n_empty_\n")
+    ctx = PreflightContext(hub=hub, units_dir="docs/units")
+    bead = Bead(id="v1", kind="verify-math", unit="U1", parent="b1")
+    assert any("substantive" in e for e in check([bead], ctx))
+    (hub / "docs" / "units" / "U1.md").write_text("# U1\n\n## Model\n\n" + "claim words " * 30 + "\n")
+    assert check([bead], ctx) == []
+    clash = check([impl_bead(id="a", files=["src/helios/"]), impl_bead(id="b", files=["src/"])], ctx)
+    assert any("overlap" in e for e in clash)
+    disjoint = check(
+        [impl_bead(id="a", files=["src/helios/"]), impl_bead(id="b", files=["tests/"])], ctx
+    )
+    assert disjoint == []
+
+
+def test_preflight_unfinalized_attempt(tmp_path: Path) -> None:
+    import os
+
+    from helios import attempt as att
+
+    hub = make_hub(tmp_path)
+    ctx = PreflightContext(hub=hub)
+    bead = impl_bead()
+    assert check([bead], ctx) == []
+    # A dead attempt is recoverable, so preflight passes.
+    attempt, _ = att.allocate(hub=hub, runs_rel=".helios/runs", bead="b1", worktree=tmp_path)
+    assert check([bead], ctx) == []
+    att.transition(attempt.dir, "finalized")
+    assert check([bead], ctx) == []
+    # A live pid refuses, naming attach and stop.
+    live, _ = att.allocate(
+        hub=hub, runs_rel=".helios/runs", bead="b1", worktree=tmp_path, pid=os.getpid()
+    )
+    att.transition(live.dir, "launched")
+    errors = check([bead], ctx)
+    assert any("helios attach b1" in e and "helios stop b1" in e for e in errors)
