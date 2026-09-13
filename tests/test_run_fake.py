@@ -218,13 +218,21 @@ def test_d_timeout_kills_process(tmp_path: Path, monkeypatch) -> None:
 
 
 CHILD_RUNNER = """\
-import os, sys
+import json, os, sys, time
 from pathlib import Path
 from helios import beads as B, config as C, run as R
 hub = Path(os.environ["HELIOS_CHILD_HUB"])
 ids = os.environ["HELIOS_CHILD_BEADS"].split(",")
+tests = json.loads(os.environ.get("HELIOS_CHILD_TESTS", "{}"))
+slow = float(os.environ.get("HELIOS_CHILD_SLOW", "0"))
+if slow:
+    _orig = R._assemble_inputs
+    def _slow(**kw):
+        time.sleep(slow)
+        return _orig(**kw)
+    R._assemble_inputs = _slow
 beads = B.FakeBeads(
-    [B.Bead(id=i, kind="impl", files=[f"src/{i}/"], test="true") for i in ids]
+    [B.Bead(id=i, kind="impl", files=[f"src/{i}/"], test=tests.get(i, "true")) for i in ids]
 )
 rc = R.run_many(ids, hub=hub, beads=beads, config=C.load(hub),
                 harness_override="fake", max_parallel=int(os.environ["HELIOS_CHILD_MAXP"]))
@@ -232,11 +240,14 @@ sys.exit(rc)
 """
 
 
-def spawn_child(hub: Path, script: Path, bead_ids: str, maxp: int = 1):
+def spawn_child(hub: Path, script: Path, bead_ids: str, maxp: int = 1,
+                tests: dict | None = None, slow: float = 0):
     """Run helios in a real subprocess so a real SIGINT can be delivered."""
     env = dict(os.environ, HELIOS_FAKE_SCRIPT=str(script),
                HELIOS_CHILD_HUB=str(hub), HELIOS_CHILD_BEADS=bead_ids,
-               HELIOS_CHILD_MAXP=str(maxp))
+               HELIOS_CHILD_MAXP=str(maxp),
+               HELIOS_CHILD_TESTS=json.dumps(tests or {}),
+               HELIOS_CHILD_SLOW=str(slow))
     return subprocess.Popen(
         [sys.executable, "-c", CHILD_RUNNER],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -700,8 +711,450 @@ def test_launched_event_has_null_session(tmp_path: Path, monkeypatch) -> None:
 def test_harness_get_errors() -> None:
     from helios.harness import get as _get
 
-    with pytest.raises(TypeError):
-        _get("base")
-    for name in ("nope", "fake.x", "__init__", "claude"):
+    for name in ("base", "nope", "fake.x", "__init__", "claude"):
         with pytest.raises(ValueError, match=name.split(".")[0]):
             _get(name)
+
+
+def group_dead(pgid: int | None) -> bool:
+    if not pgid:
+        return True
+    for _ in range(40):
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        time.sleep(0.05)
+    return False
+
+
+def reap_group(pgid: int | None) -> None:
+    if pgid:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def test_sigint_during_checks_single(tmp_path: Path) -> None:
+    hub = make_hub(tmp_path)
+    script = write_script(tmp_path, {"report": {"status": "done", "summary": "ok"}})
+    proc = spawn_child(hub, script, "b1", tests={"b1": "sleep 6"})
+    wait_for(hub / ".helios" / "runs" / "b1" / "attempt-1" / "state.log",
+             "native_completed")
+    time.sleep(0.7)
+    os.kill(proc.pid, signal.SIGINT)
+    proc.communicate(timeout=90)
+    assert proc.returncode == 4
+    env = read_envelope(hub, "b1", 1)
+    assert env["execution_status"] == "completed"
+    assert attempt_mod.read_state(
+        hub / ".helios" / "runs" / "b1" / "attempt-1")["state"] == "finalized"
+
+
+def test_sigint_during_checks_parallel(tmp_path: Path) -> None:
+    hub = make_hub(tmp_path)
+    script = write_script(tmp_path, {"report": {"status": "done", "summary": "ok"}})
+    proc = spawn_child(hub, script, "b1,b2", maxp=2,
+                       tests={"b1": "sleep 6", "b2": "sleep 6"})
+    for bid in ("b1", "b2"):
+        wait_for(hub / ".helios" / "runs" / bid / "attempt-1" / "state.log",
+                 "native_completed")
+    time.sleep(0.7)
+    os.kill(proc.pid, signal.SIGINT)
+    proc.communicate(timeout=90)
+    assert proc.returncode == 4
+    for bid in ("b1", "b2"):
+        assert attempt_mod.read_state(
+            hub / ".helios" / "runs" / bid / "attempt-1")["state"] == "finalized"
+
+
+def test_second_sigint_still_exits_4(tmp_path: Path) -> None:
+    hub = make_hub(tmp_path)
+    script = write_script(
+        tmp_path,
+        {"sleep_s": 40, "stdout": "slow",
+         "report": {"status": "done", "summary": "ok"}, "ignore_sigint": True},
+    )
+    proc = spawn_child(hub, script, "b1")
+    a1 = hub / ".helios" / "runs" / "b1" / "attempt-1"
+    wait_for(a1 / "stdout.jsonl", "slow")
+    pid = attempt_mod.read_state(a1)["pid"]
+    os.kill(proc.pid, signal.SIGINT)
+    time.sleep(2)
+    os.kill(proc.pid, signal.SIGINT)
+    proc.communicate(timeout=90)
+    alive = not group_dead(pid)
+    reap_group(pid)
+    assert not alive and proc.returncode == 4
+    assert read_envelope(hub, "b1", 1)["execution_status"] == "interrupted"
+
+
+def test_queued_bead_never_launches(tmp_path: Path) -> None:
+    hub = make_hub(tmp_path)
+    script = write_script(
+        tmp_path,
+        {"sleep_s": 5, "stdout": "slow", "report": {"status": "done", "summary": "ok"}},
+    )
+    proc = spawn_child(hub, script, "b1,b2,b3", maxp=2)
+    for bid in ("b1", "b2"):
+        wait_for(hub / ".helios" / "runs" / bid / "attempt-1" / "stdout.jsonl", "slow")
+    os.kill(proc.pid, signal.SIGINT)
+    proc.communicate(timeout=90)
+    assert proc.returncode == 4
+    assert not (hub / ".helios" / "runs" / "b3").exists()
+
+
+GRANDCHILD = r"""
+import os, signal, subprocess, sys, time
+mode, gcfile = sys.argv[1], sys.argv[2]
+gc = ("import os,signal,time,sys; signal.signal(signal.SIGINT, signal.SIG_IGN); "
+      "signal.signal(signal.SIGTERM, signal.SIG_IGN); open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(120)")
+subprocess.Popen([sys.executable, "-c", gc, gcfile])
+if mode == "escalate":
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while not os.path.exists(gcfile):
+    time.sleep(0.02)
+print("slow", flush=True)
+time.sleep(120)
+"""
+
+
+@pytest.mark.parametrize("mode", ["escalate", "leader_exits"])
+def test_timeout_waits_for_whole_group(tmp_path: Path, monkeypatch, mode: str) -> None:
+    from helios.harness import fake as fake_mod
+
+    hub = make_hub(tmp_path)
+    gcfile = tmp_path / "gc.pid"
+    monkeypatch.setattr(
+        fake_mod.FakeHarness, "argv",
+        lambda self, spec: [sys.executable, "-c", GRANDCHILD, mode, str(gcfile)])
+    set_fake(monkeypatch, write_script(tmp_path, {}))
+    rc = run_mod.run_one("b1", hub=hub,
+                         beads=beads_mod.FakeBeads([make_bead("b1")]),
+                         config=config_mod.load(hub), harness_override="fake",
+                         timeout_s=3)
+    pgid = attempt_mod.read_state(hub / ".helios" / "runs" / "b1" / "attempt-1")["pid"]
+    alive = not group_dead(pgid)
+    reap_group(pgid)
+    assert rc == 4
+    assert read_envelope(hub, "b1", 1)["execution_status"] == "timed_out"
+    assert not alive
+
+
+def setup_attempt(hub: Path, state: str, pid=None):
+    cfg = config_mod.load(hub)
+    info = worktree_mod.prepare(hub=hub, bead="b1")
+    att, _ = attempt_mod.allocate(
+        hub=hub, runs_rel=cfg.project.runs, bead="b1", worktree=info.path)
+    (att.dir / "input.json").write_text(json.dumps(
+        {"input_hashes": {"x": "y"}, "base_commit": info.base_commit}))
+    if state in ("native_completed", "validated", "invalid"):
+        rp = attempt_mod.worktree_report_path(info.path, 1)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text(json.dumps({"status": "done", "summary": "ok"}))
+        (info.path / "src/b1").mkdir(parents=True)
+        (info.path / "src/b1/x.txt").write_text("x\n")
+        (att.dir / "stdout.jsonl").write_text("ok\n")
+    if state != "allocated":
+        attempt_mod.transition(att.dir, "launched", pid=pid)
+        if state != "launched":
+            if state in ("validated", "invalid"):
+                attempt_mod.transition(att.dir, "native_completed")
+            attempt_mod.transition(att.dir, state)
+    return cfg, info, att
+
+
+def dead_pid() -> int:
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
+
+
+RECOVERY_STATES = ["allocated", "launched", "native_completed", "validated", "invalid",
+                   "interrupted", "timed_out", "crashed", "launch_failed"]
+
+
+@pytest.mark.parametrize("state", RECOVERY_STATES)
+def test_recovery_matrix(tmp_path: Path, monkeypatch, state: str) -> None:
+    hub = make_hub(tmp_path)
+    cfg, info, att = setup_attempt(hub, state, pid=dead_pid())
+    before = [json.loads(line)["state"]
+              for line in (att.dir / "state.log").read_text().splitlines()]
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="impl", files=["src/b1/"],
+        test="mkdir -p src/b1 && echo y > src/b1/y.txt")])
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg,
+                         harness_override="fake")
+    after = [json.loads(line)["state"]
+             for line in (att.dir / "state.log").read_text().splitlines()]
+    attempts = attempt_mod.existing_attempts(hub / ".helios" / "runs" / "b1")
+    assert after[-1] == "finalized"
+    if state in ("native_completed", "validated", "invalid"):
+        assert attempts == [1]
+        assert (att.dir / "envelope.json").exists()
+    elif state in ("allocated", "launched"):
+        assert after[len(before):] == ["crashed", "finalized"] and attempts == [1, 2]
+    else:
+        assert after[len(before):] == ["finalized"] and attempts == [1, 2]
+    assert rc in (0, 3, 4, 5)
+
+
+@pytest.mark.parametrize("flag", ["interrupted", "timed_out"])
+def test_resume_keeps_terminal_status(tmp_path: Path, monkeypatch, flag: str) -> None:
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    real_law = run_mod._launch_and_wait
+
+    def fake_law(*a, **k):
+        code, _t, _i, lf, pid = real_law(*a, **k)
+        return code, flag == "timed_out", flag == "interrupted", lf, pid
+
+    monkeypatch.setattr(run_mod, "_launch_and_wait", fake_law)
+    real_wb = beads_mod.apply_writeback
+
+    def boom(*a, **k):
+        raise RuntimeError("bd died")
+
+    monkeypatch.setattr(beads_mod, "apply_writeback", boom)
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="impl", files=["src/b1/"],
+        test="mkdir -p src/b1 && echo y > src/b1/y")])
+    with pytest.raises(RuntimeError):
+        run_mod.run_one("b1", hub=hub, beads=beads, config=cfg,
+                        harness_override="fake")
+    first = read_envelope(hub, "b1", 1)["execution_status"]
+    monkeypatch.setattr(beads_mod, "apply_writeback", real_wb)
+    monkeypatch.setattr(run_mod, "_launch_and_wait", real_law)
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg,
+                         harness_override="fake")
+    assert first == flag
+    assert read_envelope(hub, "b1", 1)["execution_status"] == flag
+    assert rc == 4 and "b1" not in beads.closed
+
+
+def test_pre_staged_unowned_never_committed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hub = make_hub(tmp_path)
+    cmd = ("echo evil >> README.md && git add README.md && git show HEAD:README.md > README.md "
+           "&& mkdir -p src/b1 && echo ok > src/b1/a")
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="impl", files=["src/b1/"], test=cmd)])
+    run_mod.run_one("b1", hub=hub, beads=beads,
+                    config=config_mod.load(hub), harness_override="fake")
+    wt = hub / ".claude" / "worktrees" / "b1"
+    assert subprocess.run(
+        ["git", "show", "HEAD:README.md"], cwd=wt, check=True,
+        capture_output=True, text=True).stdout == "hi\n"
+
+
+def test_pre_staged_confidential_never_committed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hub = make_hub(tmp_path)
+    (hub / ".agents").mkdir(exist_ok=True)
+    (hub / ".agents" / "workflow.toml").write_text(
+        '[project]\nconfidential = ["*.pem"]\n')
+    subprocess.run(["git", "add", "."], cwd=hub, check=True)
+    subprocess.run(["git", "commit", "-qm", "conf"], cwd=hub, check=True)
+    cmd = "echo KEY > k.pem && git add k.pem && rm k.pem && mkdir -p src/b1 && echo ok > src/b1/a"
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="impl", files=["src/b1/"], test=cmd)])
+    run_mod.run_one("b1", hub=hub, beads=beads,
+                    config=config_mod.load(hub), harness_override="fake")
+    wt = hub / ".claude" / "worktrees" / "b1"
+    tree = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=wt, check=True,
+        capture_output=True, text=True).stdout.splitlines()
+    assert "k.pem" not in tree
+
+
+def test_glob_pathspec_does_not_stage_link(tmp_path: Path, monkeypatch) -> None:
+    hub = tmp_path / "hub"
+    hub.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=hub, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=hub, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=hub, check=True)
+    (hub / "README.md").write_text("hi\n")
+    (hub / ".gitignore").write_text(".helios/\n.claude/worktrees/\n")
+    (hub / "skills" / "impl").mkdir(parents=True)
+    (hub / "skills" / "impl" / "SKILL.md").write_text("---\nname: impl\n---\n\nDo.\n")
+    (hub / "AGENTS.md").write_text("# h\n\n## Worker contract\n\nOne bead.\n")
+    (hub / ".agents").mkdir()
+    (hub / ".agents" / "workflow.toml").write_text(
+        '[project]\nlink_into_worktrees = ["src/b1/.env"]\nconfidential = [".env"]\n')
+    (hub / "src" / "b1").mkdir(parents=True)
+    (hub / "src" / "b1" / "keep").write_text("k\n")
+    subprocess.run(["git", "add", "."], cwd=hub, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=hub, check=True)
+    (hub / "src" / "b1" / ".env").write_text("SECRET=1\n")
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="impl", files=["src/b1/"],
+        test="echo x > 'src/b1/[.]env'")])
+    run_mod.run_one("b1", hub=hub, beads=beads,
+                    config=config_mod.load(hub), harness_override="fake")
+    wt = hub / ".claude" / "worktrees" / "b1"
+    assert os.path.islink(wt / "src/b1" / ".env")
+    tree = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=wt, check=True,
+        capture_output=True, text=True).stdout.splitlines()
+    assert "src/b1/.env" not in tree
+
+
+def test_staging_delete_and_rename(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    (hub / "src").mkdir()
+    (hub / "src" / "b1").mkdir()
+    (hub / "src" / "b1" / "old.txt").write_text("o\n")
+    (hub / "src" / "b1" / "keep.txt").write_text("k\n")
+    subprocess.run(["git", "add", "."], cwd=hub, check=True)
+    subprocess.run(["git", "commit", "-qm", "files"], cwd=hub, check=True)
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="impl", files=["src/b1/"],
+        test="rm src/b1/keep.txt && mv src/b1/old.txt src/b1/new.txt")])
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    wt = hub / ".claude" / "worktrees" / "b1"
+    tree = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=wt, check=True,
+        capture_output=True, text=True).stdout.splitlines()
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=wt, check=True,
+        capture_output=True, text=True).stdout
+    assert rc == 0 and "src/b1/new.txt" in tree
+    assert "src/b1/old.txt" not in tree and "src/b1/keep.txt" not in tree
+    assert status == ""
+
+
+@pytest.mark.parametrize("payload,want,rc_want", [
+    ({"report": {"status": "done", "summary": "ok"}, "exit_code": 9}, "completed", 0),
+    ({"report_text": "{nope", "exit_code": 9}, "invalid_output", 4),
+    ({"report": {"status": "done"}}, "invalid_output", 4),
+    ({"exit_code": 9}, "crashed", 4),
+    ({}, "missing_output", 4),
+])
+def test_classification_matrix(tmp_path: Path, monkeypatch, payload, want, rc_want) -> None:
+    hub = make_hub(tmp_path)
+    set_fake(monkeypatch, write_script(tmp_path, dict(payload)))
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    env = read_envelope(hub, "b1", 1)
+    envelope_mod.Envelope.model_validate(env)
+    assert env["execution_status"] == want and rc == rc_want
+    if want == "completed":
+        assert any("exit" in n for n in env["notes"])
+
+
+def test_set_state_called_once(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1", test="false")])
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "done", "summary": "s"}}))
+    assert run_mod.run_one("b1", hub=hub, beads=beads,
+                           config=config_mod.load(hub),
+                           harness_override="fake") == 5
+    sets = [a for a in beads.argv_log if a and a[0] == "set-state"]
+    assert len(sets) == 1 and sets[0][3] == "failed"
+
+
+def test_writeback_replay_keeps_comments(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    rep = {"status": "needs_input", "summary": "q", "question": "why?",
+           "learned": ["l1", "l2"], "missing_context": ["m1"], "followups": ["f1"]}
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": rep, "session_id": "s1"}))
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    run_mod.run_one("b1", hub=hub, beads=beads,
+                    config=config_mod.load(hub), harness_override="fake")
+    first = [c.text for c in beads.comments("b1")]
+    a1 = hub / ".helios" / "runs" / "b1" / "attempt-1"
+    attempt_mod.transition(a1, "validated")
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    second = [c.text for c in beads.comments("b1")]
+    assert first == second and len(first) == 6 and rc == 3
+
+
+def test_stdin_devnull_or_text(tmp_path: Path, monkeypatch) -> None:
+    from helios.harness import fake as fake_mod
+
+    child = ("import os, sys; st = os.fstat(0); dn = os.stat('/dev/null'); "
+             "data = sys.stdin.read(); "
+             "open(sys.argv[1], 'w').write(repr((os.path.samestat(st, dn), data)))")
+    for text in (None, "PROMPT-X"):
+        hub = make_hub(tmp_path / ("s" if text is None else "t"))
+        outf = tmp_path / ("o1" if text is None else "o2")
+        monkeypatch.setattr(
+            fake_mod.FakeHarness, "argv",
+            lambda self, spec: [sys.executable, "-c", child, str(outf)])
+        monkeypatch.setattr(fake_mod.FakeHarness, "stdin_text",
+                            lambda self, spec: text)
+        set_fake(monkeypatch, write_script(tmp_path, {}))
+        run_mod.run_one("b1", hub=hub, beads=beads_mod.FakeBeads([make_bead("b1")]),
+                        config=config_mod.load(hub), harness_override="fake",
+                        timeout_s=20)
+        assert outf.read_text() == repr((text is None, text or ""))
+
+
+def test_live_refusal_message_and_lock(tmp_path: Path, monkeypatch, capsys) -> None:
+    hub = make_hub(tmp_path)
+    live = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        setup_attempt(hub, "launched", pid=live.pid)
+        set_fake(monkeypatch, write_script(
+            tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+        beads = beads_mod.FakeBeads([make_bead("b1")])
+        rc = run_mod.run_many(["b1"], hub=hub, beads=beads,
+                              config=config_mod.load(hub), harness_override="fake")
+        out = capsys.readouterr()
+        assert rc == 2
+        assert "helios attach b1" in out.out + out.err
+        assert "helios stop b1" in out.out + out.err
+        assert beads.argv_log == []
+    finally:
+        live.kill()
+        live.wait()
+
+
+def test_lock_refusal_second_process(tmp_path: Path) -> None:
+    hub = make_hub(tmp_path)
+    script = write_script(
+        tmp_path,
+        {"sleep_s": 3, "stdout": "slow", "report": {"status": "done", "summary": "ok"}},
+        name="s1.json")
+    proc = spawn_child(hub, script, "b1", slow=4)
+    try:
+        wait_for(hub / ".helios" / "runs" / "b1" / "attempt-1" / "state.log",
+                 "allocated")
+        quick = spawn_child(
+            hub, write_script(tmp_path, {"sleep_s": 1,
+                                         "report": {"status": "done", "summary": "ok"}},
+                              name="s2.json"), "b1")
+        out2, err2 = quick.communicate(timeout=60)
+        assert quick.returncode == 2
+        assert "helios attach b1" in out2 + err2
+        out1, _ = proc.communicate(timeout=60)
+        assert proc.returncode == 0
+        assert not (hub / ".helios" / "runs" / "b1" / "attempt-2").exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()

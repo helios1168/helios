@@ -10,9 +10,11 @@ _REGISTERED = ("claude", "codex", "opencode", "agy", "fake")
 
 
 def get(name: str) -> Harness:
-    """Return the adapter for ``name`` (SPEC §6.1, §6.4)."""
-    if name == "base":
-        raise TypeError("helios.harness.base is the adapter interface, not a harness")
+    """Return the adapter for ``name`` (SPEC §6.1, §6.4).
+
+    Only the registered harness names resolve; any other name raises
+    ``ValueError`` naming it.
+    """
     if name == "fake":
         from helios.harness.fake import FakeHarness
 
