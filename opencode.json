@@ -4,9 +4,14 @@
   "permission": {
     "edit": "allow",
     "webfetch": "deny",
+    "websearch": "deny",
     "external_directory": "deny",
     "bash": {
       "*": "allow",
+      "curl*": "deny",
+      "wget*": "deny",
+      "bd*": "deny",
+      "bd show*": "allow",
       "git merge*": "deny",
       "git checkout*": "deny",
       "git switch*": "deny",
@@ -15,14 +20,7 @@
       "git reset --hard*": "deny",
       "git worktree*": "deny",
       "git tag*": "deny",
-      "git branch -D*": "deny",
-      "bd close*": "deny",
-      "bd update*": "deny",
-      "bd create*": "deny",
-      "bd delete*": "deny",
-      "bd remember*": "deny",
-      "bd forget*": "deny",
-      "bd dolt*": "deny"
+      "git branch -D*": "deny"
     }
   }
 }
