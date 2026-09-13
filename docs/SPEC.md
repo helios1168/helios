@@ -221,6 +221,11 @@ processes. `helios.harness.get(name) -> Harness` returns the adapter.
 3. helios takes the native structured result when present, else the report file. When both
    exist and differ, it takes the native result and adds a note.
 4. The report is validated with `AgentReport.model_validate`. Failure gives `invalid_output`.
+5. The chosen report text is copied, byte for byte, to `attempt-<n>/report.json` (the captured
+   report, §8.1) before `execution_status` is stored, and no captured report is written when
+   none was found. From then on validation, recovery and write-back read only the captured
+   report, never the worktree path again, so an agent or user deleting or editing the worktree
+   report after step 8 changes nothing.
 
 ### 6.3 Per harness
 
@@ -364,12 +369,20 @@ These apply to claude, codex, opencode and agy.
 8. Parse with the adapter, capture the report (§6.2), classify execution status (§4.4).
 9. Run checks from helios itself: the bead `test` in the worktree (log to `checks/test.log`),
    `typecheck` when set, ownership (§7.4).
-10. If ownership passed, stage exactly the changed paths of §7.4, after its skips, with
-    literal pathspecs (`git add -A -- ':(literal)<path>' ...`, never the whole tree). Commit
-    only those paths (`git commit -m <message> -- ':(literal)<path>' ...`) as
-    `<bead>: <report summary>` when any of them differs from HEAD. `output_commit` is the worktree HEAD after this step, whether helios
-    committed, the agent committed, or nothing changed. When ownership failed, nothing is
-    staged and `output_commit` is null.
+10. If ownership passed, commit the changed paths of §7.4, after its skips, in three calls with
+    literal pathspecs, never the whole tree. A path may no longer exist anywhere (a `git mv` or
+    `git rm` source, or a file staged and then deleted on disk), and git rejects a pathspec
+    that matches nothing, so each call gets its own filtered list:
+    - stage: `git add -A -- ':(literal)<path>' ...` with the paths that exist on disk
+      (`os.path.lexists`) or are in the index (`git ls-files -z --cached -- <pathspecs>`);
+      skip the call when that list is empty;
+    - select: `git diff --cached --name-only --no-renames -z HEAD -- <pathspecs of all changed
+      paths>` lists the paths whose index entry differs from HEAD, deletions included;
+    - commit: when the selected list is not empty, `git commit -m '<bead>: <report summary>'
+      -- ':(literal)<path>' ...` with exactly the selected paths.
+    `output_commit` is the worktree HEAD after this step, whether helios committed, the agent
+    committed, or nothing changed. When ownership failed, nothing is staged and `output_commit`
+    is null.
 11. Write `envelope.json`, finalize the attempt, write back to the bead (§7.5), append the
     event (§9.3).
 
@@ -385,7 +398,20 @@ processes, which are also started with `start_new_session=True`. Beads not yet l
 never launched. An attempt whose harness child was still running when the flag was set records
 `interrupted`; an attempt already classified in step 8 keeps its status. A check stopped by the
 interrupt fails with detail `interrupted`. Every launched attempt still completes steps 8 to
-11. Later SIGINTs are ignored.
+11. Later SIGINTs are ignored. An attempt allocated but not yet launched when the flag is set
+never launches: it goes from `allocated` straight to `interrupted`, emits no `launched` event,
+and completes steps 8 (classified `interrupted`), 10 and 11; its checks are skipped with detail
+`interrupted`.
+
+The handler never blocks. It only sets the flag (a `threading.Event`) and returns; a stopper
+thread started by the run waits on that event and runs the stop sequences. The handler must not
+take any lock, because the main thread may hold it when the signal arrives. The handler is
+installed only when `run_many` is called from the main thread (elsewhere `signal.signal` is not
+allowed, and SIGINT keeps its current behavior), and the previous handler is restored before
+`run_many` returns.
+
+Every refusal and preflight message (lock held, live attempt, preflight errors, including under
+`--dry-run`) goes to stderr.
 
 `--dry-run` prints harness, argv, worktree, attempt path and prompt size. It performs no
 recovery (§8.4) and prints the recovery action instead. When the bead lock is held or the latest
@@ -490,7 +516,10 @@ captured report), `checks/`, `envelope.json`. The agent writes its report inside
 `allocated`, then `launched`, then one of `native_completed`, `interrupted`, `timed_out`,
 `crashed`, `launch_failed`, then `validated` or `invalid`, then `finalized`. `state.json` is
 `{"state", "attempt_id", "pid", "session_id", "execution_status", "updated"}`, where
-`execution_status` is null until step 8 classifies the attempt and never changes after. It is written to a temp file and
+`execution_status` is null until step 8 classifies the attempt and never changes after. Every
+write carries all six keys, and a transition keeps the stored `execution_status` (and `pid`
+and `session_id`) unless it sets a new value, so the key survives `validated`, `invalid`,
+`finalized` and every resume. It is written to a temp file and
 moved with `os.replace`. Every transition appends one line to `state.log`. `launched` is
 recorded with the pid as soon as the process starts, so a running attempt is always `launched`
 with a live pid.
@@ -503,7 +532,12 @@ exit 2 and prints the `helios attach` and `helios stop` commands. Recovery and a
 happen only under the lock. The lock dies with its process, so it never goes stale.
 
 `n` is one more than the highest existing `attempt-<n>` directory. The directory is created with
-an exclusive `mkdir`; if it already exists (a concurrent run took `n`), helios tries `n + 1`. Before launch helios checks the
+an exclusive `mkdir`; if it already exists (a concurrent run took `n`), helios tries `n + 1`.
+`state.json` is written right after the `mkdir`, but a process can die between the two. Every
+reader (preflight, recovery, `helios ps`) treats an attempt directory without `state.json` as
+state `allocated` with `pid` null, `session_id` null and `execution_status` null; reading it
+never raises. Preflight reads attempt state without the lock, so it must accept this case and
+leave the decision to recovery under the lock. Before launch helios checks the
 worktree report path; if a file is there (stale), it moves it to `attempt-<n>/stale-report.json`
 and adds a note. A report is accepted only from the current attempt's path or the native schema
 channel of the current process. The input hashes (sha256 of the prompt, the bead JSON, each doc
@@ -516,7 +550,10 @@ When `helios run` finds the latest attempt not finalized:
 - `pid` alive: refuse, and print the `helios attach` and `helios stop` commands.
 - state `native_completed`, `validated` or `invalid`: redo validation, checks and write-back
   (idempotent, §7.5), then finalize. No new attempt. A stored `execution_status` (§8.2) is
-  kept; only an attempt without one is classified again.
+  kept; only an attempt without one is classified again. Validation reads the captured
+  `attempt-<n>/report.json` (§6.2 step 5). A stored `completed` whose captured report is
+  missing or no longer validates keeps `completed` and fails with a helios check `report`
+  whose detail names the problem (exit 5), so the bead is not closed.
 - state `interrupted`, `timed_out`, `crashed` or `launch_failed` with no live process: write
   `envelope.json` with that state as the execution status, finalize, then allocate a new
   attempt.
