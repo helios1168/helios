@@ -151,8 +151,9 @@ Execution failure is never a scientific verdict. A crashed verifier does not ref
 File: `.agents/workflow.toml` at the project root, read with `tomllib`. The loader
 `helios.config.load(start: Path) -> Config` walks up from `start` to the first directory holding
 `.agents/workflow.toml`, else the first holding `.git`, else `start`; that directory is the
-hub. Without the file helios runs in ad hoc mode with the defaults below. Unknown keys are an
-error naming the key. `templates/workflow.toml` is the commented template.
+hub. Without the file helios runs in ad hoc mode with the defaults below. An unknown key, at any
+depth including `[harness.<name>]` and `[tolerance.<tier>]`, and a value of the wrong type are
+errors naming the dotted key. `templates/workflow.toml` is the commented template.
 
 | key | default | meaning |
 | --- | --- | --- |
@@ -173,6 +174,7 @@ error naming the key. `templates/workflow.toml` is the commented template.
 | `agents.model` | `"claude"` | agent spec for `model` |
 | `agents.verify_code` | `"other"` | agent spec for `verify-code` |
 | `agents.verify_math` | `"other"` | agent spec for `verify-math` |
+| `agents.verify_validate` | `"other"` | agent spec for `verify-validate` |
 | `agents.verify_order` | `["claude", "codex", "opencode", "agy"]` | how `other` is resolved |
 | `harness.<name>.binary` | the harness name | executable |
 | `harness.<name>.model` | none | passed to the CLI |
@@ -190,8 +192,9 @@ error naming the key. `templates/workflow.toml` is the commented template.
 | `tolerance.<tier>` | none | named numeric tolerances for skills and claims |
 
 Agent spec syntax: `harness` or `harness:profile`, or `other`. `other` resolves to the first
-harness in `agents.verify_order` that differs from the author of the bead the verifier checks
-(the `author` metadata of the parent bead). The resolved harness is recorded on the bead.
+harness in `agents.verify_order` that differs from the author's harness. The author is the
+`author` metadata of the parent bead, an agent spec; its harness is the part before any `:`, so
+author `claude:opus` excludes `claude`. The resolved harness is recorded on the bead.
 
 ## 6. Harness adapters
 
@@ -265,10 +268,16 @@ report `needs_input` naming it.
    module that calls `bd`). Metadata values may arrive JSON-encoded as strings; decode them.
 2. Preflight (`helios.preflight`), all failures exit 2 before anything is created:
    - `impl` and `validate` need `files` and `test`; verify kinds need `unit` and `parent`.
-   - every name in `memories` and every path in `docs` exists;
-   - `verify-math` needs a substantive `## Model`: at least 200 characters that are not
-     headings, blank lines or the `_empty_` placeholder;
-   - beads launched together have disjoint `files` (glob overlap counts);
+   - every name in `memories` exists (preflight takes the memory lookup as a required argument);
+     every path in `docs` exists, and every `path#key` resolves to a section (§7.2);
+   - `verify-math` needs a substantive `## Model`: the lines that are not headings, blank
+     (whitespace only) or the `_empty_` placeholder, each stripped of surrounding whitespace,
+     total at least 200 characters; line breaks do not count;
+   - beads launched together have disjoint `files`. Two entries overlap when either matches the
+     other read as a literal path, or when neither is a literal path and the literal prefix of
+     one starts with the literal prefix of the other. The literal prefix of a glob is its text
+     before the first `*`, `?` or `[`; of a directory entry, the entry itself. The rule
+     over-approximates on purpose: a false overlap only means the beads run separately;
    - the latest attempt of the bead is finalized, unless recovery (§8.4) applies.
 3. Resolve the harness (§5). `--harness` overrides.
 4. Prepare the worktree (§7.3).
@@ -301,13 +310,18 @@ heading:
 1. `Role`: the skill for the bead kind, `skills/<kind>/SKILL.md` without front matter.
 2. `Contract`: the `## Worker contract` section of the repository's `AGENTS.md`, verbatim.
 3. `Bead`: JSON of id, title, description, kind, unit, accept, files, test.
-4. `Docs`: each `docs` entry. `path#heading` extracts that heading's section, including its
-   subsections.
+4. `Docs`: each `docs` entry. A bare `path` includes the whole file. `path#key` includes one
+   section: the first heading, of any level, whose text equals `key` or whose first
+   whitespace-separated word equals `key` (so `#5.` selects `## 5. Configuration` and `#9.3`
+   selects `### 9.3 Events`). The section runs from that heading up to the next heading of the
+   same or a higher level, so it includes its subsections. Lines inside fenced code blocks
+   (opened by ```` ``` ```` or `~~~`) are never headings. A key with no match is a preflight
+   error.
 5. `Memories`: each key's value from the memory backend (§13).
 6. `Attempt`: worktree path, branch, attempt id, report path, and the report schema JSON.
 
-Sections 4 and 5 together are capped at `memory.inject_cap_bytes`; truncation appends a line
-naming what was cut. The prompt never names the harness, so the bytes are identical across
+Sections 4 and 5 together are capped at `memory.inject_cap_bytes` UTF-8 bytes, never splitting a
+character; truncation appends a line naming what was cut, and that line counts within the cap. The prompt never names the harness, so the bytes are identical across
 harnesses; a test asserts this.
 
 ### 7.3 Worktree
@@ -322,9 +336,13 @@ harnesses; a test asserts this.
 
 ### 7.4 Ownership
 
-Changed paths are `git diff --name-only <base_commit>` plus untracked files. Each path must
-match a `files` glob (a directory entry covers everything below it) or start with a prefix in
-`project.always_allowed`. Verify kinds may touch only `<verify_artifacts>/<unit>/`. Always
+Changed paths are `git diff --name-only --no-renames -z <base_commit>` plus
+`git ls-files --others --exclude-standard -z`. `--no-renames` lists both sides of a rename, so a
+deleted path is checked too; `-z` keeps non-ASCII paths unquoted. Each path must match a `files`
+entry or start with a prefix in `project.always_allowed`. A `files` entry ending in `/` covers
+everything below that directory. Any other entry is a glob matched against the whole path: `*`
+and `?` never match `/`, `**` matches any number of path segments, `[...]` is a character class.
+So `src/*.py` owns `src/a.py` but not `src/sub/a.py`. Verify kinds may touch only `<verify_artifacts>/<unit>/`. Always
 rejected, whatever the globs say: `.beads/`, `.helios/`, `.agents/`, the memory export
 directory, and anything matching `project.confidential`. A failed ownership check commits
 nothing and lists the paths in the check detail.
@@ -376,7 +394,10 @@ When `helios run` finds the latest attempt not finalized:
 - `pid` alive: refuse, and print the `helios attach` and `helios stop` commands.
 - state `native_completed`, `validated` or `invalid`: redo validation, checks and write-back
   (idempotent, §7.5), then finalize. No new attempt.
-- any earlier state with no live process: record `crashed`, finalize, allocate a new attempt.
+- state `interrupted`, `timed_out`, `crashed` or `launch_failed` with no live process: finalize
+  with that state as the execution status, then allocate a new attempt.
+- state `allocated` or `launched` with no live process: record `crashed`, finalize, allocate a
+  new attempt.
 
 ### 8.5 Stale evidence
 
@@ -410,8 +431,9 @@ the window runs the attach command and the attempt runs headless. Users attach w
 
 ### 9.3 Events
 
-`<hub>/.helios/events.jsonl`, one JSON object per line, appended with a single `write` under
-4 KB: `{"ts", "source", "type", "bead", "attempt", "session", "detail"}`. Types: `launched`,
+`<hub>/.helios/events.jsonl`, one JSON object per line, appended with a single `write`:
+`{"ts", "source", "type", "bead", "attempt", "session", "detail"}`. The line, newline included,
+is at most 4096 bytes: helios shortens `detail` first, and raises when the line is still too long. Types: `launched`,
 `completed`, `needs_input`, `needs_review`, `failed`, `finalized`, `steer`, `answer`, `idle`,
 `error`. Sources: `helios`, `opencode-plugin`, `orchestrator`. The orchestrator watches this
 file.

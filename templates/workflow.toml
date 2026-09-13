@@ -21,6 +21,7 @@ implement = "codex"
 model = "claude"
 verify_code = "other"
 verify_math = "other"
+verify_validate = "other"
 verify_order = ["claude", "codex", "opencode", "agy"]
 
 [harness.claude]
