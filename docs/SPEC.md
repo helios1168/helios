@@ -269,10 +269,12 @@ report `needs_input` naming it.
 2. Preflight (`helios.preflight`), all failures exit 2 before anything is created:
    - `impl` and `validate` need `files` and `test`; verify kinds need `unit` and `parent`.
    - every name in `memories` exists (preflight takes the memory lookup as a required argument);
-     every path in `docs` exists, and every `path#key` resolves to a section (§7.2);
-   - `verify-math` needs a substantive `## Model`: the lines that are not headings, blank
-     (whitespace only) or the `_empty_` placeholder, each stripped of surrounding whitespace,
-     total at least 200 characters; line breaks do not count;
+     every path in `docs` is an existing file (a directory is an error), and every `path#key`
+     resolves to a section (§7.2);
+   - `verify-math` needs a substantive `## Model`: the lines that are not headings in the §7.2
+     sense, not blank (whitespace only) and not the `_empty_` placeholder, each stripped of
+     surrounding whitespace, total at least 200 characters; line breaks do not count. A line
+     inside a code fence, or `#text` without a space, is counted like any other line;
    - beads launched together have disjoint `files`. Two entries overlap when either matches the
      other read as a literal path, or when neither is a literal path and the literal prefix of
      one starts with the literal prefix of the other. The literal prefix of a glob is its text
@@ -314,15 +316,22 @@ heading:
    section: the first heading, of any level, whose text equals `key` or whose first
    whitespace-separated word equals `key` (so `#5.` selects `## 5. Configuration` and `#9.3`
    selects `### 9.3 Events`). The section runs from that heading up to the next heading of the
-   same or a higher level, so it includes its subsections. Lines inside fenced code blocks
-   (opened by ```` ``` ```` or `~~~`) are never headings. A key with no match is a preflight
-   error.
+   same or a higher level, so it includes its subsections. A heading is a line outside code
+   fences that starts with 1 to 6 `#` followed by a space or the end of the line; its level is
+   the number of `#`. A fence opens with a line starting (after up to three spaces) with three
+   or more backticks or tildes, and closes with a line of the same character at least as long
+   as the opener; an unclosed fence runs to the end of the file. A key with no match is a
+   preflight error.
 5. `Memories`: each key's value from the memory backend (§13).
 6. `Attempt`: worktree path, branch, attempt id, report path, and the report schema JSON.
 
-Sections 4 and 5 together are capped at `memory.inject_cap_bytes` UTF-8 bytes, never splitting a
-character; truncation appends a line naming what was cut, and that line counts within the cap. The prompt never names the harness, so the bytes are identical across
-harnesses; a test asserts this.
+Sections 4 and 5 together are capped at `memory.inject_cap_bytes` UTF-8 bytes. The docs entries
+followed by the memory values form one ordered list of items, each kept whole or cut whole.
+helios keeps the longest prefix of that list whose bytes, plus the note line naming the cut items
+when any are cut, fit within the cap. It tries prefix lengths from longest to shortest and takes
+the first that fits, so the computation always ends. When even the empty prefix does not fit,
+the note is shortened at a character boundary to the cap. The prompt never names the harness,
+so the bytes are identical across harnesses; a test asserts this.
 
 ### 7.3 Worktree
 
@@ -338,19 +347,28 @@ harnesses; a test asserts this.
 
 Changed paths are `git diff --name-only --no-renames -z <base_commit>` plus
 `git ls-files --others --exclude-standard -z`. `--no-renames` lists both sides of a rename, so a
-deleted path is checked too; `-z` keeps non-ASCII paths unquoted. Each path must match a `files`
-entry or start with a prefix in `project.always_allowed`. A `files` entry ending in `/` covers
-everything below that directory. Any other entry is a glob matched against the whole path: `*`
-and `?` never match `/`, `**` matches any number of path segments, `[...]` is a character class.
-So `src/*.py` owns `src/a.py` but not `src/sub/a.py`. Verify kinds may touch only `<verify_artifacts>/<unit>/`. Always
-rejected, whatever the globs say: `.beads/`, `.helios/`, `.agents/`, the memory export
-directory, and anything matching `project.confidential`. A failed ownership check commits
-nothing and lists the paths in the check detail.
+deleted path is checked too; `-z` keeps non-ASCII paths unquoted. An untracked symlink whose
+path matches a `project.link_into_worktrees` glob (§7.3) is not a change.
+
+Each path must match a `files` entry or start with a prefix in `project.always_allowed`. A
+`files` entry ending in `/` covers everything below that directory. Any other entry is a glob
+matched against the whole path: `*` and `?` never match `/`, `**` matches any number of path
+segments, `[...]` is a character class that never matches `/` and is negated by a leading `!`.
+So `src/*.py` owns `src/a.py` but not `src/sub/a.py`. Verify kinds may touch only
+`<verify_artifacts>/<unit>/`.
+
+Always rejected, whatever the globs say: `.beads/`, `.helios/`, `.agents/`, the memory export
+directory, and anything matching `project.confidential`. Confidential globs follow the same
+rules, except that a glob without `/` matches the last path segment at any depth, so `*.pem`
+matches `keys/a.pem`. A failed ownership check commits nothing and lists the paths in the check
+detail.
 
 ### 7.5 Write-back
 
 Every write carries the marker `[<attempt_id>]` (or `[<attempt_id>#k]` per line) and is skipped
 when a comment with that kind and marker already exists, so a crashed write-back can be replayed.
+A comment has that kind and marker when its text starts with `<kind>: <marker>`; a marker quoted
+later in the text does not count.
 
 - metadata: `harness`, `session` (`<harness>:<session_id>`), `worktree`, `attempt`,
   `execution_status`, `verdict` (verify kinds), `output_commit`.
@@ -381,7 +399,8 @@ moved with `os.replace`. Every transition appends one line to `state.log`.
 
 ### 8.3 Allocation
 
-`n` is one more than the highest existing attempt directory. Before launch helios checks the
+`n` is one more than the highest existing `attempt-<n>` directory. The directory is created with
+an exclusive `mkdir`; if it already exists (a concurrent run took `n`), helios tries `n + 1`. Before launch helios checks the
 worktree report path; if a file is there (stale), it moves it to `attempt-<n>/stale-report.json`
 and adds a note. A report is accepted only from the current attempt's path or the native schema
 channel of the current process. The input hashes (sha256 of the prompt, the bead JSON, each doc
