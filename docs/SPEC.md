@@ -216,46 +216,100 @@ processes. `helios.harness.get(name) -> Harness` returns the adapter.
 ### 6.3 Per harness
 
 Flags and shapes below were checked against live runs on 2026-09-13; the recorded output is in
-`tests/fixtures/native/<harness>/` (`fresh`, `resume`, `error`; see its README). An adapter
-must parse the fixtures; it must not invent output shapes. If a needed fixture is missing,
-report `needs_input` naming it.
+`tests/fixtures/native/<harness>/` (see its README for what each file is). An adapter must parse
+the fixtures; it must not invent output shapes. If a needed fixture is missing, report
+`needs_input` naming it.
 
-- **claude** (Claude Code): fresh turn `claude -p --output-format json --json-schema <schema
-  JSON text> --permission-mode bypassPermissions [--model M] [--effort E] <prompt>`; resume adds
-  `--resume <session_id>` and keeps the same `session_id`. stdout is one JSON object:
-  `session_id`, `is_error`, `subtype`, `terminal_reason`, `structured_output` (the schema
-  result, absent on error), `result` (text). A native error is `is_error: true`, with
-  `api_error_status` when the API refused, and exit code 1. Never pass `--bare`. Attach:
-  `claude --resume <session_id>` with cwd the worktree.
+Each form lists the argv elements in order. A bracketed part appears only when its `LaunchSpec`
+field is set (not None and not empty): `M` is `spec.model`, `E` is `spec.effort`, `<session_id>`
+is `spec.resume_session`. `<prompt>` is `spec.prompt`. Paths are `str()` of the `LaunchSpec` path,
+never resolved. `[extra_args]` is `spec.extra_args`, one element each.
+
+- **claude** (Claude Code): `claude -p --output-format json --json-schema <schema text>
+  --permission-mode bypassPermissions [--model M] [--effort E] [--resume <session_id>]
+  [extra_args] <prompt>`, where `<schema text>` is `spec.report_schema_path.read_text()`
+  unchanged. A resume keeps the same `session_id`. stdout is one JSON object: `session_id`,
+  `is_error`, `subtype`, `terminal_reason`, `structured_output` (the schema result, absent on
+  error), `result` (text). A native error is `is_error: true`, with a non-null
+  `api_error_status` when the API refused, and exit code 1. `subtype` stays `success` on error,
+  so never use it. Never pass `--bare`. Attach: `claude --resume <session_id>`.
 - **codex** (Codex CLI): fresh `codex exec --json --output-schema <schema path> -o
   <raw_dir>/last-message.json -C <worktree> --skip-git-repo-check
-  --dangerously-bypass-approvals-and-sandbox [-m M] [-c model_reasoning_effort="E"] -` with the
-  prompt on stdin; resume `codex exec resume <session_id> --json --output-schema ... -o ... -`.
-  stdout is JSON lines: `thread.started` with `thread_id` (the session id, unchanged on
-  resume), `turn.started`, `item.completed`, then `turn.completed` or, on failure, `error` and
-  `turn.failed` with exit code 1. The structured result is the JSON in the `-o` file, which is
-  not written when the turn fails. Never `--last`. Attach: `codex resume <session_id>`.
-- **opencode**: fresh `opencode run --format json --dir <worktree> --title <bead>#<attempt>
-  [-m M] [--variant E] [--attach <server_url>] --auto <prompt>`; resume adds `-s <session_id>`
-  and keeps the id. stdout is JSON lines, each with `type`, `timestamp`, `sessionID` and `part`;
-  types seen: `step_start`, `text`, `tool_use` (`part.tool`, `part.state`), `step_finish`
-  (`part.reason`, `part.tokens`), and `error` (`error.name`, `error.data.message`) with exit
-  code 1. No schema channel: the report file is the only source. Attach:
-  `opencode attach <server_url> --dir <worktree> -s <session_id>` when a server is set, else
-  `opencode <worktree> -s <session_id>`. Stop with a server:
+  --dangerously-bypass-approvals-and-sandbox [-m M] [-c model_reasoning_effort="E"]
+  [extra_args] -`. Resume `codex exec resume <session_id> --json --output-schema <schema path>
+  -o <raw_dir>/last-message.json --skip-git-repo-check
+  --dangerously-bypass-approvals-and-sandbox [-m M] [-c model_reasoning_effort="E"]
+  [extra_args] -`; `exec resume` has no `-C`, and helios launches with cwd the worktree. The
+  effort is two elements, `-c` and `model_reasoning_effort="E"` with literal double quotes.
+  The prompt goes on stdin: `stdin_text` returns `spec.prompt` for codex and None for every
+  other harness. stdout is JSON lines in no fixed order, parsed by `type`: `thread.started` with
+  `thread_id` (the session id, unchanged on resume), `turn.started`, `item.completed` (an
+  `item.type` of `error` is a warning, not a failure), then `turn.completed` or, on failure,
+  `error` (`message`) and `turn.failed` (`error.message`) with exit code 1. The structured
+  result is the JSON in the `-o` file, which is not written when the turn fails. Never
+  `--last`. Attach: `codex resume <session_id>`.
+- **opencode**: `opencode run --format json --dir <worktree> --title <bead>#<attempt> [-m M]
+  [--variant E] [--attach <server_url>] [-s <session_id>] --auto [extra_args] <prompt>`, with
+  `<server_url>` from `spec.server_url`. The title is the same on a resume, and a resume keeps
+  the id. stdout is JSON lines, each with `type`, `timestamp` and `sessionID`; every type except
+  `error` also carries `part`. Types seen: `step_start`, `text`, `tool_use` (`part.tool`,
+  `part.state`), `step_finish` (`part.reason`, `part.tokens`), and `error` (`error.name`,
+  `error.data.message`) with exit code 1. A completed turn ends with `step_finish`. No schema
+  channel: the report file is the only source. Attach:
+  `opencode attach <server_url> --dir <worktree> -s <session_id>` when `spec.server_url` is set,
+  else `opencode <worktree> -s <session_id>`. Stop with a server:
   `POST <server_url>/session/<session_id>/abort`.
-- **agy** (Antigravity CLI): the prompt is the value of `-p`, so `-p` comes last: fresh
+- **agy** (Antigravity CLI): the prompt is the value of `-p`, so `-p` comes last:
   `agy --output-format json --json-schema <schema path> --dangerously-skip-permissions
-  [--model M] [--effort E] -p <prompt>` with cwd the worktree; resume adds
-  `--conversation <session_id>` and keeps the id. stdout is one JSON object:
-  `conversation_id` (the session id), `status` (`SUCCESS` or `ERROR`), `structured_output`,
-  `response`, `error` (on failure, with exit code 1), `num_turns`, `usage`. Attach:
-  `agy --conversation <session_id>`.
+  [--model M] [--effort E] [--conversation <session_id>] [extra_args] -p <prompt>`, with cwd
+  the worktree; a resume keeps the id. stdout is one JSON object: `conversation_id` (the
+  session id, an empty string on some errors), `status` (`SUCCESS` or `ERROR`),
+  `structured_output`, `response`, `error` (text on failure, with exit code 1), `num_turns`,
+  `usage`; other fields are ignored. Attach: `agy --conversation <session_id>`.
 - **fake**: `python -m helios.harness.fake` driven by the JSON file in env
   `HELIOS_FAKE_SCRIPT`: `{"exit_code": 0, "sleep_s": 0, "stdout": "...", "session_id": "s1",
   "report": {...} | null, "report_text": "..." | null, "ignore_sigint": false}`. It writes
   `report` (or raw `report_text`) to `HELIOS_REPORT`, prints `stdout`, sleeps, exits. Tests use
   it for every failure path.
+
+### 6.4 Rules for the real adapters
+
+These apply to claude, codex, opencode and agy.
+
+- `argv` and `attach_command` return `list[str]`; `stdin_text` returns `str | None`. They do no
+  I/O, except that the claude `argv` reads the schema file. Element 0 of both lists is the
+  harness name; `helios run` and `helios attach` replace it with `harness.<name>.binary` when
+  that is configured. `attach_command` adds no model, effort or permission flags and sets no
+  cwd, because `helios attach` runs it in the worktree. Model and effort are passed verbatim
+  and never validated.
+- `parse(spec, exit_code, stdout_path)` never raises and never reads stderr. Input handling:
+  - A missing `stdout_path` gives session_id None and native_error `no stdout`.
+  - claude and agy: `json.loads` of the stripped text. A decode failure or a value that is not
+    an object gives native_error `invalid JSON`.
+  - codex and opencode: every line is stripped. Blank lines and lines that are not JSON objects
+    are skipped, with one note `skipped <N> non-JSON lines` when N is not 0. No JSON object at
+    all gives native_error `no events`.
+- session_id is the first non-empty value of: claude `session_id`; codex `thread_id` of the
+  first `thread.started`; opencode the top-level `sessionID` of the first line that has one;
+  agy `conversation_id`. An empty string counts as None. session_id is returned even when
+  native_error is set.
+- When the input rules above set no native_error, it is set when `exit_code` is an int other
+  than 0, or when the output signals failure: claude `is_error` true; codex any `turn.failed`,
+  or no `turn.completed`; opencode any `error` event, or a last event that is not
+  `step_finish`; agy a `status` other than `SUCCESS`. `exit_code` None is not an error by
+  itself. The text is a non-empty string, the first that applies: claude `result`; codex
+  `error.message` of the last `turn.failed`, else `message` of the last `error` event; opencode
+  `error.data.message` of the first `error` event, else its `error.name`; agy `error`; else
+  `exit code <N>` when the exit code is not 0, else `turn did not complete`.
+- structured is None whenever native_error is set, and always None for opencode. Otherwise it
+  is claude or agy `structured_output`, or for codex the JSON in `<raw_dir>/last-message.json`.
+  Only a JSON object counts. A missing key or file gives None and the note
+  `no structured result`; invalid JSON or a value that is not an object gives None and the note
+  `structured result is not a JSON object`. Never fall back to claude `result` or agy
+  `response`.
+- notes is empty unless a rule above adds one.
+- `helios.harness.get(name)` returns the adapter for `claude`, `codex`, `opencode`, `agy` and
+  `fake`, and raises ValueError naming any other name.
 
 ## 7. `helios run`
 

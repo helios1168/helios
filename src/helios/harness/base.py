@@ -68,8 +68,9 @@ class Harness(Protocol):
     def parse(self, spec: LaunchSpec, exit_code: int | None, stdout_path: Path) -> NativeResult:
         """Read captured stdout (and raw_dir side files) after the process ends.
 
-        Must not raise on malformed output: return session_id None, structured None and a
-        native_error describing what was wrong. helios.run turns that into an execution status.
+        Must not raise on malformed output: return structured None and a native_error
+        describing what was wrong, keeping any session id already found (SPEC 6.4). helios.run
+        turns that into an execution status.
         """
         ...
 

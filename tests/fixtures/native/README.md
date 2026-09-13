@@ -25,5 +25,5 @@ pong", resume "Now return status blocked and summary second turn", error a nonex
 | agy | `error.stdout` | `status: ERROR`, empty `conversation_id`, `error` text | 1 |
 | opencode | `fresh.stdout` | JSON lines for a one-word reply: `step_start`, `text`, `step_finish` | 0 |
 | opencode | `tools.stdout` | a full bead turn with `tool_use` events (bash, read, edit, write) | 0 |
-| opencode | `resume.stdout` | a second turn on the same `sessionID` (run with `-s`) | 0 |
+| opencode | `resume.stdout` | a second turn on the `tools.stdout` session (run with `-s`); `fresh.stdout` is a separate session | 0 |
 | opencode | `error.stdout` | one `error` event, `error.name: UnknownError` | 1 |
