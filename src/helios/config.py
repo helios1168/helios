@@ -3,7 +3,8 @@
 The loader walks up from ``start`` to the first directory holding
 ``.agents/workflow.toml``, else the first holding ``.git``, else ``start``;
 that directory is the hub. Without the file helios runs in ad hoc mode with
-the defaults from the SPEC table. Unknown keys are an error naming the key.
+the defaults from the SPEC table. An unknown key at any depth, and a value
+of the wrong type, are errors naming the dotted key.
 """
 
 from __future__ import annotations
@@ -11,12 +12,65 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 WORKFLOW_REL = Path(".agents/workflow.toml")
 
 _VERIFY_KINDS = ("verify-code", "verify-math", "verify-validate")
 
-_HARNESS_SUBKEYS = {"binary", "model", "effort", "timeout_s", "extra_args", "server_url"}
+_STR = "str"
+_OPT_STR = "opt_str"
+_STR_LIST = "str_list"
+_INT = "int"
+
+_PROJECT_TYPES: dict[str, str] = {
+    "test": _STR,
+    "typecheck": _STR,
+    "units": _STR,
+    "verify_artifacts": _STR,
+    "experiments": _STR,
+    "worktrees": _STR,
+    "runs": _STR,
+    "link_into_worktrees": _STR_LIST,
+    "confidential": _STR_LIST,
+    "always_allowed": _STR_LIST,
+    "program": _OPT_STR,
+    "claims": _OPT_STR,
+}
+
+_AGENTS_TYPES: dict[str, str] = {
+    "orchestrate": _STR,
+    "implement": _STR,
+    "model": _STR,
+    "verify_code": _STR,
+    "verify_math": _STR,
+    "verify_validate": _STR,
+    "verify_order": _STR_LIST,
+}
+
+_HARNESS_TYPES: dict[str, str] = {
+    "binary": _STR,
+    "model": _OPT_STR,
+    "effort": _OPT_STR,
+    "timeout_s": _INT,
+    "extra_args": _STR_LIST,
+    "server_url": _OPT_STR,
+}
+
+_CONTROL_TYPES: dict[str, str] = {
+    "default": _STR,
+    "until": _STR,
+    "stop_at": _STR_LIST,
+    "confirm": _STR_LIST,
+}
+
+_MEMORY_TYPES: dict[str, str] = {
+    "backend": _STR,
+    "export_dir": _STR,
+    "inject_cap_bytes": _INT,
+}
+
+_SECTIONS = {"project", "agents", "harness", "control", "memory", "tolerance"}
 
 
 @dataclass(frozen=True)
@@ -42,6 +96,7 @@ class AgentsConfig:
     model: str = "claude"
     verify_code: str = "other"
     verify_math: str = "other"
+    verify_validate: str = "other"
     verify_order: tuple[str, ...] = ("claude", "codex", "opencode", "agy")
 
 
@@ -99,24 +154,34 @@ def find_hub(start: Path) -> Path:
     return with_git if with_git is not None else start
 
 
-def _unknown(key: str) -> ValueError:
-    return ValueError(f"unknown config key {key!r}")
+def _check_type(dotted: str, value: Any, want: str) -> None:
+    """Raise TypeError naming the dotted key when the value has the wrong type."""
+    if want == _STR:
+        ok = isinstance(value, str)
+    elif want == _OPT_STR:
+        ok = value is None or isinstance(value, str)
+    elif want == _INT:
+        ok = isinstance(value, int) and not isinstance(value, bool)
+    elif want == _STR_LIST:
+        ok = isinstance(value, list) and all(isinstance(v, str) for v in value)
+    else:
+        raise AssertionError(f"unknown type tag {want!r}")
+    if not ok:
+        raise TypeError(f"config key {dotted!r} has the wrong type: {value!r}")
 
 
-def _check_keys(table: dict, known: set[str], prefix: str) -> None:
-    for key in table:
-        if key not in known:
-            raise _unknown(f"{prefix}.{key}" if prefix else key)
-
-
-_PROJECT_KEYS = {f.name for f in ProjectConfig.__dataclass_fields__.values()} | {"test"}
-_AGENTS_KEYS = set(AgentsConfig.__dataclass_fields__)
-_CONTROL_KEYS = set(ControlConfig.__dataclass_fields__)
-_MEMORY_KEYS = set(MemoryConfig.__dataclass_fields__)
+def _check_table(table: Any, types: dict[str, str], prefix: str) -> None:
+    if not isinstance(table, dict):
+        raise TypeError(f"config key {prefix!r} must be a table")
+    for key, value in table.items():
+        dotted = f"{prefix}.{key}"
+        if key not in types:
+            raise ValueError(f"unknown config key {dotted!r}")
+        _check_type(dotted, value, types[key])
 
 
 def _project(table: dict) -> ProjectConfig:
-    _check_keys(table, _PROJECT_KEYS, "project")
+    _check_table(table, _PROJECT_TYPES, "project")
     data = dict(table)
     for key in ("link_into_worktrees", "confidential", "always_allowed"):
         if key in data:
@@ -125,7 +190,7 @@ def _project(table: dict) -> ProjectConfig:
 
 
 def _agents(table: dict) -> AgentsConfig:
-    _check_keys(table, _AGENTS_KEYS, "agents")
+    _check_table(table, _AGENTS_TYPES, "agents")
     data = dict(table)
     if "verify_order" in data:
         data["verify_order"] = tuple(data["verify_order"])
@@ -133,17 +198,28 @@ def _agents(table: dict) -> AgentsConfig:
 
 
 def _harness(table: dict) -> dict[str, HarnessConfig]:
+    if not isinstance(table, dict):
+        raise TypeError("config key 'harness' must be a table")
     out: dict[str, HarnessConfig] = {}
     for name, sub in table.items():
         if not isinstance(sub, dict):
-            raise _unknown(f"harness.{name}")
-        for key in sub:
-            if key not in _HARNESS_SUBKEYS:
-                raise _unknown(f"harness.{name}.{key}")
+            raise TypeError(f"config key 'harness.{name}' must be a table")
+        _check_table(sub, _HARNESS_TYPES, f"harness.{name}")
         data = dict(sub)
         if "extra_args" in data:
             data["extra_args"] = tuple(data["extra_args"])
         out[name] = HarnessConfig(**data)
+    return out
+
+
+def _tolerance(table: Any) -> dict[str, float]:
+    if not isinstance(table, dict):
+        raise TypeError("config key 'tolerance' must be a table")
+    out: dict[str, float] = {}
+    for tier, value in table.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"config key 'tolerance.{tier}' must be a number: {value!r}")
+        out[tier] = float(value)
     return out
 
 
@@ -156,36 +232,26 @@ def load(start: Path) -> Config:
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
     for key in raw:
-        if key not in {"project", "agents", "harness", "control", "memory", "tolerance"}:
-            raise _unknown(key)
-    tolerance: dict[str, float] = {}
-    if "tolerance" in raw:
-        if not isinstance(raw["tolerance"], dict):
-            raise ValueError("tolerance must be a table")
-        tolerance = {k: float(v) for k, v in raw["tolerance"].items()}
+        if key not in _SECTIONS:
+            raise ValueError(f"unknown config key {key!r}")
     project = _project(raw.get("project", {}))
     agents = _agents(raw.get("agents", {}))
-    control_raw = _checked(raw, "control")
+    control_raw = dict(raw.get("control", {}))
+    _check_table(control_raw, _CONTROL_TYPES, "control")
     for key in ("stop_at", "confirm"):
         if key in control_raw:
             control_raw[key] = tuple(control_raw[key])
-    memory = MemoryConfig(**_checked(raw, "memory"))
+    memory_raw = dict(raw.get("memory", {}))
+    _check_table(memory_raw, _MEMORY_TYPES, "memory")
     return Config(
         hub=hub,
         project=project,
         agents=agents,
         harness=_harness(raw.get("harness", {})),
         control=ControlConfig(**control_raw),
-        memory=memory,
-        tolerance=tolerance,
+        memory=MemoryConfig(**memory_raw),
+        tolerance=_tolerance(raw.get("tolerance", {})),
     )
-
-
-def _checked(raw: dict, section: str) -> dict:
-    table = raw.get(section, {})
-    known = _CONTROL_KEYS if section == "control" else _MEMORY_KEYS
-    _check_keys(table, known, section)
-    return table
 
 
 def split_spec(spec: str) -> tuple[str, str | None]:
@@ -196,17 +262,25 @@ def split_spec(spec: str) -> tuple[str, str | None]:
     return (harness, profile if sep else None)
 
 
+def author_harness(author: str | None) -> str | None:
+    """The harness part of an author agent spec, before any ``:`` (SPEC §5)."""
+    if author is None:
+        return None
+    return author.partition(":")[0]
+
+
 def resolve_harness(spec: str, *, author: str | None, verify_order: tuple[str, ...]) -> str:
     """Resolve an agent spec to a harness name (SPEC §5).
 
     ``other`` is the first harness in ``verify_order`` that differs from the
-    author of the bead the verifier checks. A plain spec resolves to itself.
+    author's harness. A plain spec resolves to itself.
     """
     harness, _profile = split_spec(spec)
     if harness != "other":
         return harness
+    excluded = author_harness(author)
     for candidate in verify_order:
-        if candidate != author:
+        if candidate != excluded:
             return candidate
     raise ValueError("verify_order has no harness differing from the author")
 
@@ -223,7 +297,7 @@ def spec_for_kind(config: Config, kind: str) -> str:
     if kind == "verify-math":
         return agents.verify_math
     if kind == "verify-validate":
-        return agents.verify_code
+        return agents.verify_validate
     raise ValueError(f"unknown bead kind {kind!r}")
 
 

@@ -4,24 +4,32 @@ All failures exit 2 before anything is created:
 
 - ``impl`` and ``validate`` need ``files`` and ``test``; verify kinds need
   ``unit`` and ``parent``.
-- every name in ``memories`` and every path in ``docs`` exists.
-- ``verify-math`` needs a substantive ``## Model``: at least 200 characters
-  that are not headings, blank lines or the ``_empty_`` placeholder.
-- beads launched together have disjoint ``files`` (glob overlap counts).
+- every name in ``memories`` exists (the memory lookup is a required
+  argument); every path in ``docs`` exists, and every ``path#key`` resolves
+  to a section (SPEC §7.2).
+- ``verify-math`` needs a substantive ``## Model``: the stripped lines that
+  are not headings, blank or the ``_empty_`` placeholder total at least 200
+  characters; line breaks do not count.
+- beads launched together have disjoint ``files``. Two entries overlap when
+  either matches the other read as a literal path, or when neither is a
+  literal path and the literal prefix of one starts with the literal prefix
+  of the other. The literal prefix of a glob is its text before the first
+  ``*``, ``?`` or ``[``; of a directory entry, the entry itself. The rule
+  over-approximates on purpose.
 - the latest attempt of the bead is finalized, unless recovery (SPEC §8.4)
   applies.
 """
 
 from __future__ import annotations
 
-import fnmatch
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from helios import attempt as attempt_mod
 from helios.beads import Bead
-from helios.prompt import section
+from helios.ownership import glob_match
+from helios.prompt import find_section
 
 MODEL_MIN_CHARS = 200
 
@@ -37,9 +45,9 @@ class PreflightError(RuntimeError):
 @dataclass(frozen=True)
 class PreflightContext:
     hub: Path
+    memory_has: Callable[[str], bool]
     runs_rel: str = ".helios/runs"
     units_dir: str = "docs/units"
-    memory_has: Callable[[str], bool] = lambda key: True
 
 
 def check(beads: list[Bead], ctx: PreflightContext) -> list[str]:
@@ -74,13 +82,24 @@ def _check_bead(bead: Bead, ctx: PreflightContext) -> list[str]:
         if not ctx.memory_has(key):
             errors.append(f"{bead.id}: memory {key!r} does not exist")
     for entry in bead.docs:
-        path_text, _, _ = entry.partition("#")
-        if not (ctx.hub / path_text).exists():
-            errors.append(f"{bead.id}: docs path {path_text!r} does not exist")
+        errors.extend(_check_doc(bead.id, entry, ctx))
     if bead.kind == "verify-math" and bead.unit:
         errors.extend(_check_model(bead, ctx))
     errors.extend(_check_attempt_finalized(bead, ctx))
     return errors
+
+
+def _check_doc(bead_id: str, entry: str, ctx: PreflightContext) -> list[str]:
+    path_text, sep, key = entry.partition("#")
+    path = ctx.hub / path_text
+    if not path.exists():
+        return [f"{bead_id}: docs path {path_text!r} does not exist"]
+    if sep:
+        try:
+            find_section(path.read_text(), key)
+        except KeyError:
+            return [f"{bead_id}: docs key {key!r} does not resolve in {path_text!r}"]
+    return []
 
 
 def _check_model(bead: Bead, ctx: PreflightContext) -> list[str]:
@@ -89,15 +108,15 @@ def _check_model(bead: Bead, ctx: PreflightContext) -> list[str]:
     if not path.is_file():
         return [f"{bead.id}: unit file {path} does not exist"]
     try:
-        model = section(path.read_text(), "## Model")
+        model = find_section(path.read_text(), "Model")
     except KeyError:
         return [f"{bead.id}: unit file has no ## Model section"]
-    substance = "\n".join(
-        line
-        for line in (l.strip() for l in model.splitlines())
-        if line and not line.startswith("#") and line != "_empty_"
+    substance = sum(
+        len(line.strip())
+        for line in model.splitlines()
+        if (stripped := line.strip()) and not stripped.startswith("#") and stripped != "_empty_"
     )
-    if len(substance) < MODEL_MIN_CHARS:
+    if substance < MODEL_MIN_CHARS:
         return [f"{bead.id}: ## Model is not substantive (needs 200 characters)"]
     return []
 
@@ -141,31 +160,37 @@ def _first_overlap(
     return None
 
 
+def _is_literal_path(entry: str) -> bool:
+    return not entry.endswith("/") and not any(ch in entry for ch in "*?[")
+
+
+def _literal_prefix(entry: str) -> str:
+    if entry.endswith("/"):
+        return entry
+    for i, char in enumerate(entry):
+        if char in "*?[":
+            return entry[:i]
+    return entry
+
+
+def _entry_matches_literal(entry: str, literal: str) -> bool:
+    if entry.endswith("/"):
+        base = entry.rstrip("/")
+        return literal == base or literal.startswith(entry)
+    if _is_literal_path(entry):
+        return literal == entry or literal.startswith(entry + "/")
+    return glob_match(literal, entry)
+
+
 def globs_overlap(left: str, right: str) -> bool:
     """True when two ``files`` entries can cover the same path (SPEC §7.1)."""
-    if left == right:
+    if _entry_matches_literal(left, right) or _entry_matches_literal(right, left):
         return True
-    for pattern, literal in ((left, right), (right, left)):
-        if _covers(pattern, literal):
-            return True
-    return False
-
-
-def _covers(pattern: str, other: str) -> bool:
-    if pattern.endswith("/"):
-        return other == pattern.rstrip("/") or other.startswith(pattern)
-    if not any(ch in pattern for ch in "*?["):
-        return other == pattern or other.startswith(pattern + "/")
-    if fnmatch.fnmatchcase(other, pattern):
-        return True
-    stem = pattern
-    while stem.endswith("/*"):
-        stem = stem[:-2]
-    if stem != pattern and (other == stem or other.startswith(stem + "/")):
-        return True
-    return not any(ch in other for ch in "*?[") and fnmatch.fnmatchcase(
-        pattern, other
-    )
+    if _is_literal_path(left) or _is_literal_path(right):
+        return False
+    return _literal_prefix(left).startswith(_literal_prefix(right)) or _literal_prefix(
+        right
+    ).startswith(_literal_prefix(left))
 
 
 def memory_map(memories: Mapping[str, str]) -> Callable[[str], bool]:

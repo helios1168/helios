@@ -35,7 +35,9 @@ FINAL_STATES = ("finalized",)
 
 RESUMABLE_STATES = ("native_completed", "validated", "invalid")
 
-RecoveryAction = Literal["refuse", "resume", "crash_and_new", "new"]
+FINALIZE_AND_NEW_STATES = ("interrupted", "timed_out", "crashed", "launch_failed")
+
+RecoveryAction = Literal["refuse", "resume", "finalize_and_new", "crash_and_new", "new"]
 
 
 def utc_now() -> str:
@@ -181,8 +183,11 @@ def classify_recovery(state: str | None, *, pid_alive: bool) -> RecoveryAction:
     - a live process: ``refuse`` (print the attach and stop commands).
     - ``native_completed``, ``validated`` or ``invalid``: ``resume`` the same
       attempt through validation, checks and write-back, then finalize.
-    - any earlier state with no live process: record ``crashed``, finalize and
-      allocate a new attempt (``crash_and_new``).
+    - ``interrupted``, ``timed_out``, ``crashed`` or ``launch_failed`` with no
+      live process: ``finalize_and_new`` (finalize with that state as the
+      execution status, then allocate a new attempt).
+    - ``allocated`` or ``launched`` with no live process: ``crash_and_new``
+      (record ``crashed``, finalize, allocate a new attempt).
     """
     if state is None or state == "finalized":
         return "new"
@@ -190,6 +195,8 @@ def classify_recovery(state: str | None, *, pid_alive: bool) -> RecoveryAction:
         return "refuse"
     if state in RESUMABLE_STATES:
         return "resume"
+    if state in FINALIZE_AND_NEW_STATES:
+        return "finalize_and_new"
     return "crash_and_new"
 
 

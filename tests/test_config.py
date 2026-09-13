@@ -43,6 +43,36 @@ def test_other_resolves_over_verify_order() -> None:
     order = ("claude", "codex", "opencode", "agy")
     assert cfg.resolve_harness("other", author="codex", verify_order=order) == "claude"
     assert cfg.resolve_harness("other", author="claude", verify_order=order) == "codex"
+    assert cfg.resolve_harness("other", author="claude:opus", verify_order=order) == "codex"
+    assert cfg.resolve_harness("other", author=None, verify_order=order) == "claude"
     assert cfg.resolve_harness("codex", author="claude", verify_order=order) == "codex"
     harness, profile = cfg.split_spec("opencode:ci")
     assert (harness, profile) == ("opencode", "ci")
+
+
+def write_workflow(tmp_path: Path, text: str) -> Path:
+    (tmp_path / ".agents").mkdir(exist_ok=True)
+    path = tmp_path / ".agents" / "workflow.toml"
+    path.write_text(text)
+    return tmp_path
+
+
+def test_wrong_typed_values_name_the_dotted_key(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match=r"tolerance\.a"):
+        cfg.load(write_workflow(tmp_path, "[tolerance]\na = 'x'\n"))
+    with pytest.raises(TypeError, match=r"project\.test"):
+        cfg.load(write_workflow(tmp_path, "[project]\ntest = 1\n"))
+    with pytest.raises(TypeError, match=r"memory\.inject_cap_bytes"):
+        cfg.load(write_workflow(tmp_path, "[memory]\ninject_cap_bytes = 'big'\n"))
+
+
+def test_unknown_nested_key_names_the_dotted_key(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"harness\.codex\.nope"):
+        cfg.load(write_workflow(tmp_path, "[harness.codex]\nnope = 1\n"))
+
+
+def test_verify_validate_has_its_own_spec(tmp_path: Path) -> None:
+    assert cfg.load(tmp_path).agents.verify_validate == "other"
+    loaded = cfg.load(write_workflow(tmp_path, "[agents]\nverify_validate = 'codex'\n"))
+    assert cfg.spec_for_kind(loaded, "verify-validate") == "codex"
+    assert cfg.harness_for_kind(loaded, "verify-validate", author="claude") == "codex"

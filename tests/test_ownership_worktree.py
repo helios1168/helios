@@ -65,6 +65,49 @@ def test_ownership_verify_kinds_are_scoped(tmp_path: Path) -> None:
     assert result.rejected == ("src/a.py",)
 
 
+def test_ownership_rename_checks_both_sides(tmp_path: Path) -> None:
+    hub = make_repo(tmp_path / "hub")
+    base = head(hub)
+    (hub / "tests").mkdir()
+    subprocess.run(["git", "mv", "README.md", "tests/README.md"], cwd=hub, check=True)
+    result = ownership.check(worktree=hub, base_commit=base, files=["tests/"])
+    assert "tests/README.md" in result.allowed
+    assert "README.md" in result.rejected
+
+
+def test_ownership_non_ascii_and_strict_star(tmp_path: Path) -> None:
+    hub = make_repo(tmp_path / "hub")
+    base = head(hub)
+    (hub / "täst.txt").write_text("u\n")
+    (hub / "src").mkdir()
+    (hub / "src" / "a.py").write_text("x\n")
+    (hub / "src" / "sub").mkdir()
+    (hub / "src" / "sub" / "x.py").write_text("x\n")
+    result = ownership.check(
+        worktree=hub, base_commit=base, files=["täst.txt", "src/*.py"]
+    )
+    assert "täst.txt" in result.allowed
+    assert "src/a.py" in result.allowed
+    assert "src/sub/x.py" in result.rejected
+
+
+def test_worktree_refuses_plain_directory(tmp_path: Path) -> None:
+    hub = make_repo(tmp_path / "hub")
+    plain = hub / ".claude" / "worktrees" / "b9"
+    plain.mkdir(parents=True)
+    (plain / "note.txt").write_text("not a worktree\n")
+    hub_branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=hub, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    with pytest.raises(worktree.WorktreeError, match="is not a worktree"):
+        worktree.prepare(hub=hub, bead="b9")
+    try:
+        worktree.prepare(hub=hub, bead="b9")
+    except worktree.WorktreeError as exc:
+        assert hub_branch in str(exc)
+
+
 def test_worktree_prepare_creates_reuses_and_refuses(tmp_path: Path) -> None:
     hub = make_repo(tmp_path / "hub")
     (hub / ".env").write_text("KEY=1\n")

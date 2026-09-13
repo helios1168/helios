@@ -9,6 +9,7 @@ its branch tip. ``link_into_worktrees`` glob matches are symlinked in.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,7 +60,13 @@ def prepare(
     path = hub / worktrees / bead
     branch = branch_name(bead)
     created = False
-    if path.is_dir():
+    if os.path.lexists(path):
+        if not path.is_dir() or _real(path) not in _registered(hub):
+            hub_branch = _git(hub, "rev-parse", "--abbrev-ref", "HEAD")
+            raise WorktreeError(
+                f"worktree path {path} exists and is not a worktree"
+                f" (hub is on branch {hub_branch!r})"
+            )
         actual = current_branch(path)
         if actual != branch:
             raise WorktreeError(
@@ -75,6 +82,20 @@ def prepare(
         created = True
     link_matches(hub, path, link_into_worktrees)
     return WorktreeInfo(path=path, branch=branch, base_commit=head_commit(path), created=created)
+
+
+def _real(path: Path) -> str:
+    return os.path.realpath(path)
+
+
+def _registered(hub: Path) -> set[str]:
+    """Real paths of the worktrees git knows about."""
+    out = _git(hub, "worktree", "list", "--porcelain")
+    paths = set()
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            paths.add(_real(Path(line[len("worktree ") :])))
+    return paths
 
 
 def link_matches(hub: Path, worktree: Path, patterns: tuple[str, ...]) -> list[Path]:

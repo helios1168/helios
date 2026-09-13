@@ -1,16 +1,21 @@
 """Ownership of changed paths (SPEC §7.4).
 
-Changed paths are the tracked changes since ``base_commit`` plus untracked
-files. Each path must match a ``files`` glob (a directory entry covers
-everything below it) or start with a prefix in ``project.always_allowed``.
-Verify kinds may touch only ``<verify_artifacts>/<unit>/``. Always rejected,
-whatever the globs say: ``.beads/``, ``.helios/``, ``.agents/``, the memory
-export directory, and anything matching ``project.confidential``.
+Changed paths are the tracked changes since ``base_commit`` (renames listed
+on both sides) plus untracked files, all NUL separated so non-ASCII paths
+stay unquoted. Each path must match a ``files`` entry or start with a prefix
+in ``project.always_allowed``. A ``files`` entry ending in ``/`` covers
+everything below that directory. Any other entry is a glob matched against
+the whole path: ``*`` and ``?`` never match ``/``, ``**`` matches any number
+of path segments, ``[...]`` is a character class. So ``src/*.py`` owns
+``src/a.py`` but not ``src/sub/a.py``. Verify kinds may touch only
+``<verify_artifacts>/<unit>/``. Always rejected, whatever the globs say:
+``.beads/``, ``.helios/``, ``.agents/``, the memory export directory, and
+anything matching ``project.confidential``.
 """
 
 from __future__ import annotations
 
-import fnmatch
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,42 +34,72 @@ class OwnershipResult:
         return not self.rejected
 
 
-def _run_git(worktree: Path, *args: str) -> str:
+def _run_git(worktree: Path, *args: str) -> bytes:
     proc = subprocess.run(
-        ["git", *args], cwd=worktree, capture_output=True, text=True, check=False
+        ["git", *args], cwd=worktree, capture_output=True, check=False
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+        raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.decode().strip()}")
     return proc.stdout
 
 
 def changed_paths(worktree: Path, base_commit: str) -> list[str]:
-    """Tracked changes since ``base_commit`` plus untracked files."""
-    tracked = _run_git(worktree, "diff", "--name-only", base_commit).splitlines()
-    untracked = _run_git(
-        worktree, "ls-files", "--others", "--exclude-standard"
-    ).splitlines()
-    return sorted({p for p in [*tracked, *untracked] if p})
+    """Tracked changes since ``base_commit`` plus untracked files (SPEC §7.4)."""
+    tracked = _run_git(worktree, "diff", "--name-only", "--no-renames", "-z", base_commit)
+    untracked = _run_git(worktree, "ls-files", "--others", "--exclude-standard", "-z")
+    paths = tracked.split(b"\0") + untracked.split(b"\0")
+    return sorted({p.decode("utf-8") for p in paths if p})
+
+
+def glob_to_regex(pattern: str) -> str:
+    """Translate a SPEC §7.4 glob to a regex string (``*`` never crosses ``/``)."""
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        char = pattern[i]
+        if char == "*":
+            if pattern[i + 1 : i + 2] == "*":
+                out.append("\x00")
+                i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif char == "?":
+            out.append("[^/]")
+            i += 1
+        elif char == "[":
+            close = pattern.find("]", i + 1)
+            if close == -1:
+                out.append("\\[")
+                i += 1
+            else:
+                out.append(pattern[i : close + 1])
+                i = close + 1
+        else:
+            out.append(re.escape(char))
+            i += 1
+    text = "".join(out)
+    text = text.replace("\x00/", "(?:.*/)?")
+    return text.replace("\x00", ".*")
+
+
+def glob_match(path: str, pattern: str) -> bool:
+    """Match a whole path against a SPEC §7.4 glob."""
+    return re.fullmatch(glob_to_regex(pattern), path) is not None
 
 
 def _is_prefix_match(path: str, prefix: str) -> bool:
     return path == prefix.rstrip("/") or path.startswith(prefix)
 
 
-def _glob_match(path: str, pattern: str) -> bool:
-    if pattern.endswith("/"):
-        return _is_prefix_match(path, pattern)
-    if not any(ch in pattern for ch in "*?["):
-        return path == pattern or path.startswith(pattern + "/")
-    if pattern.endswith("/*"):
-        stem = pattern[:-2]
-        if _is_prefix_match(path, stem + "/"):
-            return True
-    return fnmatch.fnmatchcase(path, pattern)
-
-
 def _matches_any(path: str, patterns: list[str] | tuple[str, ...]) -> bool:
-    return any(_glob_match(path, p) for p in patterns)
+    for entry in patterns:
+        if entry.endswith("/"):
+            if _is_prefix_match(path, entry):
+                return True
+        elif glob_match(path, entry):
+            return True
+    return False
 
 
 def check(

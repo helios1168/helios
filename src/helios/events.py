@@ -39,7 +39,11 @@ def append(
     session: str | None = None,
     detail: str = "",
 ) -> dict[str, Any]:
-    """Append one JSON object per line with a single ``write`` under 4 KB."""
+    """Append one JSON object per line with a single ``write`` (SPEC §9.3).
+
+    The line, newline included, is at most 4096 bytes: ``detail`` is
+    shortened first, and the call raises when the line is still too long.
+    """
     if type not in TYPES:
         raise ValueError(f"unknown event type {type!r}")
     if source not in SOURCES:
@@ -53,13 +57,18 @@ def append(
         "session": session,
         "detail": detail,
     }
-    line = json.dumps(event, sort_keys=True)
-    while len(line.encode("utf-8")) >= MAX_BYTES and event["detail"]:
+    line = _encode(event)
+    while len(line) > MAX_BYTES and event["detail"]:
         event["detail"] = event["detail"][: len(event["detail"]) // 2]
-        line = json.dumps(event, sort_keys=True)
-    line += "\n"
+        line = _encode(event)
+    if len(line) > MAX_BYTES:
+        raise ValueError(f"event line for bead {bead!r} exceeds {MAX_BYTES} bytes")
     path = hub / EVENT_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as fh:
-        fh.write(line)
+        fh.write(line.decode("utf-8"))
     return event
+
+
+def _encode(event: dict[str, Any]) -> bytes:
+    return (json.dumps(event, sort_keys=True) + "\n").encode("utf-8")

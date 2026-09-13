@@ -8,7 +8,7 @@ import pytest
 
 from helios import prompt as pr
 from helios.beads import Bead
-from helios.preflight import PreflightContext, check, memory_map
+from helios.preflight import PreflightContext, check, globs_overlap, memory_map
 
 
 def make_hub(tmp_path: Path) -> Path:
@@ -22,7 +22,12 @@ def make_hub(tmp_path: Path) -> Path:
     )
     (hub / "docs").mkdir()
     (hub / "docs" / "SPEC.md").write_text(
-        "# spec\n\n## 5. Configuration\n\nConfig words.\n\n## 7. Run\n\nRun words.\n"
+        "# spec\n\n"
+        "## 4. Result contracts\n\nContracts.\n\n"
+        "### 4.4 Execution status\n\nStatus words.\n\n"
+        "## 5. Configuration\n\nConfig words.\n\n"
+        "## 9. Sessions\n\nSessions.\n\n"
+        "### 9.3 Events\n\nEvent words.\n"
     )
     return hub
 
@@ -77,8 +82,44 @@ def test_assemble_order_extraction_and_harness_invariance() -> None:
         assert [h for h in headings if h in order] == order
         assert "Do the work." in first and "name: impl" not in first
         assert "Work exactly one bead." in first and "Merges." not in first
-        assert "Config words." in first and "Run words." not in first
+        assert "Config words." in first and "Sessions." not in first
         assert '"id": "b1"' in first and "b1#1" in first
+
+
+def test_assemble_section_keys() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        hub = make_hub(Path(tmp))
+        for key in ("5.", "9.3", "4.4", "9.3 Events"):
+            kwargs = base_kwargs(hub)
+            kwargs["docs"] = [f"docs/SPEC.md#{key}"]
+            out = pr.assemble(**kwargs)
+            assert "truncated" not in out
+        kwargs = base_kwargs(hub)
+        kwargs["docs"] = ["docs/SPEC.md#5."]
+        assert "Config words." in pr.assemble(**kwargs)
+        kwargs["docs"] = ["docs/SPEC.md#9.3"]
+        assert "Event words." in pr.assemble(**kwargs)
+        kwargs["docs"] = ["docs/SPEC.md#4.4"]
+        assert "Status words." in pr.assemble(**kwargs)
+        with pytest.raises(KeyError):
+            pr.find_section("## a\n\nx\n", "missing")
+
+
+def test_assemble_fenced_lines_are_never_headings() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        hub = make_hub(Path(tmp))
+        (hub / "docs" / "F.md").write_text(
+            "## Real\n\nreal words\n\n```\n# fake\n\n## Also fake\n```\n\ntail words\n\n"
+            "~~~\n# tilde fake\n~~~\n\nmore words\n"
+        )
+        text = pr.read_doc(hub, "docs/F.md#Real")[1]
+        assert "real words" in text and "tail words" in text and "more words" in text
+        with pytest.raises(KeyError):
+            pr.find_section("## Real\n\nx\n", "Also fake")
 
 
 def test_assemble_caps_docs_plus_memories() -> None:
@@ -94,6 +135,24 @@ def test_assemble_caps_docs_plus_memories() -> None:
         out = pr.assemble(**kwargs)
         assert "truncated for inject cap" in out
         assert "docs/BIG.md" in out or "m1" in out
+        docs_text = out.split("## Docs\n\n")[1].split("\n\n## Memories")[0]
+        memories_text = out.split("## Memories\n\n")[1].split("\n\n## Attempt")[0]
+        assert len((docs_text + memories_text).encode("utf-8")) <= 1000
+
+
+def test_assemble_cap_never_splits_a_character() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        hub = make_hub(Path(tmp))
+        (hub / "docs" / "UNI.md").write_text("# u\n\n" + "é" * 500 + "\n")
+        kwargs = base_kwargs(hub)
+        kwargs["docs"] = ["docs/UNI.md"]
+        kwargs["memories"] = {"m1": "ü" * 500}
+        kwargs["inject_cap_bytes"] = 100
+        out = pr.assemble(**kwargs)
+        out.encode("utf-8")
+        assert "truncated for inject cap" in out
 
 
 def impl_bead(**kw) -> Bead:
@@ -118,11 +177,25 @@ def test_preflight_needs_files_test_docs_and_memories(tmp_path: Path) -> None:
     assert check([impl_bead()], PreflightContext(hub=hub, memory_has=memory_map({}))) == []
 
 
+def test_preflight_docs_key_must_resolve(tmp_path: Path) -> None:
+    hub = make_hub(tmp_path)
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}))
+    ok = check([impl_bead(docs=["docs/SPEC.md#5."])], ctx)
+    assert ok == []
+    bad = check([impl_bead(docs=["docs/SPEC.md#nope"])], ctx)
+    assert any("nope" in e for e in bad)
+
+
+def test_preflight_memory_lookup_is_required() -> None:
+    with pytest.raises(TypeError):
+        PreflightContext(hub=Path("/tmp"))  # type: ignore[call-arg]
+
+
 def test_preflight_verify_math_model_and_overlap(tmp_path: Path) -> None:
     hub = make_hub(tmp_path)
     (hub / "docs" / "units").mkdir(parents=True)
     (hub / "docs" / "units" / "U1.md").write_text("# U1\n\n## Model\n\n_empty_\n")
-    ctx = PreflightContext(hub=hub, units_dir="docs/units")
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}), units_dir="docs/units")
     bead = Bead(id="v1", kind="verify-math", unit="U1", parent="b1")
     assert any("substantive" in e for e in check([bead], ctx))
     (hub / "docs" / "units" / "U1.md").write_text("# U1\n\n## Model\n\n" + "claim words " * 30 + "\n")
@@ -135,13 +208,29 @@ def test_preflight_verify_math_model_and_overlap(tmp_path: Path) -> None:
     assert disjoint == []
 
 
+def test_preflight_model_counts_text_not_newlines(tmp_path: Path) -> None:
+    hub = make_hub(tmp_path)
+    (hub / "docs" / "units").mkdir(parents=True)
+    (hub / "docs" / "units" / "U1.md").write_text("# U1\n\n## Model\n\n" + "x\n" * 101)
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}), units_dir="docs/units")
+    bead = Bead(id="v1", kind="verify-math", unit="U1", parent="b1")
+    assert any("substantive" in e for e in check([bead], ctx))
+
+
+def test_globs_overlap_rule() -> None:
+    assert globs_overlap("tests/test_*.py", "tests/*_config.py")
+    assert globs_overlap("src/", "*.py")
+    assert not globs_overlap("src/helios/config.py", "src/helios/beads.py")
+    assert not globs_overlap("src/a/", "src/b/*.py")
+
+
 def test_preflight_unfinalized_attempt(tmp_path: Path) -> None:
     import os
 
     from helios import attempt as att
 
     hub = make_hub(tmp_path)
-    ctx = PreflightContext(hub=hub)
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}))
     bead = impl_bead()
     assert check([bead], ctx) == []
     # A dead attempt is recoverable, so preflight passes.
