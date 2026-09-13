@@ -15,7 +15,6 @@ import os
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -36,57 +35,71 @@ from helios.harness.base import Harness, LaunchSpec
 _RUNNING: dict[str, subprocess.Popen[str]] = {}
 _RUNNING_LOCK = threading.Lock()
 _INTERRUPT = threading.Event()
+_RUN_ACTIVE = threading.Event()
 _RUN_DEPTH = 0
 _RUN_DEPTH_LOCK = threading.Lock()
 _PREV_SIGINT: Callable[[int, FrameType | None], object] | int | None = None
 
 
 def _handle_sigint(signum: int, frame: FrameType | None) -> None:
-    """First SIGINT sets the run-wide flag and stops every child group.
+    """Record a SIGINT and return immediately (SPEC §7.1 Interrupts).
 
-    Later SIGINTs are ignored (SPEC §7.1 Interrupts). Fast and non-blocking:
-    workers run the full stop sequence when they notice the flag.
+    The handler never blocks and takes no lock: a stopper thread started
+    by the run waits on the flag and runs the stop sequences. Later
+    SIGINTs are ignored.
     """
-    if _INTERRUPT.is_set():
-        return
     _INTERRUPT.set()
-    with _RUNNING_LOCK:
-        procs = list(_RUNNING.values())
-    for proc in procs:
-        _signal_group(proc, proc.pid, signal.SIGINT)
 
 
-def _run_guard_enter() -> bool:
-    """Enter a run; install the SIGINT handler at the outermost level."""
-    global _PREV_SIGINT, _RUN_DEPTH
+def _stopper_main() -> None:
+    """Stop every running child group while the run is active (SPEC §7.1)."""
+    while _RUN_ACTIVE.is_set():
+        if not _INTERRUPT.wait(0.2):
+            continue
+        with _RUNNING_LOCK:
+            procs = list(_RUNNING.values())
+        for proc in procs:
+            if not (_RUN_ACTIVE.is_set() and _INTERRUPT.is_set()):
+                return
+            _stop_sequence(proc, proc.pid)
+
+
+def _run_depth_enter() -> int:
+    """Count one more active run layer; return the new depth."""
+    global _RUN_DEPTH
     with _RUN_DEPTH_LOCK:
         _RUN_DEPTH += 1
-        outermost = _RUN_DEPTH == 1
-    if outermost:
-        _INTERRUPT.clear()
-        try:
-            _PREV_SIGINT = signal.signal(signal.SIGINT, _handle_sigint)
-        except ValueError:
-            pass
-        return True
-    return False
+        return _RUN_DEPTH
 
 
-def _run_guard_exit(outermost: bool) -> None:
-    """Leave a run; restore the previous SIGINT handler."""
-    global _PREV_SIGINT, _RUN_DEPTH
-    if not outermost:
-        with _RUN_DEPTH_LOCK:
-            _RUN_DEPTH -= 1
-        return
+def _run_depth_exit() -> None:
+    """Leave one run layer."""
+    global _RUN_DEPTH
+    with _RUN_DEPTH_LOCK:
+        _RUN_DEPTH -= 1
+
+
+def _install_handler() -> bool:
+    """Install the SIGINT handler for this run; True when installed."""
+    global _PREV_SIGINT
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    try:
+        _PREV_SIGINT = signal.signal(signal.SIGINT, _handle_sigint)
+    except ValueError:
+        return False
+    return True
+
+
+def _restore_handler() -> None:
+    """Restore the previous SIGINT handler."""
+    global _PREV_SIGINT
     prev, _PREV_SIGINT = _PREV_SIGINT, None
     if prev is not None:
         try:
             signal.signal(signal.SIGINT, prev)  # type: ignore[arg-type]
         except ValueError:
             pass
-    with _RUN_DEPTH_LOCK:
-        _RUN_DEPTH -= 1
 
 
 def sha256_text(text: str) -> str:
@@ -114,57 +127,6 @@ def compute_input_hashes(
     if unit_text is not None:
         hashes["unit"] = sha256_text(unit_text)
     return hashes
-
-
-def capture_report(
-    native_structured: dict | None, report_path: Path
-) -> tuple[envelope_mod.AgentReport | None, str | None, list[str]]:
-    """Capture the report, preferring the native channel (SPEC §6.2).
-
-    Returns (report, report_error, notes). A missing file and no structured
-    result gives (None, None, []); the caller maps that to missing_output.
-    A present but unparsable or schema-invalid candidate gives
-    (None, error, notes) for invalid_output.
-    """
-    notes: list[str] = []
-    file_candidate: dict | None = None
-    file_error: str | None = None
-    if report_path.is_file():
-        try:
-            raw = report_path.read_text()
-        except OSError as exc:
-            file_error = f"cannot read report: {exc}"
-            raw = ""
-        if file_error is None:
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                file_error = f"report is not valid JSON: {exc}"
-            else:
-                if isinstance(parsed, dict):
-                    file_candidate = parsed
-                else:
-                    file_error = "report JSON is not an object"
-    candidate: dict | None = None
-    if native_structured is not None:
-        candidate = native_structured
-        if file_candidate is not None and file_candidate != native_structured:
-            notes.append("native result differs from report file; using native")
-        elif file_error is not None:
-            notes.append(f"report file unreadable ({file_error}); using native")
-    else:
-        if file_candidate is not None:
-            candidate = file_candidate
-        elif file_error is not None:
-            return None, file_error, notes
-        else:
-            return None, None, notes
-    assert candidate is not None
-    try:
-        report = envelope_mod.AgentReport.model_validate(candidate)
-    except Exception as exc:
-        return None, f"report fails schema: {exc}", notes
-    return report, None, notes
 
 
 def classify_execution(
@@ -306,7 +268,7 @@ def _launch_and_wait(
             start = time.monotonic()
             while True:
                 if _INTERRUPT.is_set():
-                    exit_code = _stop_sequence(proc, pgid)
+                    exit_code = proc.wait()
                     return exit_code, False, True, False, child_pid
                 try:
                     exit_code = proc.wait(timeout=0.05)
@@ -314,7 +276,6 @@ def _launch_and_wait(
                     pass
                 else:
                     if _INTERRUPT.is_set():
-                        exit_code = _stop_sequence(proc, pgid)
                         return exit_code, False, True, False, child_pid
                     return exit_code, False, False, False, child_pid
                 if time.monotonic() - start >= timeout_s:
@@ -351,13 +312,12 @@ def _run_shell(
     except OSError as exc:
         log_path.write_text(f"failed to start: {exc}\n")
         return False, 127, f"failed to start: {exc}"
-    pgid = proc.pid
     with _RUNNING_LOCK:
         _RUNNING[run_key] = proc
     try:
         while True:
             if _INTERRUPT.is_set():
-                _stop_sequence(proc, pgid)
+                proc.wait()
                 try:
                     out, err = proc.communicate(timeout=5)
                 except (subprocess.TimeoutExpired, ValueError, OSError):
@@ -370,7 +330,6 @@ def _run_shell(
             except subprocess.TimeoutExpired:
                 continue
         if _INTERRUPT.is_set():
-            _stop_sequence(proc, pgid)
             try:
                 out, err = proc.communicate(timeout=5)
             except (subprocess.TimeoutExpired, ValueError, OSError):
@@ -458,18 +417,39 @@ def _classify_extra_paths(
     return allowed, rejected
 
 
+def _index_paths(worktree: Path) -> set[str]:
+    """Paths with an index entry (SPEC §7.1 step 10)."""
+    try:
+        return set(_git_nul(worktree, "ls-files", "-z", "--cached"))
+    except RuntimeError:
+        return set()
+
+
 def _stage_and_commit(
     worktree: Path, bead_id: str, summary: str, paths: list[str]
 ) -> tuple[bool, str]:
-    """Stage exactly ``paths`` and commit only them (SPEC §7.1 step 10).
+    """Stage and commit exactly ``paths`` in three calls (SPEC §7.1 step 10).
 
-    Returns (committed, head): ``committed`` is True when this call created
-    a commit; ``head`` is the worktree HEAD afterwards.
+    A path may exist nowhere (a rename source or a staged-then-deleted
+    file), and git rejects a pathspec matching nothing, so stage only
+    paths on disk or in the index, select the staged ones that differ
+    from HEAD, and commit exactly those. Returns (committed, head).
     """
-    if paths:
-        _git(worktree, "add", "-A", "--", *[_literal(p) for p in paths])
-    staged = _git(worktree, "diff", "--cached", "--name-only", "--", *[_literal(p) for p in paths]) if paths else ""
-    if not staged.strip():
+    if not paths:
+        return False, _head_commit(worktree)
+    specs = [_literal(p) for p in paths]
+    index = _index_paths(worktree)
+    addable = [
+        p for p in paths
+        if os.path.lexists(worktree / p) or p in index
+    ]
+    if addable:
+        _git(worktree, "add", "-A", "--", *[_literal(p) for p in addable])
+    selected = _git_nul(
+        worktree, "diff", "--cached", "--name-only", "--no-renames",
+        "-z", "HEAD", "--", *specs,
+    )
+    if not selected:
         return False, _head_commit(worktree)
     _git(
         worktree,
@@ -481,7 +461,7 @@ def _stage_and_commit(
         "-m",
         f"{bead_id}: {summary}",
         "--",
-        *[_literal(p) for p in paths],
+        *[_literal(p) for p in selected],
     )
     return True, _head_commit(worktree)
 
@@ -549,29 +529,6 @@ def _missing_skill(hub: Path, kind: str) -> str | None:
     return None
 
 
-def _store_execution_status(
-    attempt_dir: Path, execution: envelope_mod.ExecutionStatus
-) -> None:
-    """Record the step 8 classification in ``state.json`` (SPEC §8.2)."""
-    path = attempt_dir / "state.json"
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError, ValueError):
-        return
-    data["execution_status"] = execution.value
-    fd, tmp = tempfile.mkstemp(dir=str(attempt_dir), prefix="state.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as fh:
-            json.dump(data, fh, indent=2, sort_keys=True)
-            fh.write("\n")
-        os.replace(tmp, path)
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-
-
 def _stored_execution(attempt_dir: Path) -> envelope_mod.ExecutionStatus | None:
     """A stored step 8 status from state.json, else the envelope (SPEC §8.4)."""
     try:
@@ -589,6 +546,91 @@ def _stored_execution(attempt_dir: Path) -> envelope_mod.ExecutionStatus | None:
     except (OSError, json.JSONDecodeError, ValueError):
         pass
     return None
+
+
+def _read_report_bytes(path: Path) -> tuple[dict | None, str | None, bytes | None]:
+    """Read a report file: (candidate, error, raw bytes).
+
+    Missing gives (None, None, None); present but bad gives (None, error,
+    raw bytes).
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None, None, None
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as exc:
+        return None, f"report is not valid JSON: {exc}", raw
+    if not isinstance(parsed, dict):
+        return None, "report JSON is not an object", raw
+    return parsed, None, raw
+
+
+@dataclass
+class _Capture:
+    """The step 8 capture decision (SPEC §6.2).
+
+    Fresh attempts choose between the native channel and the worktree
+    report file and persist the chosen bytes; resume and recovery read
+    only the captured copy (SPEC §6.2 step 5).
+    """
+
+    candidate: dict | None
+    raw_error: str | None
+    store_bytes: bytes | None
+    force: envelope_mod.ExecutionStatus | None
+    report_check_detail: str | None
+    notes: list[str]
+
+
+def _capture_fresh(
+    native_structured: dict | None, report_path: Path
+) -> _Capture:
+    """Choose the report for a fresh attempt (SPEC §6.2 steps 3-5)."""
+    file_candidate, file_error, raw = _read_report_bytes(report_path)
+    notes: list[str] = []
+    if native_structured is not None:
+        if file_candidate is not None and file_candidate != native_structured:
+            notes.append("native result differs from report file; using native")
+        elif file_error is not None:
+            notes.append(f"report file unreadable ({file_error}); using native")
+        store = (
+            raw
+            if raw is not None
+            else (json.dumps(native_structured, indent=2, sort_keys=True) + "\n").encode()
+        )
+        return _Capture(native_structured, None, store, None, None, notes)
+    if file_candidate is not None:
+        return _Capture(file_candidate, None, raw, None, None, notes)
+    if file_error is not None:
+        return _Capture(None, file_error, raw, None, None, notes)
+    return _Capture(None, None, None, None, None, notes)
+
+
+def _capture_resume(
+    attempt_dir: Path,
+    legacy_path: Path | None,
+    stored: envelope_mod.ExecutionStatus | None,
+) -> _Capture:
+    """Read the captured copy; legacy worktree fallback without status.
+
+    A stored ``completed`` whose captured report is missing or invalid
+    keeps ``completed``; the failure surfaces as a helios ``report``
+    check (SPEC §8.4).
+    """
+    captured = attempt_dir / "report.json"
+    candidate, error, raw = _read_report_bytes(captured)
+    store: bytes | None = None
+    if raw is None and stored is None and legacy_path is not None:
+        candidate, error, store = _read_report_bytes(legacy_path)
+    if stored is envelope_mod.ExecutionStatus.COMPLETED and candidate is None:
+        if raw is None:
+            detail = "captured report is missing"
+        else:
+            detail = f"captured report invalid: {error}"
+        return _Capture(None, error, None, stored, detail, [])
+    return _Capture(candidate, error, store, stored, None, [])
 
 
 @dataclass
@@ -620,28 +662,38 @@ def _apply_writeback_once(
 def _finish_attempt(
     args: _FinishArgs,
     *,
+    capture: _Capture,
     native_session: str | None,
-    native_structured: dict | None,
     native_error: str | None,
     proc_exit: int | None,
     interrupted: bool,
     timed_out: bool,
     launch_failed: bool,
     transition_from: str | None,
-    force_execution: envelope_mod.ExecutionStatus | None = None,
 ) -> int:
-    """Capture, check, commit, envelop, write back and finalize one attempt."""
+    """Validate, check, commit, envelop, write back and finalize one attempt."""
     bead = args.bead
     attempt_dir = args.attempt.dir
     n = args.attempt.n
     attempt_id = args.attempt.attempt_id
-    report_path = attempt_mod.worktree_report_path(args.worktree_path, n)
 
-    report, report_error, capture_notes = capture_report(native_structured, report_path)
-    notes = [*args.notes, *capture_notes]
+    if capture.store_bytes is not None:
+        try:
+            (attempt_dir / "report.json").write_bytes(capture.store_bytes)
+        except OSError:
+            pass
+    report: envelope_mod.AgentReport | None = None
+    report_error = capture.raw_error
+    if capture.candidate is not None:
+        try:
+            report = envelope_mod.AgentReport.model_validate(capture.candidate)
+            report_error = None
+        except Exception as exc:
+            report_error = f"report fails schema: {exc}"
+    notes = [*args.notes, *capture.notes]
     has_candidate = report is not None or report_error is not None
-    if force_execution is not None:
-        execution = force_execution
+    if capture.force is not None:
+        execution = capture.force
     else:
         execution = classify_execution(
             interrupted=interrupted,
@@ -669,20 +721,20 @@ def _finish_attempt(
         }.get(execution, "native_completed" if proc_exit == 0 else "crashed")
         if launch_failed:
             terminal = "launch_failed"
-        attempt_mod.transition(attempt_dir, terminal)
-        _store_execution_status(attempt_dir, execution)
-    if report is not None:
-        (attempt_dir / "report.json").write_text(
-            report.model_dump_json(indent=2, exclude_none=False) + "\n"
+        attempt_mod.transition(
+            attempt_dir, terminal, execution_status=execution.value
         )
-    elif has_candidate and report_path.is_file():
-        try:
-            (attempt_dir / "report.json").write_bytes(report_path.read_bytes())
-        except OSError:
-            pass
 
     checks_dir = attempt_dir / "checks"
     checks: list[envelope_mod.Check] = []
+    if capture.report_check_detail is not None:
+        checks.append(
+            envelope_mod.Check(
+                name="report",
+                passed=False,
+                detail=capture.report_check_detail,
+            )
+        )
     if bead.test:
         passed, code, detail = _run_shell(
             bead.test, args.worktree_path, checks_dir / "test.log",
@@ -787,31 +839,62 @@ def _finish_attempt(
     if report is not None and bead.kind.startswith("verify"):
         overall = envelope_mod.overall_verdict(list(report.findings))
         verdict = overall.value if overall is not None else None
-    envelope = envelope_mod.Envelope(
-        task_id=bead.id,
-        attempt=n,
-        attempt_id=attempt_id,
-        kind=bead.kind,
-        harness=args.harness_name,  # type: ignore[arg-type]
-        model=harness_cfg.model if harness_cfg else None,
-        session_id=native_session,
-        started_at=args.started_at,
-        finished_at=finished_at,
-        base_commit=args.base_commit,
-        output_commit=output_commit,
-        input_hashes=dict(args.input_hashes),
-        execution_status=execution,
-        exit_code=proc_exit,
-        report=report,
-        report_error=report_error,
-        checks=checks,
-        notes=notes,
-    )
+    if execution is envelope_mod.ExecutionStatus.COMPLETED and report is None:
+        # SPEC §8.4 keeps a stored completed whose captured report went bad;
+        # the contracts model cannot hold completed without a report, so the
+        # envelope is written unvalidated with the failing report check.
+        envelope = envelope_mod.Envelope.model_construct(
+            schema_version="1",
+            task_id=bead.id,
+            attempt=n,
+            attempt_id=attempt_id,
+            kind=bead.kind,
+            harness=args.harness_name,
+            model=harness_cfg.model if harness_cfg else None,
+            session_id=native_session,
+            started_at=args.started_at,
+            finished_at=finished_at,
+            base_commit=args.base_commit,
+            output_commit=output_commit,
+            input_hashes=dict(args.input_hashes),
+            execution_status=execution,
+            exit_code=proc_exit,
+            report=None,
+            report_error=report_error,
+            checks=checks,
+            artifacts=[],
+            steered=[],
+            notes=notes,
+        )
+    else:
+        envelope = envelope_mod.Envelope(
+            task_id=bead.id,
+            attempt=n,
+            attempt_id=attempt_id,
+            kind=bead.kind,
+            harness=args.harness_name,  # type: ignore[arg-type]
+            model=harness_cfg.model if harness_cfg else None,
+            session_id=native_session,
+            started_at=args.started_at,
+            finished_at=finished_at,
+            base_commit=args.base_commit,
+            output_commit=output_commit,
+            input_hashes=dict(args.input_hashes),
+            execution_status=execution,
+            exit_code=proc_exit,
+            report=report,
+            report_error=report_error,
+            checks=checks,
+            notes=notes,
+        )
     (attempt_dir / "envelope.json").write_text(
         envelope.model_dump_json(indent=2, exclude_none=False) + "\n"
     )
-    attempt_mod.transition(attempt_dir, "validated" if report is not None else "invalid")
-    _store_execution_status(attempt_dir, execution)
+    attempt_mod.transition(
+        attempt_dir,
+        "validated" if report is not None else "invalid",
+        execution_status=execution.value,
+    )
 
     plan = beads_mod.plan_writeback(
         attempt_id=attempt_id,
@@ -987,10 +1070,12 @@ class _BeadLock:
 
 def _refuse_live(bead_id: str, attempt_id: str | None) -> int:
     """Print the attach and stop commands and refuse with exit 2 (SPEC §8.4)."""
-    print(
+    text = (
         f"attempt {attempt_id} is still running; "
         f"use `helios attach {bead_id}` or `helios stop {bead_id}`"
     )
+    print(text)
+    print(text, file=sys.stderr)
     return 2
 
 
@@ -1117,8 +1202,10 @@ def run_one(
     dry_run: bool = False,
 ) -> int:
     """Run one bead through launch, checks, commit and write-back (SPEC §7.1)."""
-    outermost = _run_guard_enter()
+    depth = _run_depth_enter()
     try:
+        if depth == 1:
+            _INTERRUPT.clear()
         return _run_one_inner(
             bead_id,
             hub=hub,
@@ -1130,7 +1217,7 @@ def run_one(
             dry_run=dry_run,
         )
     finally:
-        _run_guard_exit(outermost)
+        _run_depth_exit()
 
 
 def _run_one_inner(
@@ -1240,6 +1327,8 @@ def _run_one_inner(
             link_into_worktrees=cfg.project.link_into_worktrees,
             again=again,
         )
+        if _INTERRUPT.is_set():
+            return 4
         worktree_path = info.path
         base_commit = info.base_commit
         attempt_obj, alloc_notes = attempt_mod.allocate(
@@ -1303,16 +1392,16 @@ def _run_one_inner(
 
         def _record_launched(pid: int) -> None:
             attempt_mod.transition(attempt_obj.dir, "launched", pid=pid)
+            events_mod.append(
+                hub,
+                source="helios",
+                type="launched",
+                bead=bead_id,
+                attempt=attempt_obj.attempt_id,
+                session=None,
+                detail=f"harness {harness_name}",
+            )
 
-        events_mod.append(
-            hub,
-            source="helios",
-            type="launched",
-            bead=bead_id,
-            attempt=attempt_obj.attempt_id,
-            session=None,
-            detail=f"harness {harness_name}",
-        )
         proc_exit, timed_out, interrupted, launch_failed, _child = _launch_and_wait(
             argv,
             cwd=worktree_path,
@@ -1325,9 +1414,10 @@ def _run_one_inner(
             on_launched=_record_launched,
         )
         if launch_failed:
-            attempt_mod.transition(attempt_obj.dir, "launch_failed")
-            _store_execution_status(
-                attempt_obj.dir, envelope_mod.ExecutionStatus.LAUNCH_FAILED
+            attempt_mod.transition(
+                attempt_obj.dir,
+                "launch_failed",
+                execution_status=envelope_mod.ExecutionStatus.LAUNCH_FAILED.value,
             )
         native = harness.parse(spec, proc_exit, stdout_path)
         finish_args = _FinishArgs(
@@ -1345,8 +1435,8 @@ def _run_one_inner(
         )
         return _finish_attempt(
             finish_args,
+            capture=_capture_fresh(native.structured, report_path),
             native_session=native.session_id,
-            native_structured=native.structured,
             native_error=native.native_error,
             proc_exit=proc_exit,
             interrupted=interrupted,
@@ -1380,11 +1470,9 @@ def _resume_latest(
     """Finalize a ``native_completed``/``validated``/``invalid`` attempt (SPEC §8.4).
 
     A stored step 8 status is kept; only an attempt without one is
-    classified again.
+    classified again. Validation reads the captured ``attempt-<n>``
+    report, never the worktree path (SPEC §6.2 step 5).
     """
-    from helios.harness import get as harness_get
-
-    harness = harness_get(harness_name)
     numbers = attempt_mod.existing_attempts(hub / config.project.runs / bead_id)
     if not numbers:
         return 2
@@ -1410,57 +1498,16 @@ def _resume_latest(
     except (OSError, json.JSONDecodeError, ValueError, AttributeError):
         hashes = {}
         base_commit = info.base_commit
-    stdout_path = attempt_dir / "stdout.jsonl"
-    harness_cfg = config.harness.get(harness_name)
-    report_path = attempt_mod.worktree_report_path(info.path, n)
-    spec = LaunchSpec(
-        bead=bead_id,
-        attempt=n,
-        worktree=info.path,
-        prompt="",
-        report_path=report_path,
-        report_schema_path=attempt_dir / "report-schema.json",
-        raw_dir=attempt_dir / "raw",
-        model=harness_cfg.model if harness_cfg else None,
-        effort=harness_cfg.effort if harness_cfg else None,
-        timeout_s=harness_cfg.timeout_s if harness_cfg else 3600,
-        server_url=harness_cfg.server_url if harness_cfg else None,
-        extra_args=tuple(harness_cfg.extra_args) if harness_cfg else (),
-        env=dict(os.environ),
-    )
-    exit_hint: int | None = 0
-    try:
-        if stdout_path.is_file():
-            exit_hint = 0
-    except OSError:
-        exit_hint = 0
-    native = harness.parse(spec, exit_hint, stdout_path)
-    if stored is None:
-        forced: envelope_mod.ExecutionStatus | None = None
-        proc_exit: int | None = 0
-        interrupted = timed_out = launch_failed = False
-        native_error = None
-    elif stored is envelope_mod.ExecutionStatus.INTERRUPTED:
-        forced, proc_exit, interrupted, timed_out, launch_failed = stored, 0, True, False, False
-        native_error = None
-    elif stored is envelope_mod.ExecutionStatus.TIMED_OUT:
-        forced, proc_exit, interrupted, timed_out, launch_failed = stored, 0, False, True, False
-        native_error = None
-    elif stored is envelope_mod.ExecutionStatus.LAUNCH_FAILED:
-        forced, proc_exit, interrupted, timed_out, launch_failed = stored, None, False, False, True
-        native_error = None
-    elif stored is envelope_mod.ExecutionStatus.COMPLETED:
-        forced, proc_exit, interrupted, timed_out, launch_failed = None, 0, False, False, False
-        native_error = None
-    elif stored is envelope_mod.ExecutionStatus.INVALID_OUTPUT:
-        forced, proc_exit, interrupted, timed_out, launch_failed = stored, 0, False, False, False
-        native_error = None
-    elif stored is envelope_mod.ExecutionStatus.CRASHED:
-        forced, proc_exit, interrupted, timed_out, launch_failed = stored, 0, False, False, False
-        native_error = "resumed"
-    else:
-        forced, proc_exit, interrupted, timed_out, launch_failed = stored, 0, False, False, False
-        native_error = None
+    legacy_path = attempt_mod.worktree_report_path(info.path, n)
+    capture = _capture_resume(attempt_dir, legacy_path, stored)
+    session_id = state.get("session_id")
+    if session_id is None:
+        try:
+            session_id = json.loads((attempt_dir / "envelope.json").read_text()).get(
+                "session_id"
+            )
+        except (OSError, json.JSONDecodeError, ValueError, AttributeError):
+            session_id = None
     finish_args = _FinishArgs(
         hub=hub,
         config=config,
@@ -1476,15 +1523,14 @@ def _resume_latest(
     )
     return _finish_attempt(
         finish_args,
-        native_session=native.session_id if native.session_id else state.get("session_id"),
-        native_structured=native.structured,
-        native_error=native_error,
-        proc_exit=proc_exit,
-        interrupted=interrupted,
-        timed_out=timed_out,
-        launch_failed=launch_failed,
+        capture=capture,
+        native_session=session_id,
+        native_error=None,
+        proc_exit=None if stored is envelope_mod.ExecutionStatus.LAUNCH_FAILED else 0,
+        interrupted=stored is envelope_mod.ExecutionStatus.INTERRUPTED,
+        timed_out=stored is envelope_mod.ExecutionStatus.TIMED_OUT,
+        launch_failed=stored is envelope_mod.ExecutionStatus.LAUNCH_FAILED,
         transition_from=None,
-        force_execution=forced,
     )
 
 
@@ -1503,7 +1549,15 @@ def run_many(
     """Run beads, up to ``max_parallel`` at once; preflight first (SPEC §7.1)."""
     from helios import preflight as preflight_mod
 
-    outermost = _run_guard_enter()
+    depth = _run_depth_enter()
+    outermost = depth == 1
+    stopper: threading.Thread | None = None
+    if outermost:
+        _INTERRUPT.clear()
+        if _install_handler():
+            _RUN_ACTIVE.set()
+            stopper = threading.Thread(target=_stopper_main, daemon=True)
+            stopper.start()
     try:
         hub = hub.resolve()
         cfg = config if config is not None else config_mod.load(hub)
@@ -1571,30 +1625,18 @@ def run_many(
                 ): bid
                 for bid in bead_ids
             }
-            try:
-                for future in concurrent.futures.as_completed(future_of):
-                    try:
-                        results[future_of[future]] = future.result()
-                    except Exception:
-                        results[future_of[future]] = 4
-            except KeyboardInterrupt:
-                _INTERRUPT.set()
-                stop_all_running_soon()
-                for future in concurrent.futures.as_completed(future_of):
-                    try:
-                        results[future_of[future]] = future.result()
-                    except Exception:
-                        results[future_of[future]] = 4
+            for future in concurrent.futures.as_completed(future_of):
+                try:
+                    results[future_of[future]] = future.result()
+                except Exception:
+                    results[future_of[future]] = 4
         if _INTERRUPT.is_set():
             return 4
         return max(results.values(), default=0)
     finally:
-        _run_guard_exit(outermost)
-
-
-def stop_all_running_soon() -> None:
-    """Send SIGINT to every running child group; workers finish the stop."""
-    with _RUNNING_LOCK:
-        procs = list(_RUNNING.values())
-    for proc in procs:
-        _signal_group(proc, proc.pid, signal.SIGINT)
+        if outermost:
+            _RUN_ACTIVE.clear()
+            if stopper is not None:
+                stopper.join(timeout=5)
+            _restore_handler()
+        _run_depth_exit()

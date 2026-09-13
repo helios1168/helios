@@ -1,9 +1,14 @@
 """Attempt lifecycle records (SPEC §8).
 
-``state.json`` is ``{"state", "attempt_id", "pid", "session_id", "updated"}``,
-written to a temp file and moved with ``os.replace``; every transition
-appends one line to ``state.log``. Recovery classification (SPEC §8.4) is a
-pure function; staleness (SPEC §8.5) compares input hashes and ancestry.
+``state.json`` is ``{"state", "attempt_id", "pid", "session_id",
+"execution_status", "updated"}`` (SPEC §8.2), written to a temp file and
+moved with ``os.replace``; every transition appends one line to
+``state.log``. Every write carries all six keys, and a transition keeps the
+stored ``execution_status`` (and ``pid`` and ``session_id``) unless it sets
+a new value. An attempt directory without ``state.json`` reads as state
+``allocated`` with null pid, session and status (SPEC §8.3). Recovery
+classification (SPEC §8.4) is a pure function; staleness (SPEC §8.5)
+compares input hashes and ancestry.
 """
 
 from __future__ import annotations
@@ -84,7 +89,25 @@ class Attempt:
 
 
 def read_state(dir: Path) -> dict[str, Any]:
-    return json.loads((dir / "state.json").read_text())
+    """Read ``state.json``; a missing file reads as ``allocated`` (SPEC §8.3).
+
+    Reading never raises for a missing file: the record is state
+    ``allocated`` with null pid, session id and execution status.
+    """
+    try:
+        return json.loads((dir / "state.json").read_text())
+    except FileNotFoundError:
+        pass
+    match = re.fullmatch(r"attempt-(\d+)", dir.name)
+    attempt_id = f"{dir.parent.name}#{match.group(1)}" if match else dir.name
+    return {
+        "state": "allocated",
+        "attempt_id": attempt_id,
+        "pid": None,
+        "session_id": None,
+        "execution_status": None,
+        "updated": utc_now(),
+    }
 
 
 def write_state(
@@ -94,6 +117,7 @@ def write_state(
     state: str,
     pid: int | None = None,
     session_id: str | None = None,
+    execution_status: str | None = None,
 ) -> dict[str, Any]:
     """Write ``state.json`` atomically and append one line to ``state.log``."""
     if state not in STATES:
@@ -103,6 +127,7 @@ def write_state(
         "attempt_id": attempt_id,
         "pid": pid,
         "session_id": session_id,
+        "execution_status": execution_status,
         "updated": utc_now(),
     }
     dir.mkdir(parents=True, exist_ok=True)
@@ -162,15 +187,24 @@ def transition(
     *,
     pid: int | None = None,
     session_id: str | None = None,
+    execution_status: str | None = None,
 ) -> dict[str, Any]:
-    """Move an attempt to ``state`` (SPEC §8.2)."""
+    """Move an attempt to ``state`` (SPEC §8.2).
+
+    The stored ``pid``, ``session_id`` and ``execution_status`` survive
+    unless the call sets a new value.
+    """
     current = read_state(dir)
+    stored = current.get("execution_status")
     return write_state(
         dir,
         attempt_id=current["attempt_id"],
         state=state,
         pid=pid if pid is not None else current.get("pid"),
         session_id=session_id if session_id is not None else current.get("session_id"),
+        execution_status=(
+            execution_status if execution_status is not None else stored
+        ),
     )
 
 
