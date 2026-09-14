@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -620,3 +622,197 @@ def test_claude_is_error_non_bool_is_not_failure(value, tmp_path: Path):
     assert got.native_error is None
     assert got.session_id == "s1"
     assert got.structured == {"a": 1}
+
+
+# regular-file gate, NUL paths, JSON-whitespace strip, constants (SPEC §6.4)
+
+
+def _parse_in_child(
+    name: str,
+    stdout_path: Path,
+    raw_dir: Path,
+    writer_payload: bytes | None = None,
+    writer_target: Path | None = None,
+    timeout: float = 10.0,
+) -> str:
+    """Run one parse in a child process so a FIFO open cannot hang the suite."""
+    cls = {
+        "claude": "ClaudeAdapter",
+        "codex": "CodexAdapter",
+        "opencode": "OpencodeAdapter",
+        "agy": "AgyAdapter",
+    }[name]
+    script = (
+        "import threading\n"
+        "from pathlib import Path\n"
+        f"from helios.harness.{name} import {cls} as A\n"
+        "from helios.harness.base import LaunchSpec\n"
+        f"payload = {writer_payload!r}\n"
+        f"target = {str(writer_target)!r} if {writer_target is not None} else None\n"
+        "if payload is not None and target is not None:\n"
+        "    def _w():\n"
+        "        with open(target, 'wb') as _f:\n"
+        "            _f.write(payload)\n"
+        "    threading.Thread(target=_w, daemon=True).start()\n"
+        "spec = LaunchSpec(bead='b', attempt=1, worktree=Path('.'), prompt='p',\n"
+        "                  report_path=Path('r'), report_schema_path=Path('s'),\n"
+        f"                  raw_dir=Path({str(raw_dir)!r}))\n"
+        f"print(repr(A().parse(spec, 0, Path({str(stdout_path)!r}))), flush=True)\n"
+    )
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"{name} parse hung on {stdout_path}")
+    assert done.returncode == 0, done.stderr
+    return done.stdout.strip()
+
+
+NO_STDOUT_REPR = (
+    "NativeResult(session_id=None, structured=None, "
+    "native_error='no stdout', notes=())"
+)
+
+
+@pytest.mark.parametrize("name", ["claude", "codex", "opencode", "agy"])
+def test_stdout_fifo_without_writer(name, tmp_path: Path):
+    fifo = tmp_path / "fifo.stdout"
+    os.mkfifo(fifo)
+    assert _parse_in_child(name, fifo, tmp_path / "raw") == NO_STDOUT_REPR
+
+
+@pytest.mark.parametrize("name", ["claude", "codex", "opencode", "agy"])
+def test_stdout_fifo_with_writer_is_not_opened(name, tmp_path: Path):
+    fifo = tmp_path / "fifo.stdout"
+    os.mkfifo(fifo)
+    payload = (FIX / name / "fresh.stdout").read_bytes()
+    assert _parse_in_child(name, fifo, tmp_path / "raw", payload, fifo) == NO_STDOUT_REPR
+
+
+def test_last_message_fifo_without_writer(tmp_path: Path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    os.mkfifo(raw / "last-message.json")
+    out = tmp_path / "o.stdout"
+    out.write_bytes((FIX / "codex/fresh.stdout").read_bytes())
+    res = _parse_in_child("codex", out, raw)
+    assert "no structured result" in res and "structured=None" in res
+
+
+def test_last_message_fifo_with_writer_is_not_opened(tmp_path: Path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    os.mkfifo(raw / "last-message.json")
+    out = tmp_path / "o.stdout"
+    out.write_bytes((FIX / "codex/fresh.stdout").read_bytes())
+    res = _parse_in_child("codex", out, raw, b'{"status":"done"}', raw / "last-message.json")
+    assert "no structured result" in res and "structured=None" in res
+
+
+@pytest.mark.parametrize("name", ["claude", "codex", "opencode", "agy"])
+def test_nul_in_stdout_path(name, tmp_path: Path):
+    got = ADAPTERS[name].parse(make_spec(tmp_path), 0, tmp_path / "a\x00b")
+    assert got == NativeResult(None, None, "no stdout")
+
+
+def test_nul_in_raw_dir(tmp_path: Path):
+    spec = make_spec(tmp_path, raw_dir=tmp_path / "r\x00w")
+    got = CodexAdapter().parse(spec, 0, FIX / "codex/fresh.stdout")
+    assert got.native_error is None
+    assert got.structured is None
+    assert got.notes == ("no structured result",)
+
+
+@pytest.mark.parametrize("payload", [
+    '{"type":"step_finish","sessionID":"s"}\u2028\n',
+    '\xa0{"type":"step_finish","sessionID":"s"}\n',
+    '{"type":"step_finish","sessionID":"s"}\u0085\n',
+])
+def test_opencode_strip_is_json_whitespace_only(payload, tmp_path: Path):
+    out = tmp_path / "w.stdout"
+    out.write_bytes(payload.encode("utf-8"))
+    got = OpencodeAdapter().parse(make_spec(tmp_path), 0, out)
+    assert got.session_id is None
+    assert got.native_error == "no events"
+    assert got.notes == ("skipped 1 non-JSON lines",)
+
+
+def test_codex_trailing_separator_on_every_line(tmp_path: Path):
+    data = (FIX / "codex/fresh.stdout").read_bytes().replace(b"\n", "\u2029\n".encode("utf-8"))
+    out = tmp_path / "w.stdout"
+    out.write_bytes(data)
+    spec = make_spec(tmp_path)
+    (spec.raw_dir / "last-message.json").write_bytes(b"{}")
+    got = CodexAdapter().parse(spec, 0, out)
+    assert got.session_id is None
+    assert got.native_error == "no events"
+
+
+def test_claude_trailing_separator_is_invalid_json(tmp_path: Path):
+    out = tmp_path / "w.stdout"
+    out.write_bytes((FIX / "claude/fresh.stdout").read_bytes() + "\u2028".encode("utf-8"))
+    got = ClaudeAdapter().parse(make_spec(tmp_path), 0, out)
+    assert got.native_error == "invalid JSON"
+    assert got.structured is None
+
+
+def test_agy_leading_ideographic_space_is_invalid_json(tmp_path: Path):
+    out = tmp_path / "w.stdout"
+    out.write_bytes("\u3000".encode("utf-8") + (FIX / "agy/fresh.stdout").read_bytes())
+    got = AgyAdapter().parse(make_spec(tmp_path), 0, out)
+    assert got.native_error == "invalid JSON"
+    assert got.structured is None
+
+
+def test_last_message_trailing_nbsp_is_not_an_object(tmp_path: Path):
+    out = tmp_path / "w.stdout"
+    out.write_bytes((FIX / "codex/fresh.stdout").read_bytes())
+    spec = make_spec(tmp_path)
+    (spec.raw_dir / "last-message.json").write_bytes('{"status":"done"}\xa0'.encode("utf-8"))
+    got = CodexAdapter().parse(spec, 0, out)
+    assert got.native_error is None
+    assert got.structured is None
+    assert got.notes == ("structured result is not a JSON object",)
+
+
+def test_nan_line_is_skipped(tmp_path: Path):
+    out = tmp_path / "n.stdout"
+    out.write_bytes(b'{"type":"step_finish","sessionID":"s"}\n{"x":NaN}\n')
+    got = OpencodeAdapter().parse(make_spec(tmp_path), 0, out)
+    assert got.native_error is None
+    assert got.session_id == "s"
+    assert got.notes == ("skipped 1 non-JSON lines",)
+
+
+@pytest.mark.parametrize("name", ["claude", "agy"])
+def test_nan_document_is_invalid_json(name, tmp_path: Path):
+    out = tmp_path / "n.stdout"
+    out.write_bytes(
+        b'{"session_id":"s","conversation_id":"s","is_error":false,'
+        b'"status":"SUCCESS","x":NaN}'
+    )
+    got = ADAPTERS[name].parse(make_spec(tmp_path), 0, out)
+    assert got.native_error == "invalid JSON"
+    assert got.structured is None
+
+
+def test_nan_last_message_is_not_an_object(tmp_path: Path):
+    out = tmp_path / "n.stdout"
+    out.write_bytes((FIX / "codex/fresh.stdout").read_bytes())
+    spec = make_spec(tmp_path)
+    (spec.raw_dir / "last-message.json").write_bytes(b'{"x":NaN}')
+    got = CodexAdapter().parse(spec, 0, out)
+    assert got.native_error is None
+    assert got.structured is None
+    assert got.notes == ("structured result is not a JSON object",)
+
+
+def test_agy_missing_status_is_failure(tmp_path: Path):
+    out = tmp_path / "m.stdout"
+    out.write_text(json.dumps({"conversation_id": "c1", "structured_output": {"a": 1}}))
+    got = AgyAdapter().parse(make_spec(tmp_path), 0, out)
+    assert got.session_id == "c1"
+    assert got.structured is None
+    assert got.native_error == "turn did not complete"

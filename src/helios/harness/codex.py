@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
 from helios.harness.base import Harness, LaunchSpec, NativeResult
 
 LAST_MESSAGE = "last-message.json"
+STRIP_CHARS = " \t\r\n"
 
 
 class CodexAdapter(Harness):
@@ -47,9 +50,8 @@ class CodexAdapter(Harness):
         self, spec: LaunchSpec, exit_code: int | None, stdout_path: Path
     ) -> NativeResult:
         """Parse the JSON lines stdout (SPEC §6.4)."""
-        try:
-            data = stdout_path.read_bytes()
-        except OSError:
+        data = _read_bytes(stdout_path)
+        if data is None:
             return NativeResult(session_id=None, structured=None, native_error="no stdout")
         events, skipped = _parse_lines(data)
         notes: list[str] = []
@@ -89,15 +91,17 @@ class CodexAdapter(Harness):
                 notes=tuple(notes),
             )
         path = spec.raw_dir / LAST_MESSAGE
-        try:
-            raw = path.read_bytes()
-        except OSError:
+        raw = _read_bytes(path)
+        if raw is None:
             notes.append("no structured result")
             return NativeResult(
                 session_id=session_id, structured=None, notes=tuple(notes)
             )
         try:
-            structured: Any = json.loads(raw.decode("utf-8").strip())
+            structured: Any = json.loads(
+                raw.decode("utf-8").strip(STRIP_CHARS),
+                parse_constant=_reject_constant,
+            )
         except Exception:
             notes.append("structured result is not a JSON object")
             return NativeResult(
@@ -131,12 +135,12 @@ def _parse_lines(data: bytes) -> tuple[list[dict[str, Any]], int]:
         except UnicodeDecodeError:
             skipped += 1
             continue
-        stripped = line.strip()
+        stripped = line.strip(STRIP_CHARS)
         if not stripped:
             skipped += 1
             continue
         try:
-            value = json.loads(stripped)
+            value = json.loads(stripped, parse_constant=_reject_constant)
         except Exception:
             skipped += 1
             continue
@@ -145,6 +149,21 @@ def _parse_lines(data: bytes) -> tuple[list[dict[str, Any]], int]:
             continue
         events.append(value)
     return events, skipped
+
+
+def _read_bytes(path: Path) -> bytes | None:
+    """Read a regular file, else None (SPEC §6.4)."""
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return None
+        return path.read_bytes()
+    except (OSError, ValueError):
+        return None
+
+
+def _reject_constant(value: str) -> Any:
+    """Reject NaN, Infinity and -Infinity (SPEC §6.4)."""
+    raise ValueError(f"invalid constant {value!r}")
 
 
 def _exit_failed(exit_code: int | None) -> bool:
