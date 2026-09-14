@@ -35,6 +35,7 @@ def _repo(tmp_path: Path) -> tuple[Path, Path]:
     worktree = tmp_path / "worktree" / "b1"
     worktree.parent.mkdir()
     _git(hub, "worktree", "add", "-b", "worktree-b1", str(worktree), "main")
+    _git(hub, "worktree", "lock", "--reason", "keep", str(worktree))
     (worktree / "value.txt").write_text("merged\n")
     _git(worktree, "add", ".")
     _git(worktree, "commit", "-m", "change")
@@ -241,13 +242,23 @@ def test_held_lock_is_exit_two(tmp_path: Path) -> None:
         _assert_refusal(beads, hub, lambda: _run(beads, hub))
 
 
-def test_refusal_removes_the_lock_it_created(tmp_path: Path) -> None:
+def test_refusal_never_unlinks_the_lock_file(tmp_path: Path) -> None:
+    """SPEC 12 item 3: the lock file is runtime state, never removed, so a second
+    holder that flocks the same inode after a refusal still excludes the next run."""
     hub, worktree = _repo(tmp_path)
     beads = _beads(hub, worktree)
     beads.beads["v1"].metadata["verdict"] = "inconclusive"
     with pytest.raises(MergeError):
         _run(beads, hub)
-    assert not (hub / ".helios" / "runs" / "b1").exists()
+    lock_path = hub / ".helios" / "runs" / "b1" / "lock"
+    assert lock_path.exists()
+    with lock_path.open("r+") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        beads.beads["v1"].metadata["verdict"] = "verified"
+        with pytest.raises(MergeError) as error:
+            _run(beads, hub)
+        assert error.value.code == 2
+        assert str(error.value) == "merge lock is held"
 
 
 def test_dry_run_creates_no_lock_directory(tmp_path: Path) -> None:
@@ -265,16 +276,64 @@ def test_dirty_beads_export_in_hub_still_merges(tmp_path: Path) -> None:
     assert (code, message) == (0, "merged")
 
 
-def test_clean_check_ignores_beads_export_in_hub_and_worktree(tmp_path: Path) -> None:
+def test_clean_check_ignores_beads_export_in_hub_only(tmp_path: Path) -> None:
+    """SPEC 12 item 7: `.beads/` dirt is ignored in the hub only; in the worktree it
+    is dirt like any other path."""
     hub, worktree = _repo(tmp_path)
     import helios.merge as merge_module
 
-    assert merge_module._clean(hub) is True
-    assert merge_module._clean(worktree) is True
+    assert merge_module._clean(hub, ignore_beads=True) is True
+    assert merge_module._clean(worktree, ignore_beads=False) is True
     (hub / ".beads" / "issues.jsonl").write_text('{"dirtied": true}\n')
     (worktree / ".beads" / "issues.jsonl").write_text('{"dirtied": true}\n')
-    assert merge_module._clean(hub) is True
-    assert merge_module._clean(worktree) is True
+    assert merge_module._clean(hub, ignore_beads=True) is True
+    assert merge_module._clean(worktree, ignore_beads=False) is False
+
+
+def test_worktree_beads_dirt_refuses_merge(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    (worktree / ".beads" / "issues.jsonl").write_text('{"dirtied": true}\n')
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == "hub or worktree is dirty"
+
+
+def test_branch_changing_beads_refuses_merge(tmp_path: Path) -> None:
+    """SPEC 12 item 7: the branch itself must not touch `.beads/`, even committed."""
+    hub, worktree = _repo(tmp_path)
+    (worktree / ".beads" / "issues.jsonl").write_text('{"branch": true}\n')
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "touch beads")
+    beads = _beads(hub, worktree)
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == "branch changes .beads/"
+
+
+def test_clean_parser_treats_rename_into_beads_as_dirty(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    import helios.merge as merge_module
+
+    _git(hub, "mv", "value.txt", ".beads/value.txt")
+    assert merge_module._clean(hub, ignore_beads=True) is False
+
+
+def test_clean_parser_arrow_named_directory_is_not_confused_with_beads(tmp_path: Path) -> None:
+    """SPEC 12 item 6: `-z` parsing must not fall for a directory literally named
+    `x -> .beads`, the way a naive `" -> "` string split would."""
+    hub, worktree = _repo(tmp_path)
+    import helios.merge as merge_module
+
+    d = hub / "x -> .beads"
+    d.mkdir()
+    (d / "y").write_text("1\n")
+    _git(hub, "add", "-A")
+    _git(hub, "commit", "-m", "arrow dir")
+    (d / "y").write_text("2\n")
+    assert merge_module._clean(hub, ignore_beads=True) is False
 
 
 def test_missing_worktree_without_recovery_is_step_two_refusal(tmp_path: Path) -> None:
@@ -638,6 +697,244 @@ def test_bad_workflow_toml_is_exit_two_not_a_traceback(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err.startswith("helios: ")
+
+
+# ---------------------------------------------------------------- item 1: step 2
+# precedes step 8, so recovery never destroys a dirty worktree.
+
+
+def test_dirty_worktree_refuses_before_recovery_runs(tmp_path: Path, monkeypatch) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    import helios.merge as merge_module
+
+    original = merge_module._git
+
+    def crash_after_ff(cwd: Path, *args: str):
+        result = original(cwd, *args)
+        if cwd == hub and args == ("merge", "--ff-only", "worktree-b1") and result.returncode == 0:
+            raise RuntimeError("crash")
+        return result
+
+    monkeypatch.setattr(merge_module, "_git", crash_after_ff)
+    with pytest.raises(RuntimeError):
+        _run(beads, hub)
+    monkeypatch.setattr(merge_module, "_git", original)
+    (worktree / "value.txt").write_text("uncommitted user edit\n")
+    with pytest.raises(MergeError) as dry_error:
+        _run(beads, hub, dry_run=True)
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert dry_error.value.code == 2
+    assert error.value.code == 2
+    assert str(error.value) == "hub or worktree is dirty"
+    assert worktree.exists()
+
+
+# Item 2 (unlock a missing, locked worktree registration before pruning and
+# deleting the branch) is covered by test_stale_worktree_registration_is_pruned_
+# before_branch_removal above, now that `_repo` locks the worktree per SPEC 7.3.
+
+# ---------------------------------------------------------------- item 4: output
+# streams (checks captured, failure detail, no bead, generic exceptions).
+
+
+def test_check_failure_reports_last_lines_of_captured_output(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    project = ProjectConfig(worktrees="../worktree", test="echo OUT; echo ERR 1>&2; exit 7")
+    with pytest.raises(MergeError) as error:
+        merge_bead(hub, "b1", project=project, beads=beads, input_hashes=lambda _b: {})
+    assert error.value.code == 5
+    assert str(error.value) == "test failed with exit 7\nOUT\nERR"
+
+
+def test_command_discards_successful_check_output(tmp_path: Path, monkeypatch, capsys) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    project = ProjectConfig(worktrees="../worktree", test="echo NOISY-OUT; echo NOISY-ERR 1>&2")
+    import helios.commands.merge as command
+    from helios.config import Config
+
+    monkeypatch.setattr(command, "load", lambda _cwd: Config(hub=hub, project=project))
+    monkeypatch.setattr(command, "Beads", lambda _hub: beads)
+    assert command.run(Namespace(bead="b1", dry_run=False)) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "merged\n"
+    assert captured.err == ""
+
+
+def test_command_prints_prefixed_failure_output_from_noisy_check(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    project = ProjectConfig(
+        worktrees="../worktree", test="echo NOISY-OUT; echo NOISY-ERR 1>&2; exit 3"
+    )
+    import helios.commands.merge as command
+    from helios.config import Config
+
+    monkeypatch.setattr(command, "load", lambda _cwd: Config(hub=hub, project=project))
+    monkeypatch.setattr(command, "Beads", lambda _hub: beads)
+    assert command.run(Namespace(bead="b1", dry_run=False)) == 5
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "helios: test failed with exit 3\nhelios: NOISY-OUT\nhelios: NOISY-ERR\n"
+
+
+def test_command_unknown_bead_prints_no_bead_and_exits_two(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    import helios.commands.merge as command
+    from helios.config import Config
+
+    monkeypatch.setattr(command, "load", lambda _cwd: Config(hub=hub, project=_project()))
+    monkeypatch.setattr(command, "Beads", lambda _hub: beads)
+    assert command.run(Namespace(bead="nope", dry_run=False)) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "helios: no bead nope\n"
+
+
+def test_command_generic_exception_prints_message_and_exits_one(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    hub, worktree = _repo(tmp_path)
+
+    class Boom:
+        def show(self, _bead_id: str):
+            raise OSError("disk exploded")
+
+    import helios.commands.merge as command
+    from helios.config import Config
+
+    monkeypatch.setattr(command, "load", lambda _cwd: Config(hub=hub, project=_project()))
+    monkeypatch.setattr(command, "Beads", lambda _hub: Boom())
+    assert command.run(Namespace(bead="b1", dry_run=False)) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "helios: disk exploded\n"
+
+
+def test_command_unreadable_workflow_toml_exits_one(tmp_path: Path, monkeypatch, capsys) -> None:
+    (tmp_path / ".agents").mkdir()
+    toml_path = tmp_path / ".agents" / "workflow.toml"
+    toml_path.write_text("[project]\n")
+    toml_path.chmod(0)
+    import helios.commands.merge as command
+
+    monkeypatch.chdir(tmp_path)
+    try:
+        assert command.run(Namespace(bead="b1", dry_run=False)) == 1
+    finally:
+        toml_path.chmod(0o644)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("helios: ")
+
+
+def test_push_rejection_stderr_is_fully_prefixed(tmp_path: Path, monkeypatch, capsys) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "--bare", str(origin))
+    _git(hub, "remote", "add", "origin", str(origin))
+    hook = origin / "hooks" / "pre-receive"
+    hook.write_text("#!/bin/sh\necho 'line one' >&2\necho 'line two' >&2\nexit 1\n")
+    hook.chmod(0o755)
+    import helios.commands.merge as command
+    from helios.config import Config
+
+    project = ProjectConfig(worktrees="../worktree", test="true", typecheck="")
+    monkeypatch.setattr(command, "load", lambda _cwd: Config(hub=hub, project=project))
+    monkeypatch.setattr(command, "Beads", lambda _hub: beads)
+    assert command.run(Namespace(bead="b1", dry_run=False)) == 4
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err != ""
+    assert all(line.startswith("helios: ") for line in captured.err.splitlines())
+
+
+# ---------------------------------------------------------------- item 5: a rebase
+# failure that is not a conflict.
+
+
+def test_rebase_failure_without_conflict_is_exit_four(tmp_path: Path, monkeypatch) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    import helios.merge as merge_module
+
+    monkeypatch.setattr(merge_module, "_clean", lambda _path, ignore_beads=True: True)
+    (worktree / "value.txt").write_text("unstaged local edit\n")
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 4
+    assert str(error.value).startswith("rebase failed:")
+    rebase_merge = _git(worktree, "rev-parse", "--git-path", "rebase-merge")
+    rebase_apply = _git(worktree, "rev-parse", "--git-path", "rebase-apply")
+    assert not (worktree / rebase_merge).exists()
+    assert not (worktree / rebase_apply).exists()
+
+
+# ---------------------------------------------------------------- item 8: only a
+# verified commit merges.
+
+
+def test_worktree_on_wrong_branch_refuses_merge(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    _git(worktree, "checkout", "-b", "rogue")
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == "worktree is not on branch worktree-b1"
+
+
+def test_worktree_head_ahead_of_output_commit_refuses_merge(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    (worktree / "extra.txt").write_text("unverified\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "after verification")
+    new_head = _git(worktree, "rev-parse", "HEAD")
+    old_commit = beads.beads["b1"].metadata["output_commit"]
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == f"worktree HEAD {new_head} is not the verified output_commit {old_commit}"
+
+
+# ---------------------------------------------------------------- item 9: a second
+# merge with a new verified commit is a fresh merge, not a recovery.
+
+
+def test_second_merge_with_new_verified_commit_creates_new_markers(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    assert _run(beads, hub) == (0, "merged")
+    first_main_before = beads.beads["b1"].metadata["merge_main_before"]
+
+    _git(hub, "worktree", "add", str(worktree), "-b", "worktree-b1", "main")
+    (worktree / "second.txt").write_text("second\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "second change")
+    new_head = _git(worktree, "rev-parse", "HEAD")
+    beads.beads["b1"].metadata["output_commit"] = new_head
+    _new_envelope(hub, worktree)
+
+    assert _run(beads, hub) == (0, "merged")
+    assert _git(hub, "show", "main:second.txt") == "second"
+    assert _git(hub, "show", "main:value.txt") == "merged"
+    second_main_before = beads.beads["b1"].metadata["merge_main_before"]
+    second_merge_commit = beads.beads["b1"].metadata["merge_commit"]
+    assert second_main_before != first_main_before
+    assert second_merge_commit == new_head
+    texts = [comment.text for comment in beads.comments("b1")]
+    assert texts.count(f"merge: [b1@{first_main_before}:merged] merged") == 1
+    assert texts.count(f"merge: [b1@{second_main_before}:merged] merged") == 1
 
 
 BD = shutil.which("bd")

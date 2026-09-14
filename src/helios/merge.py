@@ -36,8 +36,26 @@ def _git_output(cwd: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def _default_runner(command: str, cwd: Path) -> int:
-    return subprocess.run(["bash", "-c", command], cwd=cwd, check=False).returncode
+class _DefaultRunner:
+    """Runs a project check command with output captured, never inherited (SPEC 12 item 4).
+
+    `last_output` holds the combined stdout and stderr of the most recent call, so a
+    caller can report it on failure; a caller that only wants the exit code (most
+    tests) can ignore it, and success discards it.
+    """
+
+    def __init__(self) -> None:
+        self.last_output = ""
+
+    def __call__(self, command: str, cwd: Path) -> int:
+        proc = subprocess.run(
+            ["bash", "-c", command], cwd=cwd, capture_output=True, text=True, check=False
+        )
+        self.last_output = proc.stdout + proc.stderr
+        return proc.returncode
+
+
+_default_runner = _DefaultRunner()
 
 
 def _default_hashes(bead: Bead) -> dict[str, str]:
@@ -54,12 +72,29 @@ def _comment(beads: BeadsLike, bead: str, marker: str, detail: str) -> None:
         beads.add_comment(bead, text)
 
 
-def _clean(path: Path) -> bool:
-    status = _git_output(path, "status", "--porcelain", "--untracked-files=no")
-    for line in status.splitlines():
-        changed = line[2:].strip() if len(line) > 2 else ""
-        changed = changed.rsplit(" -> ", 1)[-1]
-        if changed == ".beads" or changed.startswith(".beads/"):
+def _clean(path: Path, ignore_beads: bool = True) -> bool:
+    """True when `path` has no changes, dropping `.beads/` paths only when `ignore_beads`.
+
+    Parses `git status --porcelain=v1 -z`: entries are NUL separated, and a rename or
+    copy entry carries a second, NUL-terminated path (its original path), so a rename
+    into `.beads/` from elsewhere still counts as a change.
+    """
+    proc = _git(path, "status", "--porcelain=v1", "-z", "--untracked-files=no")
+    if proc.returncode:
+        raise MergeError(proc.stderr.strip() or "git status failed", 4)
+    tokens = proc.stdout.split("\0")
+    i = 0
+    while i < len(tokens):
+        entry = tokens[i]
+        i += 1
+        if not entry:
+            continue
+        code, changed = entry[:2], entry[3:]
+        paths = [changed]
+        if ("R" in code or "C" in code) and i < len(tokens):
+            paths.append(tokens[i])
+            i += 1
+        if ignore_beads and all(p == ".beads" or p.startswith(".beads/") for p in paths):
             continue
         return False
     return True
@@ -100,17 +135,32 @@ def _verify_evidence(hub: Path, runs: str, impl: Bead, beads: BeadsLike, hashes:
             raise MergeError("verify envelope is stale")
 
 
+def _worktree_registered(hub: Path, path: Path) -> bool:
+    """True when `git worktree list` still lists `path`, whether or not it exists on disk."""
+    listing = _git_output(hub, "worktree", "list", "--porcelain")
+    target = str(path)
+    prefix = "worktree "
+    return any(line[len(prefix):] == target for line in listing.splitlines() if line.startswith(prefix))
+
+
 def _remove_worktree(hub: Path, path: Path, branch: str) -> None:
+    """Step 7 cleanup: unlock (even a missing path), remove, prune, then delete the branch.
+
+    Each action is skipped when its target is already gone, so a rerun after a crash
+    during step 7 exits 0 (SPEC 12).
+    """
+    if _worktree_registered(hub, path):
+        unlocked = _git(hub, "worktree", "unlock", str(path))
+        if unlocked.returncode not in (0, 128):
+            raise MergeError(unlocked.stderr.strip() or "worktree unlock failed", 4)
     if path.exists() or path.is_symlink():
-        if _git(hub, "worktree", "unlock", str(path)).returncode not in (0, 128):
-            raise MergeError("worktree unlock failed", 4)
         proc = _git(hub, "worktree", "remove", "--force", str(path))
         if proc.returncode:
             raise MergeError(proc.stderr.strip() or "worktree removal failed", 4)
+    pruned = _git(hub, "worktree", "prune")
+    if pruned.returncode:
+        raise MergeError(pruned.stderr.strip() or "worktree prune failed", 4)
     if _git(hub, "show-ref", "--verify", f"refs/heads/{branch}").returncode == 0:
-        pruned = _git(hub, "worktree", "prune")
-        if pruned.returncode:
-            raise MergeError(pruned.stderr.strip() or "worktree prune failed", 4)
         proc = _git(hub, "branch", "-d", branch)
         if proc.returncode:
             raise MergeError(proc.stderr.strip() or "branch removal failed", 4)
@@ -143,16 +193,16 @@ def merge_bead(
     input_hashes: HashFunction = _default_hashes,
     dry_run: bool = False,
 ) -> tuple[int, str]:
-    """Integrate one closed implementation bead, returning ``(exit_code, message)``."""
+    """Integrate one closed implementation bead, returning ``(exit_code, message)``.
+
+    Steps run in the order 1, 2, 8, 3, 4, 5, 6, 7 (SPEC 12).
+    """
     bead = beads.show(bead_id)
     runs_dir = hub / project.runs / bead_id
     lock_path = runs_dir / "lock"
     lock: TextIO | None = None
-    created_lock = False
-    wrote = False
     if not dry_run:
         runs_dir.mkdir(parents=True, exist_ok=True)
-        created_lock = not lock_path.exists()
         lock = lock_path.open("a+")
     elif lock_path.exists():
         lock = lock_path.open("r+")
@@ -163,49 +213,113 @@ def merge_bead(
             lock.close()
             raise MergeError("merge lock is held", 2) from exc
     try:
+        # Step 1: evidence.
         _verify_evidence(hub, project.runs, bead, beads, input_hashes)
+
+        branch = f"worktree-{bead_id}"
         worktree = (hub / project.worktrees / bead_id).resolve()
+
+        # Step 2: hub on main, both trees clean (the worktree only when it exists).
         branch_check = _git(hub, "symbolic-ref", "--short", "HEAD")
         if branch_check.returncode or branch_check.stdout.strip() != "main":
             raise MergeError("hub is not on main")
-        if not _clean(hub):
+        if not _clean(hub, ignore_beads=True):
             raise MergeError("hub or worktree is dirty")
-        branch = f"worktree-{bead_id}"
+        worktree_exists = worktree.is_dir()
+        if worktree_exists and not _clean(worktree, ignore_beads=False):
+            raise MergeError("hub or worktree is dirty")
+
+        # Step 8: recovery, only when a completed merge is on main and the worktree
+        # holds nothing beyond it (missing, or its HEAD is an ancestor of merge_commit).
         merge_commit = bead.metadata.get("merge_commit")
-        if merge_commit and _git(hub, "merge-base", "--is-ancestor", str(merge_commit), "main").returncode == 0:
+        merge_commit_completed = bool(merge_commit) and _git(
+            hub, "merge-base", "--is-ancestor", str(merge_commit), "main"
+        ).returncode == 0
+        recovering = False
+        if merge_commit_completed:
+            if not worktree_exists:
+                recovering = True
+            else:
+                wt_head = _git_output(worktree, "rev-parse", "HEAD")
+                recovering = _git(hub, "merge-base", "--is-ancestor", wt_head, str(merge_commit)).returncode == 0
+
+        if recovering:
             main_before = str(bead.metadata.get("merge_main_before", _git_output(hub, "rev-parse", "main")))
             marker = f"[{bead_id}@{main_before}:"
             if dry_run:
                 return 0, "would recover and remove worktree"
-            wrote = True
             _comment(beads, bead_id, marker + "merged]", "merged")
             _finish_step7(hub, worktree, branch, beads, bead_id, marker)
             return 0, "recovered"
-        if not worktree.is_dir():
+
+        if not worktree_exists:
             raise MergeError(f"worktree missing for {bead_id}")
-        if not _clean(worktree):
-            raise MergeError("hub or worktree is dirty")
+
+        # Step 3's own main_before, computed fresh every call. When it matches the
+        # stored value from an earlier, not-yet-merge_commit-completed call, this is
+        # a rerun continuing that same attempt after a crash: its rebase may already
+        # have replayed the worktree onto main, changing its HEAD, so the checks
+        # below (which only make sense before the first rebase of an attempt) do
+        # not re-run against the now-superseded output_commit.
         main_before = _git_output(hub, "rev-parse", "main")
+        continuing = not merge_commit_completed and str(bead.metadata.get("merge_main_before", "")) == main_before
+
+        if not continuing:
+            # Only a verified commit merges: the worktree must sit on its own
+            # branch, at exactly the commit the verify evidence covers.
+            current_branch = _git(worktree, "symbolic-ref", "--short", "HEAD")
+            if current_branch.returncode or current_branch.stdout.strip() != branch:
+                raise MergeError(f"worktree is not on branch {branch}")
+            head = _git_output(worktree, "rev-parse", "HEAD")
+            output_commit = bead.metadata.get("output_commit")
+            if head != output_commit:
+                raise MergeError(f"worktree HEAD {head} is not the verified output_commit {output_commit}")
+            # Diff against the merge base, falling back to git's well-known empty
+            # tree hash when the branch shares no history with main (an orphan
+            # branch), so this still lists every path the branch introduces.
+            merge_base = _git(hub, "merge-base", "main", branch)
+            base_ref = merge_base.stdout.strip() if merge_base.returncode == 0 else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+            diff_paths = _git_output(hub, "diff", "--name-only", base_ref, branch).splitlines()
+            if any(p == ".beads" or p.startswith(".beads/") for p in diff_paths):
+                raise MergeError("branch changes .beads/")
+
+        # Step 3: record main_before, then rebase.
         marker = f"[{bead_id}@{main_before}:"
         if dry_run:
             return 0, "would rebase, test, merge, push, and remove"
-        wrote = True
         beads.set_metadata(bead_id, {"merge_main_before": main_before})
         rebase = _git(worktree, "rebase", "main")
         if rebase.returncode:
-            _git(worktree, "rebase", "--abort")
-            beads.set_state(bead_id, "run", "conflict", "rebase conflict")
-            _comment(beads, bead_id, marker + "conflict]", "conflict")
-            raise MergeError("rebase conflict", 3)
+            rebase_merge = _git_output(worktree, "rev-parse", "--git-path", "rebase-merge")
+            rebase_apply = _git_output(worktree, "rev-parse", "--git-path", "rebase-apply")
+            in_progress = (worktree / rebase_merge).exists() or (worktree / rebase_apply).exists()
+            if in_progress:
+                _git(worktree, "rebase", "--abort")
+                beads.set_state(bead_id, "run", "conflict", "rebase conflict")
+                _comment(beads, bead_id, marker + "conflict]", "conflict")
+                raise MergeError("rebase conflict", 3)
+            detail = "\n".join(["rebase failed:", *rebase.stderr.strip().splitlines()])
+            raise MergeError(detail, 4)
         _comment(beads, bead_id, marker + "rebased]", "rebased")
+
+        # Step 4: checks.
         for name, command in (("test", project.test), ("typecheck", project.typecheck)):
-            if command and check_runner(command, worktree) != 0:
+            if not command:
+                continue
+            exit_code = check_runner(command, worktree)
+            if exit_code != 0:
                 _comment(beads, bead_id, marker + "test-failed]", "test-failed")
-                raise MergeError(f"{name} failed", 5)
+                output = getattr(check_runner, "last_output", "")
+                tail = output.splitlines()[-50:]
+                raise MergeError("\n".join([f"{name} failed with exit {exit_code}", *tail]), 5)
         _comment(beads, bead_id, marker + "tested]", "tested")
+
+        # Step 5: main must not have moved during the checks.
         if _git_output(hub, "rev-parse", "main") != main_before:
             _comment(beads, bead_id, marker + "main-moved]", "main-moved")
             raise MergeError("main moved during checks", 3)
+
+        # Step 6: record merge_commit before the fast-forward merge.
         commit = _git_output(worktree, "rev-parse", "HEAD")
         beads.set_metadata(bead_id, {"merge_commit": commit})
         merged = _git(hub, "merge", "--ff-only", branch)
@@ -216,15 +330,11 @@ def merge_bead(
                 raise MergeError("main moved during merge", 3)
             raise MergeError(merged.stderr.strip() or "fast-forward merge failed", 4)
         _comment(beads, bead_id, marker + "merged]", "merged")
+
+        # Step 7: push (if origin exists) and remove the worktree.
         _finish_step7(hub, worktree, branch, beads, bead_id, marker)
         return 0, "merged"
     finally:
         if lock is not None:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             lock.close()
-        if created_lock and not wrote and lock_path.exists():
-            lock_path.unlink()
-            try:
-                runs_dir.rmdir()
-            except OSError:
-                pass
