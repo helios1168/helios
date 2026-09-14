@@ -34,7 +34,9 @@ def safe_state(directory: Path) -> dict[str, Any]:
             raise ValueError("invalid state")
         normalized = dict(state)
         pid = normalized.get("pid")
-        normalized["pid"] = pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else None
+        normalized["pid"] = (
+            pid if isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 2**31 else None
+        )
         session_id = normalized.get("session_id")
         normalized["session_id"] = session_id if isinstance(session_id, str) else None
         execution_status = normalized.get("execution_status")
@@ -42,7 +44,7 @@ def safe_state(directory: Path) -> dict[str, Any]:
         normalized["attempt_id"] = normalized["attempt_id"] if isinstance(normalized.get("attempt_id"), str) else None
         normalized["updated"] = normalized["updated"] if isinstance(normalized.get("updated"), str) else None
         return normalized
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, RecursionError):
         return {"state": "allocated", "attempt_id": None, "pid": None,
                 "session_id": None, "updated": None}
 
@@ -51,7 +53,7 @@ def _input(directory: Path) -> dict[str, Any]:
     try:
         value = json.loads((directory / "input.json").read_text())
         return value if isinstance(value, dict) else {}
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, RecursionError):
         return {}
 
 
@@ -88,14 +90,18 @@ def _last_event(hub: Path, bead: str, attempt_id: str | None) -> str | None:
         except UnicodeDecodeError:
             continue
         try:
-            value = json.loads(line)
-        except (TypeError, json.JSONDecodeError):
+            value = json.loads(line, parse_constant=_reject_constant)
+        except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
             continue
         if not isinstance(value, dict):
             continue
         if value.get("bead") == bead and value.get("attempt") == attempt_id:
             result = value.get("type")
     return result
+
+
+def _reject_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant {value}")
 
 
 def rows(hub: Path, runs_rel: str, *, bead_store: beads.BeadsLike | None = None,
@@ -106,6 +112,7 @@ def rows(hub: Path, runs_rel: str, *, bead_store: beads.BeadsLike | None = None,
         return []
     out: list[dict[str, Any]] = []
     store = bead_store or beads.Beads(hub)
+    worktree_root = hub / config.load(hub).project.worktrees
     for bead_dir in sorted((p for p in runs.iterdir() if p.is_dir()), key=lambda p: p.name):
         directory = latest(runs, bead_dir.name)
         if directory is None:
@@ -125,11 +132,11 @@ def rows(hub: Path, runs_rel: str, *, bead_store: beads.BeadsLike | None = None,
         pid = state.get("pid")
         alive = attempt.is_pid_alive(pid) if pid is not None else False
         stored = state["state"]
-        shown_state = f"{stored} (dead)" if stored == "launched" and pid is not None and not alive else stored
         attempt_id = state.get("attempt_id") or f"{bead_dir.name}#{directory.name.removeprefix('attempt-')}"
         row = {"bead": bead_dir.name, "unit": unit, "kind": kind, "harness": harness,
-               "state": shown_state, "attempt": attempt_id,
-               "age": _age(state.get("updated"), now), "worktree": inp.get("worktree") or None,
+               "state": stored, "attempt": attempt_id,
+               "age": _age(state.get("updated"), now),
+               "worktree": str(worktree_root / bead_dir.name) if (worktree_root / bead_dir.name).is_dir() else None,
                "session": session, "alive": alive,
                "last_event": _last_event(hub, bead_dir.name, attempt_id)}
         out.append(row)
@@ -144,16 +151,17 @@ def attach(hub: Path, runs_rel: str, bead: str, *, harness_lookup: Callable[[str
         raise ValueError(f"no attempt for {bead}")
     inp, state = _input(directory), safe_state(directory)
     project_config = config.load(hub)
+    attempt_number = directory.name.removeprefix("attempt-")
+    attempt_id = state.get("attempt_id") or f"{bead}#{attempt_number}"
     harness_name = inp.get("harness")
-    if not harness_name:
-        raise ValueError(f"no harness recorded for {state.get('attempt_id')}")
+    if not isinstance(harness_name, str) or not harness_name:
+        raise ValueError(f"no harness recorded for {attempt_id}")
     worktree = hub / project_config.project.worktrees / bead
     if not worktree.is_dir():
-        raise ValueError(f"worktree missing for {state.get('attempt_id')}")
+        raise ValueError(f"worktree missing for {attempt_id}")
     session_id = state.get("session_id")
     if session_id is None:
-        raise ValueError(f"no session recorded for {state.get('attempt_id')}")
-    attempt_number = directory.name.removeprefix("attempt-")
+        raise ValueError(f"no session recorded for {attempt_id}")
     if not attempt_number.isdigit():
         raise ValueError(f"invalid attempt directory {directory.name}")
     n = int(attempt_number)

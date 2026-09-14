@@ -26,5 +26,8 @@ def run(args) -> int:
     columns = ("bead", "unit", "kind", "harness", "state", "attempt", "age", "worktree", "session")
     print("\t".join(columns))
     for row in rows:
-        print("\t".join(str(row[key]) if row[key] is not None else "-" for key in columns))
+        values = dict(row)
+        if values["state"] == "launched" and not values["alive"]:
+            values["state"] = "launched (dead)"
+        print("\t".join(str(values[key]) if values[key] is not None else "-" for key in columns))
     return 0

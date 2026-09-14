@@ -22,7 +22,7 @@ def run(args) -> int:
             def lookup(name):
                 raise ValueError("harness lookup unavailable")
         sessions.attach(cfg.hub, cfg.project.runs, args.bead, harness_lookup=lookup)
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, TypeError, ValueError, KeyError) as exc:
         print(f"helios: {exc}", file=__import__("sys").stderr)
         return 2
     return 0

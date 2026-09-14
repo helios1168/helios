@@ -84,7 +84,7 @@ def test_ps_rows_sort_filter_dead_state_events_and_unknowns(tmp_path: Path) -> N
     events.append(tmp_path, source="helios", type="completed", bead="b1", attempt="b1#1")
     rows = sessions.rows(tmp_path, ".helios/runs", bead_store=store)
     assert [row["bead"] for row in rows] == ["b1", "b3"]
-    assert rows[0]["state"] == "launched (dead)"
+    assert rows[0]["state"] == "launched"
     assert rows[0]["last_event"] == "completed"
     assert rows[0]["alive"] is False
     assert rows[1]["harness"] is None and rows[1]["worktree"] is None
@@ -111,11 +111,16 @@ def test_ps_skips_bad_event_lines(tmp_path: Path, line: bytes) -> None:
     assert rows[0]["last_event"] is None
 
 
-def test_ps_naive_and_future_age_are_safe_and_json_null(tmp_path: Path) -> None:
+def test_ps_naive_and_future_age_are_safe_and_json_null(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     directory = _attempt(tmp_path, state="launched", pid=None, updated="2026-01-01T00:00:00")
     rows = sessions.rows(tmp_path, ".helios/runs", bead_store=FakeBeads([Bead(id="b1")]), now=now)
     assert rows[0]["age"] is None and rows[0]["state"] == "launched"
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["ps"]) == 0
+    assert "launched (dead)" in capsys.readouterr().out
     directory = _attempt(tmp_path, n=2, updated="2027-01-01T00:00:00Z")
     rows = sessions.rows(tmp_path, ".helios/runs", bead_store=FakeBeads([Bead(id="b1")]), now=now)
     assert rows[0]["age"] == "0s"

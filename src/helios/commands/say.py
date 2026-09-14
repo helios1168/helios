@@ -24,10 +24,10 @@ def run(args) -> int:
             return 2
         msg_id, queued = messages.say(cfg.hub, cfg.project.runs, args.bead,
                                       args.text, kind=args.kind)
-    except RuntimeError as exc:
+    except (FileNotFoundError, RuntimeError) as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 1
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, TypeError, ValueError, KeyError) as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2
     if queued:
