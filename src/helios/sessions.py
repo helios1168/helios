@@ -95,7 +95,8 @@ def _last_event(hub: Path, bead: str, attempt_id: str | None) -> str | None:
             continue
         if not isinstance(value, dict):
             continue
-        if value.get("bead") == bead and value.get("attempt") == attempt_id:
+        if (value.get("bead") == bead and value.get("attempt") == attempt_id
+                and isinstance(value.get("type"), str)):
             result = value.get("type")
     return result
 
@@ -126,7 +127,8 @@ def rows(hub: Path, runs_rel: str, *, bead_store: beads.BeadsLike | None = None,
         if state["state"] == "finalized" and not in_progress:
             continue
         inp = _input(directory)
-        harness = inp.get("harness") or None
+        raw_harness = inp.get("harness")
+        harness = raw_harness if isinstance(raw_harness, str) and raw_harness else None
         session_id = state.get("session_id")
         session = f"{harness}:{session_id}" if harness is not None and session_id is not None else None
         pid = state.get("pid")

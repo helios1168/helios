@@ -68,6 +68,24 @@ def test_message_without_runs_fails_without_writing(tmp_path: Path) -> None:
     assert not (tmp_path / ".helios").exists()
 
 
+def test_say_cli_unexecutable_bd_is_failed_comment_exit_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    _attempt(tmp_path)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_bd = bin_dir / "bd"
+    fake_bd.write_text("#!/bin/sh\necho hi\n")
+    fake_bd.chmod(0o644)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["say", "b1", "hi"]) == 1
+    assert capsys.readouterr().err == "helios: [Errno 13] Permission denied: 'bd'\n"
+    inbox = list((tmp_path / ".helios" / "runs" / "b1" / "inbox").glob("*.json"))
+    assert len(inbox) == 1
+    assert not (tmp_path / ".helios" / "events.jsonl").exists()
+
+
 def test_ps_rows_sort_filter_dead_state_events_and_unknowns(tmp_path: Path) -> None:
     first = _attempt(tmp_path, "b2", state="finalized", updated=None)
     _input(first, harness="fake", worktree="/wt")
@@ -111,6 +129,36 @@ def test_ps_skips_bad_event_lines(tmp_path: Path, line: bytes) -> None:
     assert rows[0]["last_event"] is None
 
 
+def test_ps_rejects_non_string_harness_and_event_type(tmp_path: Path) -> None:
+    directory = _attempt(tmp_path)
+    (directory / "input.json").write_text('{"harness": ["x"]}')
+    events_path = tmp_path / ".helios" / "events.jsonl"
+    events_path.write_text('{"bead":"b1","attempt":"b1#1","type":5}\n')
+    row = sessions.rows(tmp_path, ".helios/runs", bead_store=FakeBeads([Bead(id="b1")]))[0]
+    assert row["harness"] is None and row["session"] is None and row["last_event"] is None
+
+
+def test_ps_json_is_strict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    directory = _attempt(tmp_path)
+    (directory / "input.json").write_text('{"harness": NaN}')
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["ps", "--json"]) == 0
+    output = capsys.readouterr().out
+    assert json.loads(output, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+
+
+def test_ps_text_shows_dash_for_non_string_harness_and_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    directory = _attempt(tmp_path)
+    (directory / "input.json").write_text('{"harness": ["x"]}')
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["ps"]) == 0
+    header, row = capsys.readouterr().out.splitlines()
+    columns = dict(zip(header.split("\t"), row.split("\t")))
+    assert columns["harness"] == "-" and columns["session"] == "-"
+
+
 def test_ps_naive_and_future_age_are_safe_and_json_null(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
@@ -152,6 +200,17 @@ def test_commands_prefix_configuration_errors(tmp_path: Path, monkeypatch: pytes
     for args in (["ps"], ["attach", "b1"], ["say", "b1", "x"], ["stop", "b1"]):
         assert cli.main(args) == 2
         assert capsys.readouterr().err.startswith("helios: ")
+
+
+def test_commands_prefix_config_recursion_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    (tmp_path / ".agents").mkdir()
+    nested = "x = " + "[" * 5000 + "]" * 5000 + "\n"
+    (tmp_path / ".agents" / "workflow.toml").write_text(nested)
+    monkeypatch.chdir(tmp_path)
+    for args in (["ps"], ["attach", "b1"], ["say", "b1", "x"], ["stop", "b1"]):
+        assert cli.main(args) == 2
+        err = capsys.readouterr().err
+        assert err.startswith("helios: ") and "Traceback" not in err
 
 
 @pytest.mark.parametrize("seconds, expected", [(59, "59s"), (60, "1m"), (3599, "59m"),

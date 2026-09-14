@@ -17,7 +17,7 @@ def run(args) -> int:
     try:
         cfg = config.load(Path.cwd())
         sessions.stop(cfg.hub, cfg.project.runs, args.bead)
-    except (OSError, TypeError, ValueError) as exc:
+    except (OSError, TypeError, ValueError, RecursionError) as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2
     return 0

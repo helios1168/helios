@@ -16,12 +16,12 @@ def add_arguments(parser) -> None:
 def run(args) -> int:
     try:
         cfg = config.load(Path.cwd())
-    except (OSError, TypeError, ValueError) as exc:
+    except (OSError, TypeError, ValueError, RecursionError) as exc:
         print(f"helios: {exc}", file=__import__("sys").stderr)
         return 2
     rows = sessions.rows(cfg.hub, cfg.project.runs)
     if args.as_json:
-        print(json.dumps(rows, sort_keys=True))
+        print(json.dumps(rows, sort_keys=True, allow_nan=False))
         return 0
     columns = ("bead", "unit", "kind", "harness", "state", "attempt", "age", "worktree", "session")
     print("\t".join(columns))
