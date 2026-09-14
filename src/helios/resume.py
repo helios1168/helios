@@ -153,6 +153,12 @@ def resume(
                 bead_id, hub=hub, beads=beads, runs_rel=runs_rel
             )
             harness_name = _harness_of(attempt_dir)
+            # SPEC §7.3: never recreate a bead's worktree from main on
+            # resume (round-2-fix item 3); a verify bead in particular must
+            # keep its parent's output_commit base, not get a fresh one.
+            worktree_path = hub / config.project.worktrees / bead_id
+            if not worktree_path.is_dir():
+                raise ResumeRefusal(f"worktree {worktree_path} is missing")
             info = worktree_mod.prepare(
                 hub=hub,
                 bead=bead_id,
@@ -163,6 +169,10 @@ def resume(
             codes: list[int] = []
             delivered = 0
             for msg_id in _inbox_ids(runs / bead_id / "inbox"):
+                # round-2-fix item 2: never allocate a turn beyond the one
+                # a previous iteration already found interrupted.
+                if run_mod._INTERRUPT.is_set():
+                    return 4
                 if (runs / bead_id / "acks" / msg_id).exists():
                     continue
                 message = _load_message(runs / bead_id / "inbox" / f"{msg_id}.json")
@@ -171,7 +181,17 @@ def resume(
                     continue
                 delivered += 1
                 turn_text = f"[helios-msg {msg_id}] {message['text']}"
-                session_id, resumed_from = _session_of(hub, runs_rel, bead_id)
+                try:
+                    session_id, resumed_from = _session_of(hub, runs_rel, bead_id)
+                except ResumeRefusal:
+                    # round-2-fix item 4: the previous turn recorded a null
+                    # session_id; stop with that turn's own code, silently.
+                    return codes[-1] if codes else 0
+                if run_mod._INTERRUPT.is_set():
+                    # A SIGINT landing between finishing the previous turn
+                    # and allocating this one (round-2-fix item 2): allocate
+                    # nothing for this message.
+                    return 4
                 code, execution_status = run_mod.run_turn(
                     bead_id,
                     hub=hub,
@@ -186,14 +206,24 @@ def resume(
                     resumed_from=resumed_from,
                 )
                 codes.append(code)
-                if run_mod._INTERRUPT.is_set():
-                    return 4
                 if execution_status in _ACK_STATUSES:
+                    # round-2-fix item 1: ack before honoring the interrupt,
+                    # so a SIGINT arriving after the harness finished (during
+                    # the checks, say) never loses an already-earned ack.
                     _write_ack(runs, bead_id, msg_id)
+                    if run_mod._INTERRUPT.is_set():
+                        return 4
                 else:
                     return code
+            if run_mod._INTERRUPT.is_set():
+                return 4
             if text is not None or delivered == 0:
-                session_id, resumed_from = _session_of(hub, runs_rel, bead_id)
+                try:
+                    session_id, resumed_from = _session_of(hub, runs_rel, bead_id)
+                except ResumeRefusal:
+                    return codes[-1] if codes else 0
+                if run_mod._INTERRUPT.is_set():
+                    return 4
                 code, _status = run_mod.run_turn(
                     bead_id,
                     hub=hub,

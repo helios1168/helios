@@ -479,3 +479,193 @@ def test_resume_sigint_during_turn_stops_with_exit4_no_further_turns(
     # nor the trailing text turn ran after the interrupt.
     assert not (runs / "b1" / "attempt-3").exists()
     _ = out
+
+
+# ------------------------------------------------------- round-2-fix item 1
+
+
+RESUME_CHECK_SIGINT_CHILD = """\
+import sys
+from pathlib import Path
+from helios import beads as B, config as C, resume as RS
+hub = Path(sys.argv[1])
+test_cmd = sys.argv[2]
+beads = B.FakeBeads([B.Bead(id="b1", kind="impl", files=["src/"], test=test_cmd, status="in_progress")])
+rc = RS.resume("b1", None, hub=hub, beads=beads, config=C.load(hub))
+sys.stderr.write(f"RC={rc}\\n")
+sys.exit(rc)
+"""
+
+
+def test_resume_sigint_during_check_phase_still_acks(tmp_path: Path, monkeypatch) -> None:
+    """A SIGINT arriving after the harness finished, during the bead's own
+    check (SPEC 8 step 9), still acks a message turn whose execution_status
+    qualifies (round-2-fix item 1: ack before honoring the interrupt)."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    runs = hub / cfg.project.runs
+    msg_id = _msg_file(runs, "b1", "20250101T000001Z", "aaaaaaaa", "hi")
+    flag = tmp_path / "slow.flag"
+    flag.write_text("")
+    test_cmd = f"test ! -f {flag} || sleep 30"
+    done = write_script(
+        tmp_path,
+        {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s2",
+         "report": {"status": "partial", "summary": "p"}},
+    )
+    child = tmp_path / "check_sigint_child.py"
+    child.write_text(RESUME_CHECK_SIGINT_CHILD)
+    proc = subprocess.Popen(
+        [sys.executable, str(child), str(hub), test_cmd],
+        env=dict(os.environ, HELIOS_FAKE_SCRIPT=str(done)),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+    )
+    a2 = runs / "b1" / "attempt-2"
+    wait_for(a2 / "state.json", "native_completed")
+    time.sleep(0.3)  # let the check actually start sleeping
+    os.kill(proc.pid, signal.SIGINT)
+    out, err = proc.communicate(timeout=30)
+    assert proc.returncode == 4, err
+    env2 = json.loads((a2 / "envelope.json").read_text())
+    assert env2["execution_status"] == "completed"
+    assert (runs / "b1" / "acks" / msg_id).exists(), "completed message turn left unacked"
+    assert not (runs / "b1" / "attempt-3").exists()
+    _ = out
+
+
+# ------------------------------------------------------- round-2-fix item 2
+
+
+RESUME_BETWEEN_TURNS_CHILD = """\
+import os, signal, sys
+from pathlib import Path
+from helios import beads as B, config as C, resume as RS
+hub = Path(sys.argv[1])
+orig = RS._session_of
+calls = {"n": 0}
+def patched(*a, **kw):
+    calls["n"] += 1
+    if calls["n"] == 2:
+        os.kill(os.getpid(), signal.SIGINT)
+    return orig(*a, **kw)
+RS._session_of = patched
+beads = B.FakeBeads([B.Bead(id="b1", kind="impl", files=["src/"], test="true", status="in_progress")])
+rc = RS.resume("b1", None, hub=hub, beads=beads, config=C.load(hub))
+sys.stderr.write(f"RC={rc}\\n")
+sys.exit(rc)
+"""
+
+
+def test_resume_sigint_between_message_turns_no_extra_attempt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A SIGINT landing between two message turns allocates nothing further
+    (round-2-fix item 2): no attempt beyond the finished one, the second
+    message never steered anywhere, exit 4."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    runs = hub / cfg.project.runs
+    m1 = _msg_file(runs, "b1", "20250101T000000Z", "aaaaaaaa", "one")
+    m2 = _msg_file(runs, "b1", "20250101T000000Z", "bbbbbbbb", "two")
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s2",
+                   "report": {"status": "partial", "summary": "p"}},
+    ))
+    child = tmp_path / "between.py"
+    child.write_text(RESUME_BETWEEN_TURNS_CHILD)
+    p = subprocess.run(
+        [sys.executable, str(child), str(hub)], capture_output=True, text=True,
+        timeout=60, env=os.environ.copy(),
+    )
+    assert p.returncode == 4, p.stderr
+    base = runs / "b1"
+    assert sorted(x.name for x in base.iterdir() if x.name.startswith("attempt-")) == [
+        "attempt-1", "attempt-2",
+    ]
+    assert (base / "acks" / m1).exists()
+    assert not (base / "acks" / m2).exists()
+    env2 = json.loads((base / "attempt-2" / "envelope.json").read_text())
+    assert env2["steered"] == [m1]
+
+
+# ------------------------------------------------------- round-2-fix item 3
+
+
+def test_resume_refuses_missing_worktree_impl(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    wt = hub / cfg.project.worktrees / "b1"
+    subprocess.run(["git", "worktree", "unlock", str(wt)], cwd=hub, capture_output=True)
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(wt)], cwd=hub, check=True,
+        capture_output=True,
+    )
+    with pytest.raises(resume_mod.ResumeRefusal, match="is missing"):
+        resume_mod.resume("b1", None, hub=hub, beads=beads, config=cfg)
+    assert not (hub / cfg.project.runs / "b1" / "attempt-2").exists()
+
+
+def test_resume_refuses_missing_worktree_verify_never_recreates_from_main(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hub = make_hub(tmp_path)
+    (hub / "skills" / "verify-code").mkdir(parents=True)
+    (hub / "skills" / "verify-code" / "SKILL.md").write_text(
+        "---\nname: verify-code\n---\n\nVerify.\n"
+    )
+    older = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=hub, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    cfg = config_mod.load(hub)
+    parent = beads_mod.Bead(
+        id="impl1", kind="impl", files=["src/"], test="true",
+        metadata={"output_commit": older},
+    )
+    verify_bead = beads_mod.Bead(
+        id="v1", kind="verify-code", unit="U1", parent="impl1",
+        files=["tools/verify/U1/"], test="true",
+    )
+    beads = beads_mod.FakeBeads([parent, verify_bead])
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "blocked", "summary": "b"}},
+    ))
+    rc = run_mod.run_one("v1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 3
+    wt = hub / cfg.project.worktrees / "v1"
+    subprocess.run(["git", "worktree", "unlock", str(wt)], cwd=hub, capture_output=True)
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(wt)], cwd=hub, check=True,
+        capture_output=True,
+    )
+    with pytest.raises(resume_mod.ResumeRefusal, match="is missing"):
+        resume_mod.resume("v1", None, hub=hub, beads=beads, config=cfg)
+    assert not (hub / cfg.project.runs / "v1" / "attempt-2").exists()
+
+
+# ------------------------------------------------------- round-2-fix item 4
+
+
+def test_resume_null_session_stops_silently_with_that_turns_code(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch, session_id="s1")
+    runs = hub / cfg.project.runs
+    msg_id = _msg_file(runs, "b1", "20250101T000000Z", "aaaaaaaa", "hi")
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": None,
+                   "report": {"status": "partial", "summary": "p"}},
+    ))
+    rc = resume_mod.resume("b1", "then", hub=hub, beads=beads, config=cfg)
+    assert rc == 3
+    assert not (runs / "b1" / "attempt-3").exists()
+    assert (runs / "b1" / "acks" / msg_id).exists()

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -28,6 +29,9 @@ from helios import tmux as tmux_mod
 from helios.commands import run as run_cmd
 
 CP = subprocess.CompletedProcess
+WT = Path(__file__).resolve().parents[1]
+HELIOS_BIN = WT / ".venv" / "bin" / "helios"
+BD = shutil.which("bd")
 
 
 class Recorder:
@@ -143,6 +147,17 @@ def make_hub(tmp_path: Path) -> Path:
     subprocess.run(["git", "add", "."], cwd=hub, check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=hub, check=True)
     return hub
+
+
+def bd_hub(tmp_path: Path) -> tuple[Path, beads_mod.Beads]:
+    """A real bd-backed hub, for CLI tests that exercise ``commands.run.run``
+    (which always talks to a real ``Beads(hub)``, not an injected fake)."""
+    hub = make_hub(tmp_path)
+    subprocess.run(
+        ["bd", "init", "--non-interactive", "--prefix", "t", "--skip-agents", "--quiet"],
+        cwd=hub, check=True, capture_output=True,
+    )
+    return hub, beads_mod.Beads(hub)
 
 
 def make_bead(bead_id: str = "b1", **kw: object) -> beads_mod.Bead:
@@ -268,63 +283,72 @@ def test_in_window_hup_and_term_interrupt_like_sigint(tmp_path: Path, sig: int) 
     assert "slow" in out
 
 
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
 def test_in_window_three_signals_quick_succession_absorbed(tmp_path: Path) -> None:
-    """HUP, TERM, INT 0.05 s apart: only the first drives the stop sequence, the
-    trailing two are absorbed (SPEC §7.1 "later SIGINTs are ignored", extended
-    to SIGHUP/SIGTERM by round-1-fix item 7). ``_restore_handler`` now keeps
-    ``_handle_sigint`` installed for an interrupted run instead of handing
-    SIGINT back to whatever ran before helios while a trailing signal from
-    the same storm could still be in flight.
+    """HUP, TERM, INT 0.05 s apart, through the real CLI: only the first drives
+    the stop sequence, the trailing two are absorbed (SPEC §7.1 "later SIGINTs
+    are ignored", extended to SIGHUP/SIGTERM by round-1-fix item 7).
 
-    A residual race outside this process's control remains: CPython can
-    still lose a signal arriving during its own ``sys.exit`` finalization to
-    the OS's raw disposition (returncode -2) even with our handler correctly
-    still installed and no threads left (confirmed by instrumenting
-    ``run_one_in_window`` directly: the handler was still ``_handle_sigint``
-    and only ``MainThread`` remained at the moment of return). So this test
-    tolerates a returncode of -2 as a known, rare, unfixable-in-run.py
-    outcome, and fails on anything else (a traceback, a hang, a live fake
-    harness, a lost tee byte, or any other exit code).
+    round-1-fix item 7 alone left a residual race: CPython can still lose a
+    trailing signal to the OS's raw disposition during its own ``sys.exit``
+    finalization (returncode -2), even with ``_handle_sigint`` still
+    installed and no threads left, in about 12 percent of runs. Round-2-fix
+    item 6 closes it at the ``--in-window`` CLI boundary specifically
+    (``commands.run._exit_in_window``): SIGHUP/SIGTERM/SIGINT go to SIG_IGN
+    and the process calls ``os._exit`` right after helios's own code has
+    decided the exit code, so no signal arriving from that point on can do
+    anything. Run 20 times to make the tightened assertion (exit code always
+    exactly 4) meaningful; ``run_one_in_window`` itself, an in-process
+    library call, keeps the plain handler-restore behavior and is not
+    touched here (see ``test_in_window_hup_and_term_interrupt_like_sigint``).
     """
-    hub = make_hub(tmp_path)
-    text = "line1\nline2"
-    script = tmp_path / "script.json"
-    script.write_text(json.dumps(
-        {"exit_code": 0, "sleep_s": 30, "stdout": text, "session_id": "s1",
-         "report": {"status": "done", "summary": "late"}}
-    ))
-    proc = spawn_in_window(hub, script)
-    a1 = hub / ".helios" / "runs" / "b1" / "attempt-1"
-    wait_for(a1 / "stdout.jsonl", "line2")
-    fake_pid = None
-    for _ in range(100):
-        pid = attempt_mod.read_state(a1).get("pid")
-        if pid is not None:
-            fake_pid = pid
-            break
-        time.sleep(0.02)
-    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
-        os.kill(proc.pid, sig)
-        time.sleep(0.05)
-    try:
-        out, err = proc.communicate(timeout=30)
-        hung = False
-    except subprocess.TimeoutExpired:
-        hung = True
-        os.killpg(proc.pid, signal.SIGKILL)
-        out, err = proc.communicate()
-    fake_alive = False
-    if fake_pid is not None:
+    for _ in range(20):
+        hub, real = bd_hub(tmp_path / f"r{_}")
+        bid = real.create(
+            "s", labels=[], metadata={"kind": "impl", "files": ["src/"], "test": "true"}
+        )
+        text = "line1\nline2"
+        script = tmp_path / f"script{_}.json"
+        script.write_text(json.dumps(
+            {"exit_code": 0, "sleep_s": 30, "stdout": text, "session_id": "s1",
+             "report": {"status": "done", "summary": "late"}}
+        ))
+        env = dict(os.environ, HELIOS_FAKE_SCRIPT=str(script))
+        proc = subprocess.Popen(
+            [str(HELIOS_BIN), "run", bid, "--in-window", "--harness", "fake"],
+            cwd=hub, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
+        )
+        a1 = hub / ".helios" / "runs" / bid / "attempt-1"
+        wait_for(a1 / "stdout.jsonl", "line2")
+        fake_pid = None
+        for _try in range(100):
+            pid = attempt_mod.read_state(a1).get("pid")
+            if pid is not None:
+                fake_pid = pid
+                break
+            time.sleep(0.02)
+        for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+            os.kill(proc.pid, sig)
+            time.sleep(0.05)
         try:
-            os.killpg(fake_pid, 0)
-            fake_alive = True
-        except ProcessLookupError:
-            pass
-    assert not hung, err
-    assert not fake_alive
-    assert proc.returncode in (4, -2), (proc.returncode, err)
-    if proc.returncode == 4:
-        assert read_envelope(hub, "b1", 1)["execution_status"] == "interrupted"
+            out, err = proc.communicate(timeout=30)
+            hung = False
+        except subprocess.TimeoutExpired:
+            hung = True
+            os.killpg(proc.pid, signal.SIGKILL)
+            out, err = proc.communicate()
+        fake_alive = False
+        if fake_pid is not None:
+            try:
+                os.killpg(fake_pid, 0)
+                fake_alive = True
+            except ProcessLookupError:
+                pass
+        assert not hung, err
+        assert not fake_alive
+        assert proc.returncode == 4, (proc.returncode, err)
+        assert read_envelope(hub, bid, 1)["execution_status"] == "interrupted"
         assert out == text + "\n"
 
 

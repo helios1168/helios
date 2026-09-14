@@ -917,6 +917,7 @@ def _finish_attempt(
     launch_failed: bool,
     transition_from: str | None,
     launched: bool = True,
+    unlaunched_detail: str = "interrupted",
 ) -> int:
     """Validate, check, commit, envelop, write back and finalize one attempt."""
     bead = args.bead
@@ -995,17 +996,17 @@ def _finish_attempt(
     if not launched:
         if bead.test:
             checks.append(
-                envelope_mod.Check(name="test", passed=False, detail="interrupted")
+                envelope_mod.Check(name="test", passed=False, detail=unlaunched_detail)
             )
         if args.config.project.typecheck:
             checks.append(
                 envelope_mod.Check(
-                    name="typecheck", passed=False, detail="interrupted"
+                    name="typecheck", passed=False, detail=unlaunched_detail
                 )
             )
         checks.append(
             envelope_mod.Check(
-                name="ownership", passed=False, detail="interrupted"
+                name="ownership", passed=False, detail=unlaunched_detail
             )
         )
         checks_passed = False
@@ -1255,6 +1256,7 @@ def _finalize_unlaunched_lookup_failure(
         launch_failed=True,
         transition_from=None,
         launched=False,
+        unlaunched_detail="memory lookup failed",
     )
     return 2
 

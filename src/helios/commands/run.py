@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import signal
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn
 
 from helios import beads as beads_mod
 from helios import config as config_mod
@@ -82,6 +84,28 @@ def memory_has_for(
     return has
 
 
+def _exit_in_window(code: int) -> NoReturn:
+    """Terminate the ``--in-window`` process immediately, past the race window.
+
+    A trailing signal from the same storm can otherwise arrive during
+    CPython's own ``sys.exit``/interpreter-finalization sequence and kill
+    the process by that signal's raw disposition, even with our own handler
+    still installed (round-2-fix item 6, supersedes hel-y8k): ignoring
+    HUP/TERM/INT and calling ``os._exit`` here skips that sequence
+    entirely, so no signal arriving from this point on can do anything.
+    ``run_one_in_window`` itself (an in-process library call, tests
+    included) keeps restoring the prior handlers (item 7).
+    """
+    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
+
+
 def run(args: argparse.Namespace) -> int:
     """Load config, read beads, and run the pipeline (SPEC §7.1, §9.1)."""
     if args.dry_run and (args.tmux or args.in_window):
@@ -99,7 +123,7 @@ def run(args: argparse.Namespace) -> int:
         if len(args.beads) != 1:
             print("helios: --in-window accepts exactly one bead", file=sys.stderr)
             return 2
-        return run_mod.run_one_in_window(
+        code = run_mod.run_one_in_window(
             args.beads[0],
             hub=hub,
             beads=beads,
@@ -108,6 +132,7 @@ def run(args: argparse.Namespace) -> int:
             timeout_s=args.timeout,
             again=args.again,
         )
+        _exit_in_window(code)
     return run_mod.run_many(
         list(args.beads),
         hub=hub,

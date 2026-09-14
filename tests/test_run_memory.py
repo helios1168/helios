@@ -435,7 +435,9 @@ def test_memory_lookup_failure_after_allocation_no_fallback_exit2(
     """A memory value preflight reported as present but that cannot actually be
     read never becomes "" in the prompt: refuse with exit 2, finalize the
     already-allocated attempt as any launch that never started, and never
-    close the bead (round-1-fix item 2)."""
+    close the bead (round-1-fix item 2). Its not-run checks record detail
+    "memory lookup failed", not the generic "interrupted" (round-2-fix
+    item 5)."""
     hub = make_hub(tmp_path)
     beads = beads_mod.FakeBeads([make_bead("b1", memories=["m1"])])  # never remembered
     set_fake(monkeypatch, write_script(tmp_path, DONE_SCRIPT))
@@ -452,6 +454,8 @@ def test_memory_lookup_failure_after_allocation_no_fallback_exit2(
     env = json.loads((attempt_dir / "envelope.json").read_text())
     assert env["output_commit"] is None
     assert "b1" not in beads.closed
+    details = {c["name"]: c["detail"] for c in env["checks"]}
+    assert details == {"test": "memory lookup failed", "ownership": "memory lookup failed"}
     assert beads.states.get("b1", {}).get("run") == "failed"
 
 
