@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from helios import control
-from helios.attempt import existing_attempts, runs_dir
+from helios.attempt import attempt_dir, existing_attempts, read_state, runs_dir
 from helios.beads import Beads, Bead
 from helios.config import load
 from helios.envelope import Envelope
@@ -37,7 +37,7 @@ def run(args: argparse.Namespace) -> int:
             until=args.until,
             run=run_bead,
             read_envelope=read_envelope,
-            latest_attempt=latest_attempt,
+            attempt_state=attempt_state,
         )
     except control.ControlError as exc:
         print(f"helios: {exc}", file=sys.stderr)
@@ -70,13 +70,17 @@ def read_envelope(bead: Bead) -> Envelope | None:
     return Envelope.model_validate_json(path.read_text())
 
 
-def latest_attempt(bead: Bead) -> int | None:
-    """The bead's highest existing attempt number, or None (SPEC section 8.3).
-
-    Compared before and after ``run_bead`` (control.py's ``_execute``) to catch a run
-    that makes no new attempt (Decided).
+def attempt_state(bead: Bead) -> control.AttemptState:
+    """The bead's highest attempt number (0 for none) and whether it was finalized
+    (SPEC sections 8.2/8.3). Snapshotted before and after ``run_bead`` (control.py's
+    ``_execute``) so a genuinely new attempt can be told apart from a SPEC section 8.4
+    in-place recovery of a not-yet-finalized one (Decided, revised).
     """
     config = load(Path.cwd())
     bead_runs = runs_dir(config.hub, config.project.runs, bead.id)
     numbers = existing_attempts(bead_runs)
-    return numbers[-1] if numbers else None
+    if not numbers:
+        return control.AttemptState(number=0, finalized=False)
+    n = numbers[-1]
+    state = read_state(attempt_dir(config.hub, config.project.runs, bead.id, n))
+    return control.AttemptState(number=n, finalized=state.get("state") == "finalized")

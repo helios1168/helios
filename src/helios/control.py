@@ -48,30 +48,49 @@ def envelope_line(envelope: Envelope) -> str:
     )
 
 
+@dataclass(frozen=True)
+class AttemptState:
+    """A bead's highest attempt number (``0`` for none) and whether that attempt was
+    already finalized (SPEC sections 8.2/8.3), snapshotted before a run so ``_execute``
+    can tell a genuinely new attempt from a SPEC section 8.4 in-place recovery of a
+    not-yet-finalized one (Decided, revised)."""
+
+    number: int
+    finalized: bool
+
+
 def _execute(
     bead: Bead,
     run: Callable[[Bead], int],
     read_envelope: Callable[[Bead], Envelope | None],
-    latest_attempt: Callable[[Bead], int | None] | None = None,
+    attempt_state: Callable[[Bead], AttemptState] | None = None,
 ) -> tuple[int, Envelope | None]:
     """Run ``bead`` and read its envelope, converting either callable's exception.
 
     A raising ``run`` or ``read_envelope`` is an execution failure (SPEC section 7.1 exit
     code 4), reported as ``execution failure for <bead>: <exception type>: <message>``.
 
-    When ``latest_attempt`` is given, its value before and after ``run`` is compared
-    (Decided): a run that makes no new attempt is its own execution failure, reason
-    ``execution failure for <bead>: no new attempt``, carrying the run's own exit code
-    so the caller can use it (``execution_failure_exit``). ``latest_attempt`` is
-    optional so existing callers that do not track attempts keep working unchanged.
+    When ``attempt_state`` is given, it is snapshotted before and after ``run`` (Decided,
+    revised). Its attempt number rising means a new attempt was made: read normally. An
+    unchanged number is still fine when the attempt was not yet finalized before the run,
+    since SPEC section 8.4 recovery of ``native_completed``, ``validated`` or ``invalid``
+    finalizes the same attempt in place rather than allocating a new one. Only an
+    unchanged number for an attempt that was already finalized before the run (or no
+    attempt at all, before or after) is its own execution failure, reason
+    ``execution failure for <bead>: no new attempt``, carrying the run's own exit code so
+    the caller can use it (``execution_failure_exit``). ``attempt_state`` is optional so
+    existing callers that do not track attempts keep working unchanged.
     """
-    before = latest_attempt(bead) if latest_attempt is not None else None
+    before = attempt_state(bead) if attempt_state is not None else None
     try:
         code = int(run(bead))
     except Exception as exc:
         raise ExecutionFailure(f"execution failure for {bead.id}: {type(exc).__name__}: {exc}") from exc
-    if latest_attempt is not None and latest_attempt(bead) == before:
-        raise ExecutionFailure(f"execution failure for {bead.id}: no new attempt", code=code)
+    if before is not None:
+        after = attempt_state(bead)
+        recovered_in_place = after.number == before.number and before.number > 0 and not before.finalized
+        if after.number == before.number and not recovered_in_place:
+            raise ExecutionFailure(f"execution failure for {bead.id}: no new attempt", code=code)
     try:
         envelope = read_envelope(bead)
     except Exception as exc:
@@ -103,7 +122,7 @@ def next_bead(
     stop_at: tuple[str, ...],
     run: Callable[[Bead], int],
     read_envelope: Callable[[Bead], Envelope | None],
-    latest_attempt: Callable[[Bead], int | None] | None = None,
+    attempt_state: Callable[[Bead], AttemptState] | None = None,
 ) -> int:
     """Run the first candidate not covered by ``stop_at`` (SPEC section 11)."""
     bead = next((b for b in candidates(beads, unit) if b.kind not in stop_at), None)
@@ -111,7 +130,7 @@ def next_bead(
         print("helios: no ready bead", file=sys.stderr)
         return 3
     try:
-        code, envelope = _execute(bead, run, read_envelope, latest_attempt)
+        code, envelope = _execute(bead, run, read_envelope, attempt_state)
     except ExecutionFailure as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return execution_failure_exit(exc.code)
@@ -148,7 +167,7 @@ def unit_run(
     until: str | None,
     run: Callable[[Bead], int],
     read_envelope: Callable[[Bead], Envelope | None],
-    latest_attempt: Callable[[Bead], int | None] | None = None,
+    attempt_state: Callable[[Bead], AttemptState] | None = None,
 ) -> UnitResult:
     """Run a unit until a SPEC section 11 stopping condition.
 
@@ -190,7 +209,7 @@ def unit_run(
             return UnitResult(3, reason)
         seen.add(bead.id)
         try:
-            code, envelope = _execute(bead, run, read_envelope, latest_attempt)
+            code, envelope = _execute(bead, run, read_envelope, attempt_state)
         except ExecutionFailure as exc:
             reason = str(exc)
             print(f"stopped: {reason}")

@@ -134,7 +134,7 @@ def run_unit(
     stop_at: tuple[str, ...] = (),
     run: Any = lambda _item: 0,
     read: Any = lambda item: mk_envelope(item.id, kind=item.kind),
-    latest_attempt: Any = None,
+    attempt_state: Any = None,
 ) -> tuple[control.UnitResult, str]:
     result = control.unit_run(
         ReadyInBdOrder(rows),
@@ -145,7 +145,7 @@ def run_unit(
         until=until,
         run=run,
         read_envelope=read,
-        latest_attempt=latest_attempt,
+        attempt_state=attempt_state,
     )
     return result, result.reason
 
@@ -277,30 +277,69 @@ def test_unit_execution_failure_exit_uses_run_code_when_nonzero(capsys: pytest.C
     assert (result.code, reason) == (2, "execution failure for b: crashed")
 
 
-def test_unit_no_new_attempt_is_execution_failure_using_run_code(capsys: pytest.CaptureFixture[str]) -> None:
-    """Decided (item 3): a run that makes no new attempt is its own execution failure,
-    reason 'no new attempt', exit with the run's own nonzero code."""
+def test_unit_no_attempt_before_or_after_is_execution_failure(capsys: pytest.CaptureFixture[str]) -> None:
+    """Decided (item 3, revised): still no attempt at all (number 0 before and after)
+    is its own execution failure, reason 'no new attempt'; exit 4 since the run's own
+    code is 0."""
+    result, reason = run_unit(
+        [bead("b")],
+        run=lambda _item: 0,
+        read=lambda item: mk_envelope(item.id),
+        attempt_state=lambda _item: control.AttemptState(number=0, finalized=False),
+    )
+    assert (result.code, reason) == (4, "execution failure for b: no new attempt")
+    assert capsys.readouterr().out.endswith("stopped: execution failure for b: no new attempt\n")
+
+
+def test_unit_unchanged_finalized_attempt_is_execution_failure_using_run_code(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Decided (item 3, revised): an unchanged attempt number is still an execution
+    failure when that attempt was already finalized before the run, exit with the
+    run's own nonzero code."""
     result, reason = run_unit(
         [bead("b")],
         run=lambda _item: 2,
         read=lambda item: mk_envelope(item.id),
-        latest_attempt=lambda _item: 5,  # same before and after: no new attempt
+        attempt_state=lambda _item: control.AttemptState(number=5, finalized=True),
     )
     assert (result.code, reason) == (2, "execution failure for b: no new attempt")
     assert capsys.readouterr().out.endswith("stopped: execution failure for b: no new attempt\n")
 
 
-def test_unit_no_new_attempt_with_run_code_zero_exits_four(capsys: pytest.CaptureFixture[str]) -> None:
+def test_unit_new_attempt_number_is_read_normally(capsys: pytest.CaptureFixture[str]) -> None:
+    """Decided (item 3, revised): a higher attempt number after the run is a genuinely
+    new attempt, read normally, not a failure."""
+    states = iter([control.AttemptState(number=0, finalized=False), control.AttemptState(number=1, finalized=False)])
     result, reason = run_unit(
         [bead("b")],
         run=lambda _item: 0,
         read=lambda item: mk_envelope(item.id),
-        latest_attempt=lambda _item: None,  # no attempt before, none after either
+        attempt_state=lambda _item: next(states),
+        until="impl",
     )
-    assert (result.code, reason) == (4, "execution failure for b: no new attempt")
+    assert (result.code, reason) == (0, "until stage reached")
 
 
-def test_next_no_new_attempt_is_execution_failure_using_run_code(capsys: pytest.CaptureFixture[str]) -> None:
+def test_unit_in_place_recovery_of_unfinalized_attempt_reads_envelope(capsys: pytest.CaptureFixture[str]) -> None:
+    """Decided (item 3, revised): an unchanged attempt number is not a failure when
+    that attempt was not yet finalized before the run (SPEC section 8.4 recovery of
+    native_completed, validated or invalid finalizes the same attempt in place). The
+    envelope the fake run wrote in place is read normally."""
+    state = control.AttemptState(number=1, finalized=False)
+    result, reason = run_unit(
+        [bead("b")],
+        run=lambda _item: 0,
+        read=lambda item: mk_envelope(item.id, attempt=1),
+        attempt_state=lambda _item: state,  # same object before and after: unchanged, not finalized
+        until="impl",
+    )
+    assert (result.code, reason) == (0, "until stage reached")
+
+
+def test_next_unchanged_finalized_attempt_is_execution_failure_using_run_code(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     rows = [bead("b")]
     code = control.next_bead(
         ReadyInBdOrder(rows),
@@ -308,10 +347,40 @@ def test_next_no_new_attempt_is_execution_failure_using_run_code(capsys: pytest.
         stop_at=(),
         run=lambda _item: 2,
         read_envelope=lambda item: mk_envelope(item.id),
-        latest_attempt=lambda _item: 5,
+        attempt_state=lambda _item: control.AttemptState(number=5, finalized=True),
     )
     assert code == 2
     assert capsys.readouterr().err == "helios: execution failure for b: no new attempt\n"
+
+
+def test_next_new_attempt_number_is_read_normally(capsys: pytest.CaptureFixture[str]) -> None:
+    states = iter([control.AttemptState(number=0, finalized=False), control.AttemptState(number=1, finalized=False)])
+    rows = [bead("b")]
+    code = control.next_bead(
+        ReadyInBdOrder(rows),
+        unit="u",
+        stop_at=(),
+        run=lambda _item: 0,
+        read_envelope=lambda item: mk_envelope(item.id),
+        attempt_state=lambda _item: next(states),
+    )
+    assert code == 0
+    assert capsys.readouterr().out == "b#1\tcompleted\tdone\t-\tok\n"
+
+
+def test_next_in_place_recovery_of_unfinalized_attempt_reads_envelope(capsys: pytest.CaptureFixture[str]) -> None:
+    state = control.AttemptState(number=1, finalized=False)
+    rows = [bead("b")]
+    code = control.next_bead(
+        ReadyInBdOrder(rows),
+        unit="u",
+        stop_at=(),
+        run=lambda _item: 0,
+        read_envelope=lambda item: mk_envelope(item.id, attempt=1),
+        attempt_state=lambda _item: state,
+    )
+    assert code == 0
+    assert capsys.readouterr().out == "b#1\tcompleted\tdone\t-\tok\n"
 
 
 def test_unit_until_reached_only_after_an_earlier_candidate(capsys: pytest.CaptureFixture[str]) -> None:
@@ -347,10 +416,10 @@ def test_next_command_config_error_is_prefixed_and_exit_two(monkeypatch: pytest.
 
 
 def _incrementing_attempt() -> Any:
-    """A latest_attempt stub whose value differs on the after-call (a new attempt was
+    """An attempt_state stub whose number differs on the after-call (a new attempt was
     made), so tests unrelated to item 3 are not tripped up by that check."""
     counter = iter(range(1_000_000))
-    return lambda _item: next(counter)
+    return lambda _item: control.AttemptState(number=next(counter), finalized=False)
 
 
 def test_next_command_passes_through_run_code(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -362,7 +431,7 @@ def test_next_command_passes_through_run_code(monkeypatch: pytest.MonkeyPatch, c
     monkeypatch.setattr(command, "Beads", lambda _hub: fake)
     monkeypatch.setattr(command, "run_bead", lambda _item: 7)
     monkeypatch.setattr(command, "read_envelope", lambda item: mk_envelope(item.id))
-    monkeypatch.setattr(command, "latest_attempt", _incrementing_attempt())
+    monkeypatch.setattr(command, "attempt_state", _incrementing_attempt())
     assert command.run(argparse.Namespace(unit=None)) == 7
     assert capsys.readouterr().out == "b#1\tcompleted\tdone\t-\tok\n"
 
@@ -394,7 +463,7 @@ def test_unit_run_command_passes_through_result_code(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(command, "Beads", lambda _hub: ReadyInBdOrder([bead("b")]))
     monkeypatch.setattr(command, "run_bead", lambda _item: 0)
     monkeypatch.setattr(command, "read_envelope", lambda item: mk_envelope(item.id))
-    monkeypatch.setattr(command, "latest_attempt", _incrementing_attempt())
+    monkeypatch.setattr(command, "attempt_state", _incrementing_attempt())
     assert command.run(argparse.Namespace(unit="u", until="impl")) == 0
     assert capsys.readouterr().out.endswith("stopped: until stage reached\n")
 
