@@ -86,7 +86,7 @@ def _execute(
         code = int(run(bead))
     except Exception as exc:
         raise ExecutionFailure(f"execution failure for {bead.id}: {type(exc).__name__}: {exc}") from exc
-    if before is not None:
+    if attempt_state is not None and before is not None:
         after = attempt_state(bead)
         recovered_in_place = after.number == before.number and before.number > 0 and not before.finalized
         if after.number == before.number and not recovered_in_place:
