@@ -51,8 +51,17 @@ class Block:
     def __post_init__(self) -> None:
         if self.kind not in KINDS:
             raise ValueError(f"unknown block kind {self.kind!r}")
+        check_id_lists(self)
         self.satisfies = tuple(self.satisfies)
         self.relaxes = tuple(self.relaxes)
+
+
+def check_id_lists(block: Block) -> None:
+    """Reject a bare str for satisfies or relaxes (they must list ids)."""
+    if isinstance(block.satisfies, str) or isinstance(block.relaxes, str):
+        raise ValueError(
+            f"block {block.id!r}: satisfies and relaxes must be sequences of ids, not str"
+        )
 
 
 def omit_ids() -> set[str]:
@@ -70,6 +79,7 @@ class Registry:
 
     def add(self, block: Block) -> None:
         """Add an active block; ValueError when the id was ever used."""
+        check_id_lists(block)
         if block.id in self._seen:
             raise ValueError(f"block id {block.id!r} was already used")
         self._seen.add(block.id)
@@ -101,10 +111,13 @@ def ensure_hub_path(hub: Path) -> None:
 
 
 def forget_module(name: str) -> None:
-    """Drop a module and its package parents from sys.modules (SPEC §2.3)."""
+    """Drop a module, its package parents and its submodules from sys.modules."""
     parts = name.split(".")
     for i in range(1, len(parts) + 1):
         sys.modules.pop(".".join(parts[:i]), None)
+    prefix = name + "."
+    for key in [k for k in sys.modules if k.startswith(prefix)]:
+        sys.modules.pop(key, None)
 
 
 def load_module(name: str, hub: Path) -> ModuleType:
@@ -118,7 +131,7 @@ def load_module(name: str, hub: Path) -> ModuleType:
     importlib.invalidate_caches()
     try:
         return importlib.import_module(name)
-    except Exception as exc:
+    except BaseException as exc:
         raise ImportError(f"cannot import {name}: {type(exc).__name__}: {exc}") from exc
 
 
@@ -194,6 +207,18 @@ class _RecorderBase:
 
     def __getattr__(self, item: str) -> _Recorder:
         return self._fresh()
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        pass
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        pass
+
+    def __int__(self) -> int:
+        return 0
+
+    def __float__(self) -> float:
+        return 0.0
 
     def __call__(self, *args: Any, **kwargs: Any) -> _Recorder:
         return self._fresh()
@@ -385,7 +410,7 @@ def check_registry_full(
         kind[0] = block.kind
         try:
             block.build(model, data)
-        except Exception as exc:
+        except BaseException as exc:
             errors.append(f"error: {block.id}: {type(exc).__name__}: {exc}")
     recorded = {name.split("[", 1)[0] for k, name in sink if k in CHECKED_KINDS}
     expected = {
@@ -400,17 +425,17 @@ def module_relpath(module_name: str) -> str:
 
 
 _CHILD_SCRIPT = (
-    "import importlib, json, sys\n"
-    "name, root = sys.argv[1], sys.argv[2]\n"
-    "sys.path.insert(0, root)\n"
-    "sys.path.insert(0, root + '/src')\n"
+    "import sys\n"
+    "name, root, out, helios_dir, stdlib, platstdlib = sys.argv[1:7]\n"
+    "sys.path[:] = [root + '/src', root, helios_dir, stdlib, platstdlib]\n"
+    "import importlib, json\n"
     "try:\n"
     "    module = importlib.import_module(name)\n"
     "    ids = sorted(b.id for b in module.REGISTRY.active())\n"
+    "    open(out, 'w').write(json.dumps(ids))\n"
     "except BaseException as exc:\n"
-    "    print(json.dumps({'error': f'{type(exc).__name__}: {exc}'}))\n"
+    "    open(out, 'w').write(json.dumps({'error': f'{type(exc).__name__}: {exc}'}))\n"
     "    raise SystemExit(1)\n"
-    "print(json.dumps(ids))\n"
 )
 
 
@@ -426,40 +451,52 @@ def extract_revision(hub: Path, rev: str, target: Path) -> None:
 
 
 def import_ids_at_revision(module_name: str, root: Path, rev: str) -> set[str]:
-    """Import the module with root and root/src first on sys.path (SPEC §15.3)."""
+    """Import the module from the extracted tree and read its active ids (SPEC §15.3).
+
+    The child runs with cwd the extracted tree, -P, and an explicit sys.path of
+    its src, the tree itself and the installed helios location, so sibling imports
+    resolve at the same revision and the working tree never leaks in. Ids travel
+    back in a temp file; child stdout is ignored.
+    """
+    import sysconfig
+
     env = dict(os.environ)
     env.pop(OMIT_ENV, None)
+    helios_dir = str(Path(__file__).resolve().parent.parent)
+    out_path = root.parent / (root.name + ".ids.json")
+    argv = [
+        sys.executable,
+        "-P",
+        "-c",
+        _CHILD_SCRIPT,
+        module_name,
+        str(root),
+        str(out_path),
+        helios_dir,
+        sysconfig.get_path("stdlib"),
+        sysconfig.get_path("platstdlib"),
+    ]
     try:
-        proc = subprocess.run(
-            [sys.executable, "-c", _CHILD_SCRIPT, module_name, str(root)],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=DIFF_TIMEOUT_S,
-        )
+        proc = subprocess.run(argv, cwd=root, capture_output=True, text=True, env=env,
+                              timeout=DIFF_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         raise ImportError(
             f"cannot import {module_name} at {rev}: TimeoutExpired: timed out"
         ) from None
+    payload: Any = None
+    try:
+        payload = json.loads(out_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        payload = None
     if proc.returncode == 0:
-        try:
-            ids = json.loads(proc.stdout)
-        except json.JSONDecodeError:
-            ids = None
-        if isinstance(ids, list) and all(isinstance(i, str) for i in ids):
-            return set(ids)
+        if isinstance(payload, list) and all(isinstance(i, str) for i in payload):
+            return set(payload)
         raise ImportError(
             f"cannot import {module_name} at {rev}: ImportError: unexpected output"
         )
-    text = proc.stdout.strip().splitlines()
     err = ""
-    if text:
-        try:
-            payload = json.loads(text[-1])
-            if isinstance(payload, dict):
-                err = str(payload.get("error", ""))
-        except json.JSONDecodeError:
-            err = ""
+    if isinstance(payload, dict):
+        err = str(payload.get("error", ""))
     if not err:
         err = f"exit {proc.returncode}"
     raise ImportError(f"cannot import {module_name} at {rev}: {err}")

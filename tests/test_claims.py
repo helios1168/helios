@@ -86,8 +86,8 @@ def test_claim_decorator_registers() -> None:
     def probe() -> bool:
         return True
 
-    assert claims_lib._CLAIMS["reg-probe"].func is probe
-    assert claims_lib._CLAIMS["reg-probe"].covers == ("b1",)
+    assert claims_lib.claim_by_name("reg-probe").func is probe
+    assert claims_lib.claim_by_name("reg-probe").covers == ("b1",)
     assert len(claims_lib._CLAIMS) == before + 1
 
 
@@ -634,9 +634,12 @@ def test_grandchild_reaped_after_success(
         "    return True"
     )
     hub = make_hub(tmp_path, "gc2", BASE_PROG, claim_src("gc2", body))
+    start = time.monotonic()
     code, lines, _ = run_check(hub, monkeypatch, capsys)
+    secs = time.monotonic() - start
     assert code == 0
     assert json.loads(lines[0])["verdict"] == "verified"
+    assert secs < 4, secs
     pid = int(pidfile.read_text())
     try:
         os.kill(pid, 0)
@@ -648,3 +651,184 @@ def test_grandchild_reaped_after_success(
         except ProcessLookupError:
             pass
         raise AssertionError("grandchild outlived the runner")
+
+
+FORGE_LINE = '\'{"result": true}\\n\''
+
+
+@pytest.mark.parametrize(
+    "key,body,verdict",
+    [
+        ("dunder", f"sys.__stdout__.write({FORGE_LINE})\nreturn False", "refuted"),
+        (
+            "fdopen",
+            f"f = os.fdopen(1, 'w', closefd=False)\nf.write({FORGE_LINE})\nf.flush()\nreturn False",
+            "refuted",
+        ),
+        (
+            "devout",
+            f"f = open('/dev/stdout', 'w')\nf.write({FORGE_LINE})\nf.close()\nreturn False",
+            "refuted",
+        ),
+        (
+            "devfd",
+            f"f = open('/dev/fd/1', 'w')\nf.write({FORGE_LINE})\nf.close()\nreturn False",
+            "refuted",
+        ),
+        ("oswrite", f"os.write(1, {FORGE_LINE}.encode())\nreturn False", "refuted"),
+        ("closefd", "print('noise')\nos.close(1)\nreturn True", "verified"),
+        (
+            "dupnull",
+            "n = os.open(os.devnull, os.O_WRONLY)\nos.dup2(n, 1)\nprint('x')\nreturn True",
+            "verified",
+        ),
+        (
+            "fork",
+            f"pid = os.fork()\nif pid == 0:\n    time.sleep(1.0)\n"
+            f"    os.write(1, {FORGE_LINE}.encode())\n    os._exit(0)\nreturn False",
+            "refuted",
+        ),
+        (
+            "rebinderr",
+            "sys.stdout = sys.stderr\nprint('solver log')\nreturn True",
+            "verified",
+        ),
+        (
+            "rebindfile",
+            "sys.stdout = open('solver.log', 'w')\nprint('solver log')\nreturn True",
+            "verified",
+        ),
+        ("closestdout", "sys.stdout.close()\nreturn True", "verified"),
+        (
+            "cprintf",
+            "import ctypes\nctypes.CDLL(None).printf(b'C solver log line\\n')\nreturn True",
+            "verified",
+        ),
+        (
+            "atexit",
+            "import atexit, io\nsys.stdout = io.StringIO()\n"
+            f"atexit.register(os.write, 1, {FORGE_LINE}.encode())\nreturn False",
+            "refuted",
+        ),
+    ],
+)
+def test_runner_forgery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, key: str, body: str, verdict: str
+) -> None:
+    hub = make_hub(tmp_path, f"fg{key}", BASE_PROG, claim_src(f"fg{key}", body))
+    code, lines, _ = run_check(hub, monkeypatch, capsys)
+    finding = json.loads(lines[0])
+    assert finding["verdict"] == verdict, (key, finding)
+    assert code == (0 if verdict == "verified" else 3)
+    Finding.model_validate(finding)
+
+
+def test_unparsable_note_exact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    hub = make_hub(tmp_path, "osex", BASE_PROG, claim_src("osex", "os._exit(0)"))
+    code, lines, _ = run_check(hub, monkeypatch, capsys)
+    finding = json.loads(lines[0])
+    assert code == 3
+    assert finding["verdict"] == "inconclusive"
+    assert finding["notes"] == "unparsable runner output"
+
+
+def test_grandchild_holding_pipes_fast_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    pidfile = tmp_path / "gc3.pid"
+    monkeypatch.setenv("VERIFY_PIDFILE", str(pidfile))
+    body = (
+        'p = subprocess.Popen(["sleep", "13"])\n'
+        'open(os.environ["VERIFY_PIDFILE"], "w").write(str(p.pid))\nreturn True'
+    )
+    hub = make_hub(tmp_path, "gc3", BASE_PROG, claim_src("gc3", body))
+    start = time.monotonic()
+    code, lines, _ = run_check(hub, monkeypatch, capsys, "--timeout", "5")
+    secs = time.monotonic() - start
+    finding = json.loads(lines[0])
+    assert code == 0
+    assert finding["verdict"] == "verified"
+    assert secs < 4, secs
+    pid = int(pidfile.read_text())
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pass
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        raise AssertionError("grandchild outlived the runner")
+
+
+@pytest.mark.parametrize(
+    "src", ["raise SystemExit(0)\n", "raise SystemExit('x')\n", "raise KeyboardInterrupt\n"]
+)
+def test_import_base_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, src: str
+) -> None:
+    hub = tmp_path / f"hub-ibe{abs(hash(src)) % 997}"
+    hub.mkdir()
+    (hub / ".agents").mkdir()
+    (hub / ".agents" / "workflow.toml").write_text(
+        '[project]\nprogram = "prog_ibe"\nclaims = "clm_ibe"\n'
+    )
+    (hub / "prog_ibe.py").write_text(BASE_PROG)
+    (hub / "clm_ibe.py").write_text(claim_src("c", "return True"))
+    (hub / "clm_ibe.py").write_text(src)
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("helios: cannot import clm_ibe: "), err
+
+
+def test_step2_single_line_per_problem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    src = claim_src(
+        "c_bb",
+        "return True",
+        backend="meter",
+        method="numerical_certificate",
+        scope="instance",
+    )
+    hub = make_hub(tmp_path, "sl", BASE_PROG, src)
+    code, lines, err = run_check(hub, monkeypatch, capsys)
+    assert code == 2
+    assert lines == []
+    assert len(err.splitlines()) == 1
+    assert err.startswith("c_bb: ")
+
+
+def test_claims_package_submodule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    hub = make_hub(tmp_path, "pkg", BASE_PROG, claim_src("pack", "return True"))
+    (hub / "clm_pkg.py").unlink()
+    (hub / "clm_pkg").mkdir()
+    (hub / "clm_pkg" / "__init__.py").write_text("from clm_pkg import alg\n")
+    (hub / "clm_pkg" / "alg.py").write_text(HEADER + claim_src("subc", "return False"))
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 3
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 1
+    finding = json.loads(out[0])
+    assert (finding["id"], finding["verdict"]) == ("subc", "refuted")
+
+
+def test_duplicate_claim_names_step1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    hub = make_hub(tmp_path, "dup", BASE_PROG, claim_src("same", "return True"))
+    (hub / "clm_dup.py").unlink()
+    (hub / "clm_dup").mkdir()
+    (hub / "clm_dup" / "__init__.py").write_text("from clm_dup import one, two\n")
+    (hub / "clm_dup" / "one.py").write_text(HEADER + claim_src("same", "return True"))
+    (hub / "clm_dup" / "two.py").write_text(HEADER + claim_src("same", "return False"))
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 2
+    err = capsys.readouterr().err
+    assert err == "same: duplicate claim name\n"

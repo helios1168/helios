@@ -4,11 +4,14 @@ Usage: python -m helios.claims.runner <module> <name>
 
 File descriptor 1 is redirected to file descriptor 2 while the claim module is
 imported and the claim runs, so claim output never reaches the protocol
-channel. The one protocol line goes to the saved original stdout.
+channel. The one protocol line is written with os.write to the saved original
+stdout, then the process leaves with os._exit, so buffered forgeries and
+atexit hooks never run. C stdio is flushed first so C output lands on stderr.
 """
 
 from __future__ import annotations
 
+import ctypes
 import importlib
 import json
 import os
@@ -36,7 +39,15 @@ def run_claim(module_name: str, name: str) -> str:
     return json.dumps({"other": type(result).__name__})
 
 
-def main(argv: list[str]) -> int:
+def flush_c_stdio() -> None:
+    """Flush libc stdio so C output lands where fd 1 points (stderr here)."""
+    try:
+        ctypes.CDLL(None).fflush(None)
+    except Exception:
+        pass
+
+
+def main(argv: list[str]) -> None:
     module_name, name = argv[1], argv[2]
     hub = os.getcwd()
     sys.path.insert(0, hub)
@@ -46,21 +57,13 @@ def main(argv: list[str]) -> int:
     saved = os.dup(1)
     os.dup2(2, 1)
     try:
-        try:
-            line = run_claim(module_name, name)
-        except BaseException:
-            line = json.dumps({"error": traceback.format_exc()})
-    finally:
-        try:
-            sys.stdout.flush()
-        except OSError:
-            pass
-        os.dup2(saved, 1)
-        os.close(saved)
-    sys.stdout.write(line + "\n")
-    sys.stdout.flush()
-    return 0
+        line = run_claim(module_name, name)
+    except BaseException:
+        line = json.dumps({"error": traceback.format_exc()})
+    flush_c_stdio()
+    os.write(saved, (line + "\n").encode("utf-8"))
+    os._exit(0)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    main(sys.argv)

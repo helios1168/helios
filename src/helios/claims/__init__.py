@@ -8,6 +8,8 @@ import re
 import signal
 import subprocess
 import sys
+import threading
+import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,9 +17,11 @@ from typing import Any, Callable, TextIO
 
 from helios import program as prog
 from helios.envelope import Finding, Method, Scope, Verdict
+from pydantic import ValidationError
 
 REQUIREMENT_RE = re.compile(r"^R[0-9]+$")
 MANUAL_BACKEND = "manual"
+COLLECT_S = 2.0
 
 
 class scrubbed_omit:
@@ -53,7 +57,16 @@ class Claim:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-_CLAIMS: dict[str, Claim] = {}
+_CLAIMS: dict[str, list[Claim]] = {}
+
+
+def _qualname(c: Claim) -> tuple[str, str]:
+    func: Any = c.func
+    try:
+        qual = func.__qualname__
+    except AttributeError:
+        qual = repr(func)
+    return (c.module, qual if isinstance(qual, str) else repr(func))
 
 
 def claim(
@@ -69,17 +82,19 @@ def claim(
     """Register a zero-argument claim callable (SPEC §15.2)."""
 
     def decorator(func: Callable[[], Any]) -> Callable[[], Any]:
-        _CLAIMS[name] = Claim(
-            name=name,
-            covers=tuple(covers),
-            backend=backend,
-            method=method,
-            scope=scope,
-            bound=bound,
-            artifact=artifact,
-            redundant=tuple(redundant),
-            func=func,
-            module=func.__module__,
+        _CLAIMS.setdefault(name, []).append(
+            Claim(
+                name=name,
+                covers=tuple(covers),
+                backend=backend,
+                method=method,
+                scope=scope,
+                bound=bound,
+                artifact=artifact,
+                redundant=tuple(redundant),
+                func=func,
+                module=func.__module__,
+            )
         )
         return func
 
@@ -87,8 +102,11 @@ def claim(
 
 
 def claim_by_name(name: str) -> Claim:
-    """Return the registered claim, raising KeyError when unknown."""
-    return _CLAIMS[name]
+    """Return the latest registered claim, raising KeyError when unknown."""
+    try:
+        return _CLAIMS[name][-1]
+    except (KeyError, IndexError):
+        raise KeyError(name) from None
 
 
 @dataclass
@@ -131,14 +149,55 @@ def load_backends(hub: Path) -> dict[str, Backend]:
 
 
 def load_claims(hub: Path, module_name: str | None) -> list[Claim]:
-    """Import the claims module and return its claims sorted by name."""
+    """Import the claims module and return every owned registration.
+
+    Claims modules may be packages: a claim is owned when its function module is
+    the configured module or starts with `<module>.`. Re-imports append
+    duplicate records; selection dedupes them (SPEC §15.2).
+    """
     if not module_name:
         raise ValueError("project.claims is not configured")
     module = prog.load_module(module_name, hub)
-    return sorted(
-        (c for c in _CLAIMS.values() if c.module == module.__name__),
-        key=lambda c: c.name,
+    prefix = module.__name__ + "."
+    return [
+        record
+        for records in _CLAIMS.values()
+        for record in records
+        if record.module == module.__name__ or record.module.startswith(prefix)
+    ]
+
+
+def select_claims(
+    records: list[Claim], backend: str | None, covers: str | None
+) -> tuple[list[Claim], list[str]]:
+    """Filter records, one claim per name, plus duplicate names (SPEC §15.2 step 1)."""
+    groups: dict[str, list[Claim]] = {}
+    for c in records:
+        if backend is not None and c.backend != backend:
+            continue
+        if covers is not None and covers not in c.covers:
+            continue
+        groups.setdefault(c.name, []).append(c)
+    claims = sorted((group[-1] for group in groups.values()), key=lambda c: c.name)
+    dupes = sorted(
+        name for name, group in groups.items() if len({_qualname(c) for c in group}) > 1
     )
+    return claims, dupes
+
+
+def first_message(exc: BaseException) -> str:
+    """One line for a declaration failure (SPEC §15.2 step 2)."""
+    if isinstance(exc, ValidationError):
+        errors = exc.errors()
+        if errors:
+            first = errors[0]
+            loc = ".".join(str(part) for part in first.get("loc", ()))
+            msg = str(first.get("msg", ""))
+            return f"{loc}: {msg}" if loc else msg
+    for line in str(exc).splitlines():
+        if line.strip():
+            return line.strip()
+    return "invalid declaration"
 
 
 def declaration_problem(c: Claim) -> str | None:
@@ -154,12 +213,15 @@ def declaration_problem(c: Claim) -> str | None:
             bound=c.bound,
         )
     except ValueError as exc:
-        return f"{c.name}: declaration cannot give a verified finding: {exc}"
+        return f"{c.name}: {first_message(exc)}"
     return None
 
 
 def validate_claims(
-    claims: list[Claim], active_ids: set[str], backends: dict[str, Backend]
+    claims: list[Claim],
+    active_ids: set[str],
+    backends: dict[str, Backend],
+    dupes: list[str] | None = None,
 ) -> list[str]:
     """Coverage, backend and declaration problems for every claim (SPEC §15.2 steps 1-2)."""
     problems: list[str] = []
@@ -182,6 +244,8 @@ def validate_claims(
         problem = declaration_problem(c)
         if problem is not None:
             problems.append(problem)
+    for name in dupes or []:
+        problems.append(f"{name}: duplicate claim name")
     return problems
 
 
@@ -196,14 +260,29 @@ def kill_group(pid: int) -> None:
         pass
 
 
+def _pump(stream: Any, chunks: list[bytes]) -> None:
+    """Read a pipe to EOF in a background thread."""
+    try:
+        while True:
+            data = stream.read(65536)
+            if not data:
+                break
+            chunks.append(data)
+    except Exception:
+        pass
+
+
 def run_claim(
     hub: Path, module_name: str, name: str, timeout: float, omit: str | None = None
 ) -> tuple[str, Any]:
     """Run one claim in a subprocess; return (status, payload) (SPEC §15.2 step 3).
 
-    Status is timeout, ok (payload is a bool), finding (payload is a dict),
-    other (payload is a type name), error (payload is a traceback string),
-    exited (payload is the exit code) or unparsable (payload is the raw stdout).
+    The runner's exit ends the claim: wait for the process itself, not for pipe
+    EOF (a grandchild may hold the pipes). Output is pumped on background
+    threads; after exit or timeout the group is SIGKILLed and output collected
+    with a bounded wait. Status is timeout, ok (payload is a bool), finding
+    (payload is a dict), other (payload is a type name), error (payload is a
+    traceback string), exited (payload is the exit code) or unparsable.
     """
     env = dict(os.environ)
     if omit is None:
@@ -216,19 +295,42 @@ def run_claim(
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
         start_new_session=True,
     )
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+    readers = [
+        threading.Thread(target=_pump, args=(proc.stdout, out_chunks), daemon=True),
+        threading.Thread(target=_pump, args=(proc.stderr, err_chunks), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    timed_out = False
     try:
         try:
-            stdout, _ = proc.communicate(timeout=timeout)
+            code = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            kill_group(proc.pid)
-            stdout, _ = proc.communicate()
+            timed_out = True
+            code = None
+        kill_group(proc.pid)
+        deadline = time.monotonic() + COLLECT_S
+        for reader in readers:
+            reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        if timed_out:
+            try:
+                proc.wait(timeout=COLLECT_S)
+            except subprocess.TimeoutExpired:
+                pass
             return ("timeout", None)
-        return interpret_runner(proc.returncode, stdout)
+        return interpret_runner(code, b"".join(out_chunks).decode("utf-8", "replace"))
     finally:
         kill_group(proc.pid)
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
 
 
 def interpret_runner(returncode: int | None, stdout: str) -> tuple[str, Any]:
@@ -389,13 +491,9 @@ def _check_claims(
     _, registry = prog.load_registry(hub, program)
     if not claims:
         raise ValueError("project.claims is not configured")
-    selected = load_claims(hub, claims)
-    if backend is not None:
-        selected = [c for c in selected if c.backend == backend]
-    if covers is not None:
-        selected = [c for c in selected if covers in c.covers]
+    selected, dupes = select_claims(load_claims(hub, claims), backend, covers)
     active_ids = {b.id for b in registry.active()}
-    problems = validate_claims(selected, active_ids, backends)
+    problems = validate_claims(selected, active_ids, backends, dupes)
     if problems:
         for problem in problems:
             print(problem, file=stderr)
@@ -435,7 +533,7 @@ def run_selected(
         return inconclusive_finding(c, f"claim returned {payload}")
     if status == "exited":
         return inconclusive_finding(c, f"runner exited {payload}")
-    return inconclusive_finding(c, f"unparsable runner output: {str(payload)[:200]!r}")
+    return inconclusive_finding(c, "unparsable runner output")
 
 
 def attack_claim(
@@ -468,7 +566,11 @@ def _attack_claim(
     _, registry = prog.load_registry(hub, program)
     if not claims:
         raise ValueError("project.claims is not configured")
-    selected = load_claims(hub, claims)
+    selected, dupes = select_claims(load_claims(hub, claims), None, None)
+    if dupes:
+        for name in dupes:
+            print(f"{name}: duplicate claim name", file=stderr)
+        return 2
     wanted = [c for c in selected if c.name == name]
     if not wanted:
         print(f"{name}: unknown claim", file=stderr)

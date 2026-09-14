@@ -175,6 +175,58 @@ def test_check_build_error_line() -> None:
     assert unexpected == []
 
 
+@pytest.mark.parametrize(
+    "exc",
+    ["raise SystemExit(0)", "raise SystemExit('x')", "raise KeyboardInterrupt"],
+)
+def test_check_build_base_exception(exc: str) -> None:
+    reg = Registry()
+    namespace: dict[str, Any] = {}
+    exec(f"def build(model, data):\n    {exc}", namespace)
+    reg.add(Block("c1", "constraint", "x", build=namespace["build"]))
+    missing, unexpected, errors = prog.check_registry_full(reg, None)
+    assert len(errors) == 1
+    assert errors[0].startswith("error: c1: ")
+    assert "\n" not in errors[0]
+    assert missing == ["c1"]
+    assert unexpected == []
+
+
+def test_recording_model_assignment_and_numbers() -> None:
+    seen: list[tuple[str, str]] = []
+    kind = ["constraint"]
+    model = prog._RecordingModel(seen, kind)
+    model.ModelSense = 1
+    model.Params["x"] = 1
+    model.addConstr(name="c1")
+    assert seen == [("constraint", "c1")]
+    assert float(model.addVar()) == 0.0
+    assert int(model.addVar()) == 0
+
+
+def test_max_over_recorder_is_build_error() -> None:
+    def build(model: Any, data: Any) -> None:
+        model.addConstr(max(model.addVars(3)) <= 1, name="c1")
+
+    reg = Registry()
+    reg.add(Block("c1", "constraint", "x", build=build))
+    missing, unexpected, errors = prog.check_registry_full(reg, None)
+    assert len(errors) == 1
+    assert errors[0].startswith("error: c1: ValueError: ")
+
+
+def test_str_satisfies_rejected() -> None:
+    with pytest.raises(ValueError):
+        Block("x", "set", "e", satisfies="R1")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        Block("x", "set", "e", relaxes="R1")  # type: ignore[arg-type]
+    reg = Registry()
+    block = Block("x", "set", "e")
+    block.satisfies = "R1"  # type: ignore[assignment]
+    with pytest.raises(ValueError):
+        reg.add(block)
+
+
 def test_recording_model_operators() -> None:
     seen: list[tuple[str, str]] = []
     kind = ["constraint"]
@@ -433,6 +485,82 @@ def test_program_diff_removed_file_exit_2(
     rev2 = git(hub, "rev-parse", "HEAD")
     monkeypatch.chdir(hub)
     assert cli.main(["program", "diff", rev1, rev2]) == 2
+
+
+def test_program_diff_ignores_import_prints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    write_hub(hub, "prprog", "")
+    git(hub, "init", "-q")
+    (hub / "prprog.py").write_text(
+        "print('loading data')\n"
+        "from helios.program import Block, Registry\n"
+        "REGISTRY = Registry()\nREGISTRY.add(Block('a', 'set', 'x'))\n"
+    )
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r1")
+    rev1 = git(hub, "rev-parse", "HEAD")
+    (hub / "prprog.py").write_text(
+        "print('loading data')\n"
+        "from helios.program import Block, Registry\n"
+        "REGISTRY = Registry()\nREGISTRY.add(Block('a', 'set', 'x'))\n"
+        "REGISTRY.add(Block('b', 'set', 'y'))\n"
+    )
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r2")
+    rev2 = git(hub, "rev-parse", "HEAD")
+    monkeypatch.chdir(hub)
+    assert cli.main(["program", "diff", rev1, rev2]) == 0
+    assert capsys.readouterr().out == "+b\n"
+
+
+def test_program_diff_no_cwd_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    write_hub(hub, "lkprog", "")
+    git(hub, "init", "-q")
+    (hub / "lkprog.py").write_text(
+        "from helios.program import Block, Registry\nfrom lkhelp import IDS\n"
+        "REGISTRY = Registry()\nfor i in IDS:\n    REGISTRY.add(Block(i, 'set', 'x'))\n"
+    )
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r1")
+    rev1 = git(hub, "rev-parse", "HEAD")
+    (hub / "lkhelp.py").write_text("IDS = ['h']\n")
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r2")
+    rev2 = git(hub, "rev-parse", "HEAD")
+    (hub / "lkhelp.py").write_text("IDS = ['h', 'dirty']\n")
+    (hub / "sub").mkdir()
+    for cwd in (hub, hub / "sub"):
+        monkeypatch.chdir(cwd)
+        assert cli.main(["program", "diff", rev1, rev2]) == 2
+        err = capsys.readouterr().err
+        assert err.startswith(
+            f"helios: cannot import lkprog at {rev1}: ModuleNotFoundError: "
+        ), (cwd, err)
+
+
+@pytest.mark.parametrize(
+    "src", ["raise SystemExit(0)\n", "raise SystemExit('x')\n", "raise KeyboardInterrupt\n"]
+)
+def test_program_show_check_import_base_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, src: str
+) -> None:
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    (hub / ".agents").mkdir()
+    (hub / ".agents" / "workflow.toml").write_text('[project]\nprogram = "syprog"\n')
+    (hub / "syprog.py").write_text(src)
+    monkeypatch.chdir(hub)
+    assert cli.main(["program", "show"]) == 2
+    assert capsys.readouterr().err.startswith("helios: cannot import syprog: ")
+    assert cli.main(["program", "check"]) == 2
+    assert capsys.readouterr().err.startswith("helios: cannot import syprog: ")
 
 
 def test_two_hubs_same_module(tmp_path: Path) -> None:
