@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from helios import attempt, beads, events
+from helios import attempt, beads, events, sessions
 
 
 def _utc_seconds() -> str:
@@ -68,22 +68,14 @@ def say(
     if not numbers:
         raise ValueError(f"no runs directory for {bead}")
     attempt_dir = hub / runs_rel / bead / f"attempt-{numbers[-1]}"
-    state = _read_state(attempt_dir)
+    state = sessions.safe_state(attempt_dir)
     msg_id = write_message(hub / runs_rel, bead, text, kind)
     store = bead_store or beads.Beads(hub)
-    attempt_id = str(state.get("attempt_id") or f"{bead}#?")
+    attempt_id = str(state.get("attempt_id") or f"{bead}#{numbers[-1]}")
     add_comment(store, bead, kind, msg_id, text)
     record_event(hub, bead, attempt_id, kind, msg_id)
     alive = (pid_alive or _pid_alive)(state.get("pid"))
     return msg_id, state.get("state") == "launched" and alive
-
-
-def _read_state(directory: Path) -> dict[str, Any]:
-    try:
-        value = json.loads((directory / "state.json").read_text())
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        return {}
 
 
 def _pid_alive(pid: int | None) -> bool:

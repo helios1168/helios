@@ -16,19 +16,22 @@ def add_arguments(parser) -> None:
 
 
 def run(args) -> int:
-    cfg = config.load(Path.cwd())
-    runs = cfg.hub / cfg.project.runs
-    if sessions.latest(runs, args.bead) is None:
-        print(f"no runs directory for {args.bead}", file=sys.stderr)
-        return 2
     try:
+        cfg = config.load(Path.cwd())
+        runs = cfg.hub / cfg.project.runs
+        if sessions.latest(runs, args.bead) is None:
+            print(f"helios: no runs directory for {args.bead}", file=sys.stderr)
+            return 2
         msg_id, queued = messages.say(cfg.hub, cfg.project.runs, args.bead,
                                       args.text, kind=args.kind)
+    except RuntimeError as exc:
+        print(f"helios: {exc}", file=sys.stderr)
+        return 1
     except (OSError, ValueError, KeyError) as exc:
-        print(str(exc), file=sys.stderr)
+        print(f"helios: {exc}", file=sys.stderr)
         return 2
     if queued:
-        print(f"queued {msg_id}", file=sys.stderr)
+        print(f"helios: queued {msg_id}", file=sys.stderr)
         return 3
     print(msg_id)
     return 0

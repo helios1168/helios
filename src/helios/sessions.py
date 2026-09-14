@@ -32,7 +32,16 @@ def safe_state(directory: Path) -> dict[str, Any]:
         state = attempt.read_state(directory)
         if not isinstance(state, dict) or not isinstance(state.get("state"), str):
             raise ValueError("invalid state")
-        return state
+        normalized = dict(state)
+        pid = normalized.get("pid")
+        normalized["pid"] = pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else None
+        session_id = normalized.get("session_id")
+        normalized["session_id"] = session_id if isinstance(session_id, str) else None
+        execution_status = normalized.get("execution_status")
+        normalized["execution_status"] = execution_status if isinstance(execution_status, str) else None
+        normalized["attempt_id"] = normalized["attempt_id"] if isinstance(normalized.get("attempt_id"), str) else None
+        normalized["updated"] = normalized["updated"] if isinstance(normalized.get("updated"), str) else None
+        return normalized
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return {"state": "allocated", "attempt_id": None, "pid": None,
                 "session_id": None, "updated": None}
@@ -46,14 +55,16 @@ def _input(directory: Path) -> dict[str, Any]:
         return {}
 
 
-def _age(updated: Any, now: datetime | None = None) -> str:
+def _age(updated: Any, now: datetime | None = None) -> str | None:
     if not isinstance(updated, str):
-        return "-"
+        return None
     try:
         when = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            return None
         seconds = max(0, int(((now or datetime.now(timezone.utc)) - when).total_seconds()))
-    except ValueError:
-        return "-"
+    except (TypeError, ValueError):
+        return None
     if seconds < 60:
         return f"{seconds}s"
     if seconds < 3600:
@@ -67,14 +78,20 @@ def _last_event(hub: Path, bead: str, attempt_id: str | None) -> str | None:
     if not attempt_id:
         return None
     try:
-        lines = (hub / events.EVENT_PATH).read_text().splitlines()
+        lines = (hub / events.EVENT_PATH).read_bytes().split(b"\n")
     except OSError:
         return None
     result = None
-    for line in lines:
+    for raw_line in lines:
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
         try:
             value = json.loads(line)
-        except json.JSONDecodeError:
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict):
             continue
         if value.get("bead") == bead and value.get("attempt") == attempt_id:
             result = value.get("type")
@@ -105,14 +122,16 @@ def rows(hub: Path, runs_rel: str, *, bead_store: beads.BeadsLike | None = None,
         harness = inp.get("harness") or None
         session_id = state.get("session_id")
         session = f"{harness}:{session_id}" if harness is not None and session_id is not None else None
-        alive = attempt.is_pid_alive(state.get("pid"))
+        pid = state.get("pid")
+        alive = attempt.is_pid_alive(pid) if pid is not None else False
         stored = state["state"]
-        shown_state = f"{stored} (dead)" if stored == "launched" and not alive else stored
+        shown_state = f"{stored} (dead)" if stored == "launched" and pid is not None and not alive else stored
+        attempt_id = state.get("attempt_id") or f"{bead_dir.name}#{directory.name.removeprefix('attempt-')}"
         row = {"bead": bead_dir.name, "unit": unit, "kind": kind, "harness": harness,
-               "state": shown_state, "attempt": state.get("attempt_id"),
+               "state": shown_state, "attempt": attempt_id,
                "age": _age(state.get("updated"), now), "worktree": inp.get("worktree") or None,
                "session": session, "alive": alive,
-               "last_event": _last_event(hub, bead_dir.name, state.get("attempt_id"))}
+               "last_event": _last_event(hub, bead_dir.name, attempt_id)}
         out.append(row)
     return out
 
@@ -124,10 +143,11 @@ def attach(hub: Path, runs_rel: str, bead: str, *, harness_lookup: Callable[[str
     if directory is None:
         raise ValueError(f"no attempt for {bead}")
     inp, state = _input(directory), safe_state(directory)
+    project_config = config.load(hub)
     harness_name = inp.get("harness")
     if not harness_name:
         raise ValueError(f"no harness recorded for {state.get('attempt_id')}")
-    worktree = Path(inp.get("worktree", ""))
+    worktree = hub / project_config.project.worktrees / bead
     if not worktree.is_dir():
         raise ValueError(f"worktree missing for {state.get('attempt_id')}")
     session_id = state.get("session_id")
@@ -137,16 +157,17 @@ def attach(hub: Path, runs_rel: str, bead: str, *, harness_lookup: Callable[[str
     if not attempt_number.isdigit():
         raise ValueError(f"invalid attempt directory {directory.name}")
     n = int(attempt_number)
+    harness_config = project_config.harness.get(harness_name, config.HarnessConfig())
     spec = LaunchSpec(bead=bead, attempt=n, worktree=worktree, prompt="",
                       report_path=directory / "report.json", report_schema_path=hub / "schemas/agent-report.schema.json",
-                      raw_dir=directory / "raw", model=inp.get("model"), effort=inp.get("effort"),
-                      timeout_s=int(inp.get("timeout_s", 3600)), server_url=inp.get("server_url"),
-                      extra_args=tuple(inp.get("extra_args", ())))
+                      raw_dir=directory / "raw", model=harness_config.model, effort=harness_config.effort,
+                      timeout_s=harness_config.timeout_s, server_url=harness_config.server_url,
+                      extra_args=harness_config.extra_args)
     harness = harness_lookup(harness_name)
     argv = list(harness.attach_command(str(session_id), spec))
     if not argv:
         raise ValueError(f"empty attach command for {harness_name}")
-    binary = config.load(hub).harness.get(harness_name, config.HarnessConfig()).resolved_binary(harness_name)
+    binary = harness_config.resolved_binary(harness_name)
     argv[0] = binary
     os.chdir(worktree)
     execvp(argv[0], argv)
@@ -176,5 +197,5 @@ def stop(hub: Path, runs_rel: str, bead: str) -> None:
     process_id = cast(int, pid)
     try:
         os.killpg(process_id, signal.SIGINT)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass

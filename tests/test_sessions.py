@@ -103,6 +103,52 @@ def test_ps_bd_failure_uses_unknown_fields_and_damaged_state_is_allocated(tmp_pa
     assert row["unit"] is None and row["kind"] is None
 
 
+@pytest.mark.parametrize("line", [b"[1]\n", b'"a string"\n', b"42\n", b"null\n", b"\xff\n"])
+def test_ps_skips_bad_event_lines(tmp_path: Path, line: bytes) -> None:
+    directory = _attempt(tmp_path)
+    (tmp_path / ".helios" / "events.jsonl").write_bytes(line)
+    rows = sessions.rows(tmp_path, ".helios/runs", bead_store=FakeBeads([Bead(id="b1")]))
+    assert rows[0]["last_event"] is None
+
+
+def test_ps_naive_and_future_age_are_safe_and_json_null(tmp_path: Path) -> None:
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    directory = _attempt(tmp_path, state="launched", pid=None, updated="2026-01-01T00:00:00")
+    rows = sessions.rows(tmp_path, ".helios/runs", bead_store=FakeBeads([Bead(id="b1")]), now=now)
+    assert rows[0]["age"] is None and rows[0]["state"] == "launched"
+    directory = _attempt(tmp_path, n=2, updated="2027-01-01T00:00:00Z")
+    rows = sessions.rows(tmp_path, ".helios/runs", bead_store=FakeBeads([Bead(id="b1")]), now=now)
+    assert rows[0]["age"] == "0s"
+
+
+@pytest.mark.parametrize("pid", [0, -1, True, "123", 1.5])
+def test_stop_rejects_invalid_pid_without_signal_or_marker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid) -> None:
+    directory = _attempt(tmp_path, state="launched", pid=pid)
+    monkeypatch.setattr(sessions.os, "killpg", lambda *args: pytest.fail("killpg called"))
+    with pytest.raises(ValueError, match="no running attempt for b1"):
+        sessions.stop(tmp_path, ".helios/runs", "b1")
+    assert not (directory / "stop-requested").exists()
+
+
+def test_stop_ignores_permission_error_from_gone_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    directory = _attempt(tmp_path, state="launched", pid=123)
+    monkeypatch.setattr(sessions.attempt, "is_pid_alive", lambda pid: True)
+    def gone(pid, sig):
+        raise PermissionError("gone")
+    monkeypatch.setattr(sessions.os, "killpg", gone)
+    sessions.stop(tmp_path, ".helios/runs", "b1")
+    assert (directory / "stop-requested").is_file()
+
+
+def test_commands_prefix_configuration_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    (tmp_path / ".agents").mkdir()
+    (tmp_path / ".agents" / "workflow.toml").write_text("[bogus]\nx = 1\n")
+    monkeypatch.chdir(tmp_path)
+    for args in (["ps"], ["attach", "b1"], ["say", "b1", "x"], ["stop", "b1"]):
+        assert cli.main(args) == 2
+        assert capsys.readouterr().err.startswith("helios: ")
+
+
 @pytest.mark.parametrize("seconds, expected", [(59, "59s"), (60, "1m"), (3599, "59m"),
                                                   (3600, "1h"), (86399, "23h"), (86400, "1d")])
 def test_ps_age_boundaries(tmp_path: Path, seconds: int, expected: str) -> None:
@@ -138,8 +184,8 @@ def test_attach_error_cases_and_success(tmp_path: Path, monkeypatch: pytest.Monk
     _input(directory, harness="fake", worktree=str(tmp_path / "missing"))
     with pytest.raises(ValueError, match="worktree missing for b1#1"):
         sessions.attach(tmp_path, ".helios/runs", "b1", harness_lookup=lambda name: None)
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
+    worktree = tmp_path / ".claude" / "worktrees" / "b1"
+    worktree.mkdir(parents=True)
     _input(directory, harness="fake", worktree=str(worktree))
     with pytest.raises(ValueError, match="no session recorded for b1#1"):
         sessions.attach(tmp_path, ".helios/runs", "b1", harness_lookup=lambda name: None)

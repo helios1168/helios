@@ -14,10 +14,10 @@ def add_arguments(parser) -> None:
 
 
 def run(args) -> int:
-    cfg = config.load(Path.cwd())
     try:
+        cfg = config.load(Path.cwd())
         sessions.stop(cfg.hub, cfg.project.runs, args.bead)
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"helios: {exc}", file=sys.stderr)
         return 2
     return 0

@@ -14,7 +14,11 @@ def add_arguments(parser) -> None:
 
 
 def run(args) -> int:
-    cfg = config.load(Path.cwd())
+    try:
+        cfg = config.load(Path.cwd())
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"helios: {exc}", file=__import__("sys").stderr)
+        return 2
     rows = sessions.rows(cfg.hub, cfg.project.runs)
     if args.as_json:
         print(json.dumps(rows, sort_keys=True))
