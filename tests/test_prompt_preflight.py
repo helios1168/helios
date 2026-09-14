@@ -143,6 +143,29 @@ def test_heading_whitespace_shapes() -> None:
         pr.find_section("    ## B\n\nbody\n", "B")
 
 
+def test_docs_and_memories_strip_only_leading_and_trailing_newlines() -> None:
+    """Only leading/trailing ``\\n`` characters are removed (SPEC §7.2 item 5,
+    decided in hel-67j): a first line's indentation and other whitespace
+    (including a lone leading/trailing space) survive."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        hub = make_hub(Path(tmp))
+        (hub / "docs" / "IND.md").write_text("    indented doc line\nmore text\n")
+        kwargs = base_kwargs(hub)
+        kwargs["docs"] = ["docs/IND.md"]
+        kwargs["memories"] = {
+            "m1": "    indented code\nline2\n\n",
+            "m2": "\n\ntext\n\n",
+            "m3": "  x  ",
+        }
+        out = pr.assemble(**kwargs)
+        assert "### docs/IND.md\n\n    indented doc line\nmore text" in out
+        assert "### m1\n\n    indented code\nline2" in out
+        assert "### m2\n\ntext" in out
+        assert "### m3\n\n  x  " in out
+
+
 def test_assemble_caps_docs_plus_memories() -> None:
     import tempfile
 

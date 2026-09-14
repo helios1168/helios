@@ -305,6 +305,27 @@ def test_memories_section_fakebeads_backend_matches_inject(
     assert data["input_hashes"]["memory/k1"] == run_mod.sha256_text("fake body")
 
 
+def test_memories_section_keeps_leading_indentation(tmp_path: Path, monkeypatch) -> None:
+    """A memory body that starts with an indented line keeps it in the prompt
+    (hel-67j): prompt.assemble strips only leading/trailing newlines, so this
+    still matches backend.inject byte for byte for a body with no leading or
+    trailing newline of its own."""
+    import dataclasses
+
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    cfg = dataclasses.replace(cfg, memory=dataclasses.replace(cfg.memory, backend="files"))
+    backend = memory_mod.FilesBackend(cfg.hub / cfg.memory.export_dir)
+    backend.write("k1", {"source": "hel-1#1"}, "    indented code\nline2")
+    beads = beads_mod.FakeBeads([make_bead("b1", memories=["k1"])])
+    set_fake(monkeypatch, write_script(tmp_path, DONE_SCRIPT))
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 0
+    prompt = (hub / ".helios" / "runs" / "b1" / "attempt-1" / "prompt.md").read_text()
+    assert _memories_section(prompt) == backend.inject(["k1"])
+    assert "### k1\n\n    indented code\nline2" in _memories_section(prompt)
+
+
 BD = shutil.which("bd")
 
 

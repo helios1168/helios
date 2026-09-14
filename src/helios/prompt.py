@@ -152,8 +152,10 @@ def assemble(
     bead_json = json.dumps(
         {k: bead.get(k) for k in BEAD_FIELDS}, indent=2, sort_keys=True
     )
-    entries = [(entry, f"### {entry}\n\n{read_doc(hub, entry)[1].strip()}") for entry in docs]
-    mem_parts = [(key, f"### {key}\n\n{value.strip()}") for key, value in memories.items()]
+    entries = [
+        (entry, f"### {entry}\n\n{read_doc(hub, entry)[1].strip('\n')}") for entry in docs
+    ]
+    mem_parts = [(key, f"### {key}\n\n{value.strip('\n')}") for key, value in memories.items()]
     capped_docs, capped_mems, note = _apply_cap(entries, mem_parts, inject_cap_bytes)
     memories_text = "\n\n".join(capped_mems)
     if note:
