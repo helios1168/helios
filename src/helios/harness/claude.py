@@ -50,11 +50,11 @@ class ClaudeAdapter(Harness):
     ) -> NativeResult:
         """Parse the single JSON object stdout (SPEC §6.4)."""
         try:
-            text = stdout_path.read_text()
+            data = stdout_path.read_bytes()
         except OSError:
             return NativeResult(session_id=None, structured=None, native_error="no stdout")
         try:
-            obj = json.loads(text.strip())
+            obj = json.loads(data.decode("utf-8").strip())
         except Exception:
             return NativeResult(session_id=None, structured=None, native_error="invalid JSON")
         if not isinstance(obj, dict):
@@ -69,8 +69,8 @@ class ClaudeAdapter(Harness):
             return NativeResult(
                 session_id=session_id, structured=None, native_error=result
             )
-        structured: dict[str, Any] | None = obj.get("structured_output")
-        if structured is None:
+        structured: Any = obj.get("structured_output")
+        if "structured_output" not in obj:
             return NativeResult(
                 session_id=session_id,
                 structured=None,

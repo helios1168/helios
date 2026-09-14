@@ -8,15 +8,24 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from helios.harness.agy import AgyAdapter
-from helios.harness.base import LaunchSpec
+from helios.harness.base import LaunchSpec, NativeResult
 from helios.harness.claude import ClaudeAdapter
 from helios.harness.codex import CodexAdapter
 from helios.harness.opencode import OpencodeAdapter
 
 ROOT = Path(__file__).resolve().parents[1]
 FIX = ROOT / "tests" / "fixtures" / "native"
+
+ADAPTERS = {
+    "claude": ClaudeAdapter(),
+    "codex": CodexAdapter(),
+    "opencode": OpencodeAdapter(),
+    "agy": AgyAdapter(),
+}
 
 
 def make_spec(tmp_path: Path, **kw) -> LaunchSpec:
@@ -448,3 +457,166 @@ def test_fixture_values_are_json_objects():
     for name in ("claude/fresh.stdout", "agy/fresh.stdout"):
         obj = json.loads((FIX / name).read_text())
         assert isinstance(obj, dict), name
+
+
+# byte-level input handling (SPEC §6.4)
+
+
+@pytest.mark.parametrize("name", ["claude", "codex", "opencode", "agy"])
+@pytest.mark.parametrize("payload", [b"\x80", b"\xff\xfe garbage\n"])
+def test_parse_invalid_utf8_stdout(name, payload, tmp_path: Path):
+    spec = make_spec(tmp_path)
+    out = tmp_path / "bad.stdout"
+    out.write_bytes(payload)
+    got = ADAPTERS[name].parse(spec, 0, out)
+    assert got.structured is None
+    if name in ("claude", "agy"):
+        assert got.native_error == "invalid JSON"
+    else:
+        assert got.native_error == "no events"
+        assert got.notes == ("skipped 1 non-JSON lines",)
+
+
+@pytest.mark.parametrize("name", ["claude", "codex", "opencode", "agy"])
+def test_parse_directory_stdout(name, tmp_path: Path):
+    spec = make_spec(tmp_path)
+    d = tmp_path / "dir.stdout"
+    d.mkdir()
+    got = ADAPTERS[name].parse(spec, 0, d)
+    assert got == NativeResult(None, None, "no stdout")
+
+
+def test_codex_last_message_invalid_utf8(tmp_path: Path):
+    spec = make_spec(tmp_path)
+    (spec.raw_dir / "last-message.json").write_bytes(b'{"a":"\xff"}')
+    got = CodexAdapter().parse(spec, 0, FIX / "codex" / "fresh.stdout")
+    assert got.native_error is None
+    assert got.structured is None
+    assert got.notes == ("structured result is not a JSON object",)
+
+
+HS = settings(
+    max_examples=100,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture, HealthCheck.too_slow],
+)
+
+
+@pytest.mark.parametrize("name", ["claude", "codex", "opencode", "agy"])
+@HS
+@given(data=st.binary(max_size=600), code=st.one_of(st.none(), st.integers(-300, 300)))
+def test_parse_random_bytes_never_raises(name, data, code, tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("rb")
+    spec = make_spec(tmp)
+    out = tmp / "out.stdout"
+    out.write_bytes(data)
+    (spec.raw_dir / "last-message.json").write_bytes(data)
+    got = ADAPTERS[name].parse(spec, code, out)
+    assert isinstance(got, NativeResult)
+    if got.native_error is not None:
+        assert got.structured is None and got.native_error
+
+
+@pytest.mark.parametrize("sep", ["\u2028", "\u2029", "\x85"])
+def test_codex_unicode_separator_inside_string(sep, tmp_path: Path):
+    lines = (FIX / "codex" / "fresh.stdout").read_text().splitlines()
+    item = json.loads(lines[2])
+    item["item"]["text"] = f"a{sep}b"
+    lines[2] = json.dumps(item, ensure_ascii=False)
+    out = tmp_path / "u.stdout"
+    out.write_bytes(("\n".join(lines) + "\n").encode())
+    spec = make_spec(tmp_path)
+    (spec.raw_dir / "last-message.json").write_bytes(b"{}")
+    got = CodexAdapter().parse(spec, 0, out)
+    assert got.native_error is None, got
+    assert got.notes == ()
+
+
+@pytest.mark.parametrize("sep", ["\u2028", "\u2029", "\x85"])
+def test_opencode_unicode_separator_inside_string(sep, tmp_path: Path):
+    lines = (FIX / "opencode" / "fresh.stdout").read_text().splitlines()
+    fin = json.loads(lines[2])
+    fin["part"]["reason"] = f"stop{sep}"
+    lines[2] = json.dumps(fin, ensure_ascii=False)
+    out = tmp_path / "u.stdout"
+    out.write_bytes(("\n".join(lines) + "\n").encode())
+    got = OpencodeAdapter().parse(make_spec(tmp_path), 0, out)
+    assert got.native_error is None, got
+    assert got.notes == ()
+
+
+def test_codex_error_message_with_separator(tmp_path: Path):
+    text = (FIX / "codex" / "error.stdout").read_text()
+    data = text.replace("not supported", "not\u2028supported")
+    for line in data.split("\n"):
+        if line.strip():
+            assert isinstance(json.loads(line), dict)
+    out = tmp_path / "e.stdout"
+    out.write_bytes(data.encode())
+    got = CodexAdapter().parse(make_spec(tmp_path), 1, out)
+    assert got.native_error and "supported" in got.native_error, got
+
+
+def test_opencode_error_message_with_separator(tmp_path: Path):
+    text = (FIX / "opencode" / "error.stdout").read_text()
+    data = text.replace("Unexpected server error.", "Unexpected\u2028server error.")
+    for line in data.split("\n"):
+        if line.strip():
+            assert isinstance(json.loads(line), dict)
+    out = tmp_path / "e.stdout"
+    out.write_bytes(data.encode())
+    got = OpencodeAdapter().parse(make_spec(tmp_path), 1, out)
+    assert got.session_id == "ses_f637fb102ffeVkpLJhLshoFXNm", got
+    assert got.native_error == "Unexpected\u2028server error. Check server logs for details.", got
+
+
+@pytest.mark.parametrize("name", ["claude", "agy"])
+def test_structured_output_null_is_not_an_object(name, tmp_path: Path):
+    obj = json.loads((FIX / name / "fresh.stdout").read_text())
+    obj["structured_output"] = None
+    out = tmp_path / "n.stdout"
+    out.write_text(json.dumps(obj))
+    got = ADAPTERS[name].parse(make_spec(tmp_path), 0, out)
+    assert got.native_error is None
+    assert got.structured is None
+    assert got.notes == ("structured result is not a JSON object",)
+
+
+def test_codex_session_skips_non_string_thread_id(tmp_path: Path):
+    out = tmp_path / "s.stdout"
+    out.write_bytes(
+        b'{"type":"thread.started","thread_id":7}\n'
+        b'{"type":"thread.started","thread_id":"B"}\n'
+        b'{"type":"turn.completed"}\n'
+    )
+    spec = make_spec(tmp_path)
+    (spec.raw_dir / "last-message.json").write_bytes(b"{}")
+    got = CodexAdapter().parse(spec, 0, out)
+    assert got.native_error is None
+    assert got.session_id == "B"
+    assert got.structured == {}
+
+
+def test_opencode_session_skips_non_string_id(tmp_path: Path):
+    out = tmp_path / "s.stdout"
+    out.write_bytes(
+        b'{"type":"step_start","sessionID":42,"part":{}}\n'
+        b'{"type":"text","sessionID":"real","part":{}}\n'
+        b'{"type":"step_finish","sessionID":"real","part":{}}\n'
+    )
+    got = OpencodeAdapter().parse(make_spec(tmp_path), 0, out)
+    assert got.native_error is None
+    assert got.session_id == "real"
+
+
+@pytest.mark.parametrize("value", ["true", 1])
+def test_claude_is_error_non_bool_is_not_failure(value, tmp_path: Path):
+    out = tmp_path / "b.stdout"
+    out.write_text(json.dumps({
+        "session_id": "s1", "is_error": value, "result": "r",
+        "structured_output": {"a": 1},
+    }))
+    got = ClaudeAdapter().parse(make_spec(tmp_path), 0, out)
+    assert got.native_error is None
+    assert got.session_id == "s1"
+    assert got.structured == {"a": 1}

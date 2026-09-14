@@ -48,10 +48,10 @@ class OpencodeAdapter(Harness):
     ) -> NativeResult:
         """Parse the JSON lines stdout (SPEC §6.4)."""
         try:
-            text = stdout_path.read_text()
+            data = stdout_path.read_bytes()
         except OSError:
             return NativeResult(session_id=None, structured=None, native_error="no stdout")
-        events, skipped = _parse_lines(text)
+        events, skipped = _parse_lines(data)
         notes: list[str] = []
         if skipped:
             notes.append(f"skipped {skipped} non-JSON lines")
@@ -108,11 +108,19 @@ class OpencodeAdapter(Harness):
         return ["opencode", str(spec.worktree), "-s", session_id]
 
 
-def _parse_lines(text: str) -> tuple[list[dict[str, Any]], int]:
-    """Split JSON lines output into events, counting skipped lines (SPEC §6.4)."""
+def _parse_lines(data: bytes) -> tuple[list[dict[str, Any]], int]:
+    """Split stdout bytes on newline only and decode each line (SPEC §6.4)."""
+    pieces = data.split(b"\n")
+    if pieces and pieces[-1] == b"":
+        pieces.pop()
     events: list[dict[str, Any]] = []
     skipped = 0
-    for line in text.splitlines():
+    for piece in pieces:
+        try:
+            line = piece.decode("utf-8")
+        except UnicodeDecodeError:
+            skipped += 1
+            continue
         stripped = line.strip()
         if not stripped:
             skipped += 1
