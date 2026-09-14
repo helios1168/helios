@@ -237,13 +237,22 @@ def test_assemble_cap_never_splits_a_character() -> None:
         assert "truncated for inject cap" in out
 
 
-def impl_bead(**kw) -> Bead:
-    base = dict(
-        id="b1", kind="impl", files=["src/"], test="uv run pytest -q",
-        docs=[], memories=[],
+def impl_bead(
+    *,
+    id: str = "b1",
+    files: list[str] | None = None,
+    test: str = "uv run pytest -q",
+    docs: list[str] | None = None,
+    memories: list[str] | None = None,
+) -> Bead:
+    return Bead(
+        id=id,
+        kind="impl",
+        files=["src/"] if files is None else files,
+        test=test,
+        docs=[] if docs is None else docs,
+        memories=[] if memories is None else memories,
     )
-    base.update(kw)
-    return Bead(**base)
 
 
 def test_preflight_needs_files_test_docs_and_memories(tmp_path: Path) -> None:
