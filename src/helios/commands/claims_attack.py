@@ -27,6 +27,6 @@ def run(args: argparse.Namespace) -> int:
             claims=config.project.claims,
             name=args.claim,
         )
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, ImportError) as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2

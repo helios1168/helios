@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -114,6 +115,28 @@ def test_show_same_registry_same_bytes() -> None:
     )
 
 
+def test_show_line_endings_and_sorted_sets() -> None:
+    reg = Registry()
+    reg.add(
+        Block(
+            "c",
+            "constraint",
+            "line1\nline2\r\nline3\rlast",
+            satisfies={"R3", "R1", "R2"},
+            relaxes={"b", "a"},
+        )
+    )
+    assert prog.show_text(reg) == "## constraint\nc  line1 line2 line3 last  # satisfies R1, R2, R3 / relaxes a, b\n"
+
+
+def test_show_empty_registry_is_zero_bytes() -> None:
+    assert prog.show_text(Registry()) == ""
+    only_retired = Registry()
+    only_retired.add(Block("x", "set", "e"))
+    only_retired.retire("x")
+    assert prog.show_text(only_retired) == "## Retired\nx  e\n"
+
+
 def recording_build(names: list[str]) -> Callable[[Any, Any], None]:
     def build(model: Any, data: Any) -> None:
         for name in names:
@@ -129,14 +152,60 @@ def test_check_ok() -> None:
     reg.add(Block("o1", "objective", "z", build=recording_build(["o1"])))
     reg.add(Block("v1", "variable", "w", build=recording_build(["junk"])))
     reg.add(Block("d1", "definition", "q"))
-    assert prog.check_registry(reg, None) == ([], [])
+    assert prog.check_registry_full(reg, None) == ([], [], [])
 
 
 def test_check_missing_and_unexpected() -> None:
     reg = Registry()
     reg.add(Block("c1", "constraint", "x", build=recording_build([])))
     reg.add(Block("o1", "objective", "z", build=recording_build(["ghost"])))
-    assert prog.check_registry(reg, None) == (["c1", "o1"], ["ghost"])
+    assert prog.check_registry_full(reg, None) == (["c1", "o1"], ["ghost"], [])
+
+
+def test_check_build_error_line() -> None:
+    def bad(model: Any, data: Any) -> None:
+        raise RuntimeError("build broke")
+
+    reg = Registry()
+    reg.add(Block("ok", "constraint", "x", build=recording_build(["ok"])))
+    reg.add(Block("bad", "constraint", "y", build=bad))
+    missing, unexpected, errors = prog.check_registry_full(reg, None)
+    assert errors == ["error: bad: RuntimeError: build broke"]
+    assert "bad" in missing
+    assert unexpected == []
+
+
+def test_recording_model_operators() -> None:
+    seen: list[tuple[str, str]] = []
+    kind = ["constraint"]
+    model = prog._RecordingModel(seen, kind)
+    x = model.addVar()
+    recorder = model.addConstr(x[0] + 2 * x <= sum([x, x]), name="c[0]")
+    assert seen == [("constraint", "c[0]")]
+    assert bool(recorder) is True
+    assert len(recorder) == 0
+    assert list(iter(recorder)) == []
+    assert isinstance(-x + +x - x * x / x // x % x**x, prog._Recorder)
+    assert isinstance((x << 1 >> 1) & 1 | 1 ^ 1, prog._Recorder)
+    assert isinstance(x == 1, prog._Recorder)
+    assert isinstance(x != 2, prog._Recorder)
+    assert isinstance(1 < x, prog._Recorder)
+    assert isinstance(x <= 2, prog._Recorder)
+    assert isinstance(abs(~x), prog._Recorder)
+    assert isinstance(round(x), prog._Recorder)
+    assert isinstance(model[1:2], prog._Recorder)
+
+
+def test_recording_model_gurobi_style_loop() -> None:
+    seen: list[tuple[str, str]] = []
+    kind = ["constraint"]
+    model = prog._RecordingModel(seen, kind)
+    x = model.addVars(3)
+    y = model.addVar()
+    z = [model.addVar(), model.addVar()]
+    for i in range(3):
+        model.addConstr(x[i] + 2 * y <= sum(z), name=f"c[{i}]")
+    assert seen == [("constraint", f"c[{i}]") for i in range(3)]
 
 
 def write_hub(hub: Path, module_name: str, source: str) -> None:
@@ -192,85 +261,221 @@ def test_program_check_command_exit_0_and_5(
         '    model.add(name="c1")\n'
         "def _bad(model, data):\n"
         '    model.add(name="ghost")\n'
+        "def _boom(model, data):\n"
+        "    raise RuntimeError('build broke')\n"
         'REGISTRY.add(Block("c1", "constraint", "x", build=_good))\n'
         'REGISTRY.add(Block("c2", "constraint", "y", build=_bad))\n'
+        'REGISTRY.add(Block("c3", "constraint", "z", build=_boom))\n'
     )
     monkeypatch.chdir(hub)
     assert cli.main(["program", "check"]) == 5
     out = capsys.readouterr().out
-    assert "missing: c2\n" in out
+    assert "error: c3: RuntimeError: build broke\n" in out
+    assert "missing: c2, c3\n" in out
     assert "unexpected: ghost\n" in out
+
+
+def test_import_errors_exit_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    (hub / ".agents").mkdir()
+    (hub / ".agents" / "workflow.toml").write_text('[project]\nprogram = "nothere"\n')
+    monkeypatch.chdir(hub)
+    assert cli.main(["program", "show"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("helios: cannot import nothere: ")
+    (hub / "nothere.py").write_text("raise RuntimeError('import boom')\n")
+    assert cli.main(["program", "show"]) == 2
+    err = capsys.readouterr().err
+    assert err == "helios: cannot import nothere: RuntimeError: import boom\n"
+
+
+def git_env() -> dict[str, str]:
+    return {
+        **dict(os.environ),
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
 
 
 def git(path: Path, *args: str) -> str:
     proc = subprocess.run(
-        ["git", *args],
-        cwd=path,
-        capture_output=True,
-        text=True,
-        env={
-            **dict(os.environ),
-            "GIT_AUTHOR_NAME": "t",
-            "GIT_AUTHOR_EMAIL": "t@t",
-            "GIT_COMMITTER_NAME": "t",
-            "GIT_COMMITTER_EMAIL": "t@t",
-        },
+        ["git", *args], cwd=path, capture_output=True, text=True, env=git_env()
     )
     assert proc.returncode == 0, proc.stderr
     return proc.stdout.strip()
 
 
-def make_repo(hub: Path, layout: str) -> tuple[str, str]:
-    write_hub(
-        hub,
-        "dpkg.mod" if layout == "src" else "dprog",
-        "from helios.program import Block, Registry\n"
-        "REGISTRY = Registry()\n"
-        'REGISTRY.add(Block("a", "constraint", "x"))\n'
-        'REGISTRY.add(Block("b", "constraint", "y"))\n',
+def commit_prog(hub: Path, module_file: str, ids: list[str], message: str) -> str:
+    source = "from helios.program import Block, Registry\nREGISTRY = Registry()\n" + "".join(
+        f"REGISTRY.add(Block('{i}', 'set', 'x'))\n" for i in ids
     )
-    if layout == "src":
-        (hub / "src" / "dpkg").mkdir(parents=True)
-        (hub / "src" / "dpkg" / "mod.py").write_text((hub / "dpkg.mod.py").read_text())
-        (hub / "dpkg.mod.py").unlink()
-        (hub / ".agents" / "workflow.toml").write_text('[project]\nprogram = "dpkg.mod"\n')
-        target = "src/dpkg/mod.py"
-    else:
-        target = "dprog.py"
-    git(hub, "init", "-q")
-    git(hub, "add", ".")
-    git(hub, "commit", "-qm", "v1")
-    rev1 = git(hub, "rev-parse", "HEAD")
-    old = (hub / target).read_text()
-    (hub / target).write_text(old.replace('Block("b"', 'Block("c"'))
-    git(hub, "add", ".")
-    git(hub, "commit", "-qm", "v2")
-    rev2 = git(hub, "rev-parse", "HEAD")
-    return rev1, rev2
+    target = hub / module_file
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source)
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", message)
+    return git(hub, "rev-parse", "HEAD")
 
 
-@pytest.mark.parametrize("layout", ["root", "src"])
-def test_program_diff_layouts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, layout: str
-) -> None:
-    hub = tmp_path / "hub"
-    hub.mkdir()
-    rev1, rev2 = make_repo(hub, layout)
-    monkeypatch.chdir(hub)
-    assert cli.main(["program", "diff", rev1, rev2]) == 0
-    assert capsys.readouterr().out == "+c\n-b\n"
-
-
-def test_program_diff_absent_revision_exits_2(
+def test_program_diff_basic_and_missing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
     hub = tmp_path / "hub"
     hub.mkdir()
-    (hub / ".agents").mkdir()
-    (hub / ".agents" / "workflow.toml").write_text('[project]\nprogram = "nope.mod"\n')
+    write_hub(hub, "dprog", "")
     git(hub, "init", "-q")
-    git(hub, "commit", "-q", "--allow-empty", "-m", "empty")
-    rev = git(hub, "rev-parse", "HEAD")
+    rev1 = commit_prog(hub, "dprog.py", ["a", "c2", "c10"], "r1")
+    rev2 = commit_prog(hub, "dprog.py", ["a", "c3", "b10", "b9"], "r2")
     monkeypatch.chdir(hub)
-    assert cli.main(["program", "diff", rev, rev]) == 2
-    assert "not found" in capsys.readouterr().err
+    assert cli.main(["program", "diff", rev1, rev2]) == 0
+    assert capsys.readouterr().out == "+b10\n+b9\n+c3\n-c10\n-c2\n"
+    assert cli.main(["program", "diff", rev1, rev1]) == 0
+    assert capsys.readouterr().out == ""
+    assert cli.main(["program", "diff", rev1, "deadbeef"]) == 2
+    assert "helios: " in capsys.readouterr().err
+
+
+def test_program_diff_src_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    (hub / ".agents").mkdir()
+    (hub / ".agents" / "workflow.toml").write_text('[project]\nprogram = "dpkg.mod"\n')
+    git(hub, "init", "-q")
+    rev1 = commit_prog(hub, "src/dpkg/mod.py", ["a"], "r1")
+    rev2 = commit_prog(hub, "src/dpkg/mod.py", ["a", "b"], "r2")
+    commit_prog(hub, "dpkg/mod.py", ["rootonly"], "r3")
+    monkeypatch.chdir(hub)
+    assert cli.main(["program", "diff", rev1, rev2]) == 0
+    assert capsys.readouterr().out == "+b\n"
+
+
+def test_program_diff_dataclass_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    write_hub(hub, "dcprog", "")
+    git(hub, "init", "-q")
+    src = (
+        "import dataclasses\nfrom helios.program import Block, Registry\n"
+        "@dataclasses.dataclass\nclass D:\n    n: int = 1\n"
+        "REGISTRY = Registry()\nREGISTRY.add(Block('a', 'set', 'x'))\n"
+    )
+    (hub / "dcprog.py").write_text(src)
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r1")
+    rev1 = git(hub, "rev-parse", "HEAD")
+    (hub / "dcprog.py").write_text(src + "REGISTRY.add(Block('b', 'set', 'y'))\n")
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r2")
+    rev2 = git(hub, "rev-parse", "HEAD")
+    monkeypatch.chdir(hub)
+    assert cli.main(["program", "diff", rev1, rev2]) == 0
+    assert capsys.readouterr().out == "+b\n"
+
+
+def test_program_diff_sibling_import_resolves_at_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    write_hub(hub, "sibprog", "")
+    git(hub, "init", "-q")
+    (hub / "sibhelp.py").write_text("IDS = ['old1']\n")
+    (hub / "sibprog.py").write_text(
+        "from helios.program import Block, Registry\nfrom sibhelp import IDS\n"
+        "REGISTRY = Registry()\nfor i in IDS:\n    REGISTRY.add(Block(i, 'set', 'x'))\n"
+    )
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r1")
+    rev1 = git(hub, "rev-parse", "HEAD")
+    (hub / "sibhelp.py").write_text("IDS = ['new1']\n")
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r2")
+    rev2 = git(hub, "rev-parse", "HEAD")
+    monkeypatch.chdir(hub)
+    assert cli.main(["program", "diff", rev1, rev2]) == 0
+    assert capsys.readouterr().out == "+new1\n-old1\n"
+
+
+def test_program_diff_syntax_error_exit_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    write_hub(hub, "seprog", "")
+    git(hub, "init", "-q")
+    rev1 = commit_prog(hub, "seprog.py", ["a"], "r1")
+    (hub / "seprog.py").write_text("def broken(:\n")
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r2")
+    rev2 = git(hub, "rev-parse", "HEAD")
+    monkeypatch.chdir(hub)
+    assert cli.main(["program", "diff", rev1, rev2]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith(f"helios: cannot import seprog at {rev2}: SyntaxError: ")
+
+
+def test_program_diff_removed_file_exit_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    write_hub(hub, "rmprog", "")
+    git(hub, "init", "-q")
+    rev1 = commit_prog(hub, "rmprog.py", ["a"], "r1")
+    (hub / "rmprog.py").unlink()
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r2")
+    rev2 = git(hub, "rev-parse", "HEAD")
+    monkeypatch.chdir(hub)
+    assert cli.main(["program", "diff", rev1, rev2]) == 2
+
+
+def test_two_hubs_same_module(tmp_path: Path) -> None:
+    res = {}
+    for layout in ("flat", "dotted"):
+        ids = []
+        for i in (1, 2):
+            hub = tmp_path / f"{layout}{i}"
+            if layout == "flat":
+                hub.mkdir()
+                (hub / "sameprog2.py").write_text(
+                    "from helios.program import Block, Registry\nREGISTRY = Registry()\n"
+                    f"REGISTRY.add(Block('h{i}', 'set', 'x'))\n"
+                )
+                name = "sameprog2"
+            else:
+                (hub / "src" / "samepkg2").mkdir(parents=True)
+                (hub / "src" / "samepkg2" / "__init__.py").write_text("")
+                (hub / "src" / "samepkg2" / "prog.py").write_text(
+                    "from helios.program import Block, Registry\nREGISTRY = Registry()\n"
+                    f"REGISTRY.add(Block('h{i}', 'set', 'x'))\n"
+                )
+                name = "samepkg2.prog"
+            _, reg = prog.load_registry(hub, name)
+            ids.append([b.id for b in reg.active()])
+        res[layout] = ids
+    assert res["flat"] == [["h1"], ["h2"]]
+    assert res["dotted"] == [["h1"], ["h2"]]
+
+
+def test_real_cli_diff_subprocess(tmp_path: Path) -> None:
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    write_hub(hub, "cliprog", "")
+    git(hub, "init", "-q")
+    rev1 = commit_prog(hub, "cliprog.py", ["a"], "r1")
+    rev2 = commit_prog(hub, "cliprog.py", ["a", "b"], "r2")
+    proc = subprocess.run(
+        [sys.executable, "-m", "helios.cli", "program", "diff", rev1, rev2],
+        cwd=hub,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "+b\n"

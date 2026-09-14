@@ -29,6 +29,6 @@ def run(args: argparse.Namespace) -> int:
         for line in prog.diff_ids(old, new):
             print(line)
         return 0
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, ImportError) as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2

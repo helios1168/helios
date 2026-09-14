@@ -28,6 +28,6 @@ def run(args: argparse.Namespace) -> int:
         else:
             sys.stdout.write(text)
         return 0
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, ImportError) as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tomllib
@@ -17,6 +18,17 @@ from helios.envelope import Finding, Method, Scope, Verdict
 
 REQUIREMENT_RE = re.compile(r"^R[0-9]+$")
 MANUAL_BACKEND = "manual"
+
+
+class scrubbed_omit:
+    """Remove HELIOS_OMIT from the environment, restoring it after (SPEC §15.2)."""
+
+    def __enter__(self) -> None:
+        self._saved: str | None = os.environ.pop(prog.OMIT_ENV, None)
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._saved is not None:
+            os.environ[prog.OMIT_ENV] = self._saved
 
 
 def is_requirement(id: str) -> bool:
@@ -129,10 +141,27 @@ def load_claims(hub: Path, module_name: str | None) -> list[Claim]:
     )
 
 
+def declaration_problem(c: Claim) -> str | None:
+    """Check the declared method, scope and bound build a verified Finding (SPEC §15.2 step 2)."""
+    try:
+        Finding(
+            id=c.name,
+            claim=c.name,
+            covers=list(c.covers),
+            verdict=Verdict.VERIFIED,
+            method=Method(c.method),
+            scope=Scope(c.scope),
+            bound=c.bound,
+        )
+    except ValueError as exc:
+        return f"{c.name}: declaration cannot give a verified finding: {exc}"
+    return None
+
+
 def validate_claims(
     claims: list[Claim], active_ids: set[str], backends: dict[str, Backend]
 ) -> list[str]:
-    """Coverage and backend problems for every selected claim (SPEC §15.2 steps 1-2)."""
+    """Coverage, backend and declaration problems for every claim (SPEC §15.2 steps 1-2)."""
     problems: list[str] = []
     for c in claims:
         covered = [i for i in c.covers if not is_requirement(i) and i in active_ids]
@@ -150,7 +179,21 @@ def validate_claims(
             problems.append(f"{c.name}: backend {c.backend!r} does not allow method {c.method!r}")
         if c.scope not in backend.scopes:
             problems.append(f"{c.name}: backend {c.backend!r} does not allow scope {c.scope!r}")
+        problem = declaration_problem(c)
+        if problem is not None:
+            problems.append(problem)
     return problems
+
+
+def kill_group(pid: int) -> None:
+    """SIGKILL a process group, ignoring gone or foreign groups (SPEC §15.2 step 3)."""
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        return
+    try:
+        killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def run_claim(
@@ -158,131 +201,159 @@ def run_claim(
 ) -> tuple[str, Any]:
     """Run one claim in a subprocess; return (status, payload) (SPEC §15.2 step 3).
 
-    Status is one of timeout, ok (payload is a bool), other (a JSON non-bool),
-    finding (payload is a dict), error (payload is a traceback string) or
-    unparsable (payload is the raw stdout).
+    Status is timeout, ok (payload is a bool), finding (payload is a dict),
+    other (payload is a type name), error (payload is a traceback string),
+    exited (payload is the exit code) or unparsable (payload is the raw stdout).
     """
     env = dict(os.environ)
     if omit is None:
         env.pop(prog.OMIT_ENV, None)
     else:
         env[prog.OMIT_ENV] = omit
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "helios.claims.runner", module_name, name],
+        cwd=hub,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "helios.claims.runner", module_name, name],
-            cwd=hub,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return ("timeout", None)
-    lines = [line for line in proc.stdout.split("\n") if line.strip()]
-    if not lines:
-        return ("unparsable", proc.stdout)
+        try:
+            stdout, _ = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_group(proc.pid)
+            stdout, _ = proc.communicate()
+            return ("timeout", None)
+        return interpret_runner(proc.returncode, stdout)
+    finally:
+        kill_group(proc.pid)
+
+
+def interpret_runner(returncode: int | None, stdout: str) -> tuple[str, Any]:
+    """Map a runner exit code and stdout to a (status, payload) pair (SPEC §15.2 step 3)."""
+    if returncode != 0:
+        return ("exited", returncode)
+    if len(stdout.splitlines()) != 1:
+        return ("unparsable", stdout)
     try:
-        message = json.loads(lines[-1])
+        message = json.loads(stdout.splitlines()[0])
     except json.JSONDecodeError:
-        return ("unparsable", proc.stdout)
+        return ("unparsable", stdout)
     if not isinstance(message, dict):
-        return ("unparsable", proc.stdout)
+        return ("unparsable", stdout)
     if "error" in message:
         return ("error", message["error"])
     if "finding" in message:
         return ("finding", message["finding"])
-    if "result" in message:
-        result = message["result"]
-        if isinstance(result, bool):
-            return ("ok", result)
-        return ("other", result)
-    return ("unparsable", proc.stdout)
-
-
-def _safe_finding(
-    *,
-    name: str,
-    covers: list[str],
-    verdict: Verdict,
-    method: str,
-    scope: str,
-    bound: dict[str, str] | None,
-    artifact: str | None,
-    notes: str,
-) -> Finding:
-    """Build a Finding, falling back to a minimal valid shape when invalid."""
-    try:
-        return Finding(
-            id=name,
-            claim=name,
-            covers=covers,
-            verdict=verdict,
-            method=Method(method),
-            scope=Scope(scope),
-            bound=bound,
-            artifact=artifact,
-            notes=notes,
-        )
-    except ValueError:
-        return Finding(
-            id=name,
-            claim=name,
-            covers=covers,
-            verdict=verdict,
-            method=Method.REVIEW,
-            scope=Scope.UNIVERSAL,
-            notes=notes,
-        )
+    if "other" in message:
+        return ("other", message["other"])
+    if "result" in message and isinstance(message["result"], bool):
+        return ("ok", message["result"])
+    return ("unparsable", stdout)
 
 
 def verified_finding(c: Claim) -> Finding:
     """A verified finding carrying the declared fields (SPEC §15.2 step 3)."""
-    return _safe_finding(
-        name=c.name,
+    return Finding(
+        id=c.name,
+        claim=c.name,
         covers=list(c.covers),
         verdict=Verdict.VERIFIED,
-        method=c.method,
-        scope=c.scope,
+        method=Method(c.method),
+        scope=Scope(c.scope),
         bound=c.bound,
         artifact=c.artifact,
-        notes="",
     )
 
 
 def inconclusive_finding(c: Claim, note: str, artifact: str | None = None) -> Finding:
-    """An inconclusive finding keeping the declared fields plus a note."""
-    return _safe_finding(
-        name=c.name,
+    """An inconclusive finding keeping the declared method, scope and bound."""
+    return Finding(
+        id=c.name,
+        claim=c.name,
         covers=list(c.covers),
         verdict=Verdict.INCONCLUSIVE,
-        method=c.method,
-        scope=c.scope,
+        method=Method(c.method),
+        scope=Scope(c.scope),
         bound=c.bound,
         artifact=artifact if artifact is not None else c.artifact,
         notes=note,
     )
 
 
-def refuted_finding(c: Claim, backends: dict[str, Backend]) -> Finding | None:
-    """A refuted finding with method counterexample, else None (SPEC §15.2 step 3)."""
+def refuted_finding(c: Claim, backends: dict[str, Backend]) -> Finding:
+    """A refuted finding, or inconclusive with the reason (SPEC §15.2 step 3)."""
     backend = backends.get(c.backend)
     if backend is None or Method.COUNTEREXAMPLE.value not in backend.methods:
-        return None
-    return _safe_finding(
-        name=c.name,
-        covers=list(c.covers),
-        verdict=Verdict.REFUTED,
-        method=Method.COUNTEREXAMPLE.value,
-        scope=c.scope,
-        bound=c.bound,
-        artifact=c.artifact,
-        notes="",
-    )
+        return inconclusive_finding(
+            c, f"backend {c.backend!r} does not allow counterexample evidence"
+        )
+    try:
+        return Finding(
+            id=c.name,
+            claim=c.name,
+            covers=list(c.covers),
+            verdict=Verdict.REFUTED,
+            method=Method.COUNTEREXAMPLE,
+            scope=Scope(c.scope),
+            bound=c.bound,
+            artifact=c.artifact,
+        )
+    except ValueError as exc:
+        return _last_resort(c, f"refuted finding would not validate: {exc}")
+
+
+def _last_resort(c: Claim, note: str) -> Finding:
+    """An inconclusive finding that never raises.
+
+    Step 2 rejects declarations that cannot validate, so every finding built in
+    the check flow keeps the declared fields. This is only insurance for direct
+    library misuse with an invalid declaration.
+    """
+    try:
+        return inconclusive_finding(c, note)
+    except ValueError:
+        return Finding(
+            id=c.name,
+            claim=c.name,
+            covers=list(c.covers),
+            verdict=Verdict.INCONCLUSIVE,
+            method=Method.REVIEW,
+            scope=Scope.UNIVERSAL,
+            notes=note,
+        )
 
 
 def timeout_note(timeout: float) -> str:
     """The timeout note of SPEC §15.2 step 3."""
-    return f"timeout after {timeout:g} s"
+    if isinstance(timeout, float) and timeout.is_integer():
+        return f"timeout after {int(timeout)} s"
+    return f"timeout after {timeout} s"
+
+
+def returned_finding(c: Claim, payload: Any, backends: dict[str, Backend]) -> Finding:
+    """Adopt a returned Finding with the claim's id, claim and covers (SPEC §15.2 step 3)."""
+    try:
+        finding = Finding.model_validate(payload)
+    except ValueError as exc:
+        return inconclusive_finding(c, f"claim returned an invalid finding: {exc}")
+    finding.id = c.name
+    finding.claim = c.name
+    finding.covers = list(c.covers)
+    backend = backends.get(c.backend)
+    if backend is None:
+        return inconclusive_finding(c, f"unknown backend {c.backend!r}")
+    if finding.method.value not in backend.methods:
+        return inconclusive_finding(
+            c, f"backend {c.backend!r} does not allow method {finding.method.value!r}"
+        )
+    if finding.scope.value not in backend.scopes:
+        return inconclusive_finding(
+            c, f"backend {c.backend!r} does not allow scope {finding.scope.value!r}"
+        )
+    return finding
 
 
 def check_claims(
@@ -292,13 +363,28 @@ def check_claims(
     claims: str | None,
     backend: str | None = None,
     covers: str | None = None,
-    timeout: float = 600.0,
+    timeout: float = 600,
     out: TextIO | None = None,
     err: TextIO | None = None,
 ) -> int:
     """Run `helios claims check` (SPEC §15.2); return the exit code."""
     stdout = out if out is not None else sys.stdout
     stderr = err if err is not None else sys.stderr
+    with scrubbed_omit():
+        return _check_claims(hub, program, claims, backend, covers, timeout, stdout, stderr)
+
+
+def _check_claims(
+    hub: Path,
+    program: str | None,
+    claims: str | None,
+    backend: str | None,
+    covers: str | None,
+    timeout: float,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    """Run `helios claims check` (SPEC §15.2); return the exit code."""
     backends = load_backends(hub)
     _, registry = prog.load_registry(hub, program)
     if not claims:
@@ -334,17 +420,9 @@ def run_selected(
     if status == "ok" and payload is True:
         return verified_finding(c)
     if status == "ok":
-        refuted = refuted_finding(c, backends)
-        if refuted is not None:
-            return refuted
-        return inconclusive_finding(
-            c, f"backend {c.backend!r} does not allow counterexample evidence"
-        )
+        return refuted_finding(c, backends)
     if status == "finding":
-        try:
-            return Finding.model_validate(payload)
-        except ValueError as exc:
-            return inconclusive_finding(c, f"claim returned an invalid finding: {exc}")
+        return returned_finding(c, payload, backends)
     if status == "error":
         path = hub / ".helios" / "claims" / f"{c.name}.traceback.txt"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -354,8 +432,10 @@ def run_selected(
     if status == "timeout":
         return inconclusive_finding(c, timeout_note(timeout))
     if status == "other":
-        return inconclusive_finding(c, f"claim returned non-boolean result {payload!r}")
-    return inconclusive_finding(c, f"could not parse runner output: {str(payload)[:200]!r}")
+        return inconclusive_finding(c, f"claim returned {payload}")
+    if status == "exited":
+        return inconclusive_finding(c, f"runner exited {payload}")
+    return inconclusive_finding(c, f"unparsable runner output: {str(payload)[:200]!r}")
 
 
 def attack_claim(
@@ -364,13 +444,27 @@ def attack_claim(
     program: str | None,
     claims: str | None,
     name: str,
-    timeout: float = 600.0,
+    timeout: float = 600,
     out: TextIO | None = None,
     err: TextIO | None = None,
 ) -> int:
     """Run `helios claims attack <claim>` (SPEC §15.2); return the exit code."""
     stdout = out if out is not None else sys.stdout
     stderr = err if err is not None else sys.stderr
+    with scrubbed_omit():
+        return _attack_claim(hub, program, claims, name, timeout, stdout, stderr)
+
+
+def _attack_claim(
+    hub: Path,
+    program: str | None,
+    claims: str | None,
+    name: str,
+    timeout: float,
+    stdout: TextIO,
+    stderr: TextIO,
+) -> int:
+    """Run `helios claims attack <claim>` (SPEC §15.2); return the exit code."""
     _, registry = prog.load_registry(hub, program)
     if not claims:
         raise ValueError("project.claims is not configured")

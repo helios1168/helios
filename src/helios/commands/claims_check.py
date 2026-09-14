@@ -11,7 +11,7 @@ HELP = "Run the project's claims and print one JSON finding per line."
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--backend", default=None, help="Only run claims with this backend.")
     parser.add_argument("--covers", default=None, help="Only run claims covering this id.")
-    parser.add_argument("--timeout", type=float, default=600.0, help="Per-claim timeout in s.")
+    parser.add_argument("--timeout", type=int, default=600, help="Per-claim timeout in s.")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -23,6 +23,9 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         config = cfg.load(Path.cwd())
+        if args.timeout < 1:
+            print("helios: --timeout must be an integer greater than 0", file=sys.stderr)
+            return 2
         return claims_lib.check_claims(
             hub=config.hub,
             program=config.project.program,
@@ -31,6 +34,6 @@ def run(args: argparse.Namespace) -> int:
             covers=args.covers,
             timeout=args.timeout,
         )
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, ImportError) as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2

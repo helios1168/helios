@@ -22,12 +22,16 @@ def run(args: argparse.Namespace) -> int:
     try:
         config = cfg.load(Path.cwd())
         module, registry = prog.load_registry(config.hub, config.project.program)
-        missing, unexpected = prog.check_registry(registry, getattr(module, "DATA", None))
+        missing, unexpected, errors = prog.check_registry_full(
+            registry, getattr(module, "DATA", None)
+        )
+        for line in errors:
+            print(line)
         if missing:
             print(f"missing: {', '.join(missing)}")
         if unexpected:
             print(f"unexpected: {', '.join(unexpected)}")
-        return 5 if missing or unexpected else 0
-    except (ValueError, TypeError) as exc:
+        return 5 if errors or missing or unexpected else 0
+    except (ValueError, TypeError, ImportError) as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2
