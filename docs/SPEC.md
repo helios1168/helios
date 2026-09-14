@@ -98,8 +98,9 @@ The code is `src/helios/envelope.py`. `uv run python -m helios.envelope` regener
 `schemas/agent-report.schema.json` and `schemas/envelope.schema.json`; a test fails when they
 drift.
 
-Every JSON file helios reads or writes, harness output and helios's own artifacts alike, goes
-through `helios.jsonio`. Reading uses a `parse_constant` that raises and a `parse_float` that
+Every JSON document helios reads from harness output or from its own artifacts, and every JSON
+file helios writes, goes through `helios.jsonio`; `bd` output and the claims and program runners
+are parsed as their own sections state. Reading uses a `parse_constant` that raises and a `parse_float` that
 raises when `float(s)` is not finite, so `NaN`, `Infinity`, `-Infinity` and a number that
 overflows to infinity (for example `1e999` or `-1e999`) are never valid JSON; each such value
 takes the same not-JSON path the site already has for `NaN` and `Infinity`. Writing uses
@@ -827,10 +828,10 @@ exit 2, before any filesystem or `bd` access.
     nothing more is allocated and resume exits 4.
   - After a message turn is finalized, the ack is written whenever its `execution_status` is
     `completed`, `missing_output` or `invalid_output`, and only then is an interrupt honored.
-    Any other status writes no ack and stops, and resume exits with that turn's code. Otherwise
-    the exit code is the highest over the turns.
+    Any other status writes no ack and stops, and resume exits with that turn's code. In every
+    other case the exit code is the highest over the turns.
   - A turn that records a null `session_id` ends resume after that turn (the ack rule above
-    still applies to it), with that turn's exit code and no refusal message. This is the one
+    still applies to it), with that turn's exit code and no refusal message. This is a second
     exception to "the exit code is the highest over the turns".
   - The envelope `steered` field lists the delivered msg_ids.
 
@@ -1192,9 +1193,10 @@ its trailing newline or lack of one.
   compared as text, never as parsed numbers; otherwise it is `helios: unknown marker <marker>`,
   exit 2, nothing written. An unknown decision word exits 2; `--mark` with `--unit` or `--json`
   exits 2. Before writing, `--mark` checks whether a `curated:` comment for that marker already
-  exists on the bead named in the marker; when that bead does not exist the check is skipped, as
-  not yet curated, but a `bd` failure there for any other reason prints `helios: <message>`,
-  exits 1, and writes nothing. It then adds `curated: [<kind>:<bead>#<attempt>#<k>] ->
+  exists on any bead the listing reads (the helios-labelled beads, and the bead named in the
+  marker when it exists); a named bead that does not exist is left out of that check, but any
+  other `bd` failure while reading those comments prints `helios: <message>`, exits 1, and
+  writes nothing. It then adds `curated: [<kind>:<bead>#<attempt>#<k>] ->
   <decision>` under the replay rule of §7.5, on the bead named in the marker, or, when that bead
   does not exist, on the source bead, the bead whose comment carries the line, skipping the
   label step in that case. When the comment already exists, `--mark` still runs the label step.
