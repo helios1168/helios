@@ -17,7 +17,6 @@
               "type": "null"
             }
           ],
-          "default": null,
           "title": "Exit Code"
         },
         "output_path": {
@@ -29,12 +28,13 @@
               "type": "null"
             }
           ],
-          "default": null,
           "title": "Output Path"
         }
       },
       "required": [
-        "command"
+        "command",
+        "exit_code",
+        "output_path"
       ],
       "title": "Checker",
       "type": "object"
@@ -52,7 +52,6 @@
               "type": "null"
             }
           ],
-          "default": null,
           "description": "Repo-relative path or exact command.",
           "title": "Artifact"
         },
@@ -61,7 +60,10 @@
             "type": "string"
           },
           "title": "Assumptions",
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "bound": {
           "anyOf": [
@@ -75,7 +77,6 @@
               "type": "null"
             }
           ],
-          "default": null,
           "description": "Domain, sizes, tolerance or instance names for the scope.",
           "title": "Bound"
         },
@@ -87,8 +88,7 @@
             {
               "type": "null"
             }
-          ],
-          "default": null
+          ]
         },
         "claim": {
           "title": "Claim",
@@ -100,7 +100,10 @@
             "type": "string"
           },
           "title": "Covers",
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "id": {
           "title": "Id",
@@ -110,9 +113,11 @@
           "$ref": "#/$defs/Method"
         },
         "notes": {
-          "default": "",
           "title": "Notes",
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "scope": {
           "$ref": "#/$defs/Scope"
@@ -124,9 +129,15 @@
       "required": [
         "id",
         "claim",
+        "covers",
         "verdict",
         "method",
-        "scope"
+        "scope",
+        "bound",
+        "assumptions",
+        "artifact",
+        "checker",
+        "notes"
       ],
       "title": "Finding",
       "type": "object"
@@ -171,7 +182,6 @@
               "type": "null"
             }
           ],
-          "default": null,
           "title": "Exit Code"
         },
         "failed": {
@@ -186,7 +196,8 @@
       "required": [
         "command",
         "passed",
-        "failed"
+        "failed",
+        "exit_code"
       ],
       "title": "TestRun",
       "type": "object"
@@ -222,35 +233,50 @@
         "type": "string"
       },
       "title": "Files Changed",
-      "type": "array"
+      "type": [
+        "array",
+        "null"
+      ]
     },
     "findings": {
       "items": {
         "$ref": "#/$defs/Finding"
       },
       "title": "Findings",
-      "type": "array"
+      "type": [
+        "array",
+        "null"
+      ]
     },
     "followups": {
       "items": {
         "type": "string"
       },
       "title": "Followups",
-      "type": "array"
+      "type": [
+        "array",
+        "null"
+      ]
     },
     "learned": {
       "items": {
         "type": "string"
       },
       "title": "Learned",
-      "type": "array"
+      "type": [
+        "array",
+        "null"
+      ]
     },
     "missing_context": {
       "items": {
         "type": "string"
       },
       "title": "Missing Context",
-      "type": "array"
+      "type": [
+        "array",
+        "null"
+      ]
     },
     "question": {
       "anyOf": [
@@ -261,15 +287,16 @@
           "type": "null"
         }
       ],
-      "default": null,
       "description": "Required when status is needs_input.",
       "title": "Question"
     },
     "schema_version": {
       "const": "1",
-      "default": "1",
       "title": "Schema Version",
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "status": {
       "$ref": "#/$defs/WorkStatus"
@@ -287,13 +314,20 @@
         {
           "type": "null"
         }
-      ],
-      "default": null
+      ]
     }
   },
   "required": [
+    "schema_version",
     "status",
-    "summary"
+    "summary",
+    "files_changed",
+    "tests",
+    "findings",
+    "question",
+    "learned",
+    "missing_context",
+    "followups"
   ],
   "title": "AgentReport",
   "type": "object"

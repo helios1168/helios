@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -26,6 +26,28 @@ HarnessName = Literal["claude", "codex", "opencode", "agy", "fake"]
 
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", use_enum_values=False)
+
+
+def _annotation_allows_none(annotation: object) -> bool:
+    """True when `annotation` already permits None."""
+    return annotation is type(None) or type(None) in get_args(annotation)
+
+
+def _drop_strict_mode_nulls(cls: type[BaseModel], data: object) -> object:
+    """Drop keys whose value is null when the field's annotation forbids None.
+
+    The strict agent-report schema (SPEC §6.3 codex) makes every optional field
+    nullable so `codex exec --output-schema` accepts it, even fields whose pydantic
+    annotation does not admit None. Dropping such a key lets the field's own default
+    apply, exactly as if the agent had omitted it.
+    """
+    if not isinstance(data, dict):
+        return data
+    cleaned = dict(data)
+    for name, field in cls.model_fields.items():
+        if name in cleaned and cleaned[name] is None and not _annotation_allows_none(field.annotation):
+            del cleaned[name]
+    return cleaned
 
 
 class WorkStatus(StrEnum):
@@ -89,6 +111,11 @@ class Finding(_Model):
     checker: Checker | None = None
     notes: str = ""
 
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_strict_nulls(cls, data: object) -> object:
+        return _drop_strict_mode_nulls(cls, data)
+
     @model_validator(mode="after")
     def _scope_rules(self) -> Finding:
         if self.scope in (Scope.BOUNDED, Scope.INSTANCE) and not self.bound:
@@ -128,6 +155,11 @@ class AgentReport(_Model):
     learned: list[str] = Field(default_factory=list)
     missing_context: list[str] = Field(default_factory=list)
     followups: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_strict_nulls(cls, data: object) -> object:
+        return _drop_strict_mode_nulls(cls, data)
 
     @model_validator(mode="after")
     def _question_rule(self) -> AgentReport:
@@ -210,8 +242,85 @@ SCHEMAS: dict[str, type[BaseModel]] = {
 }
 
 
+def _ref_alone(node: dict) -> dict:
+    """Drop title/description siblings of a bare $ref; strict mode rejects them."""
+    if "$ref" in node:
+        extra = set(node) - {"$ref"}
+        if extra and extra <= {"title", "description"}:
+            return {"$ref": node["$ref"]}
+    return node
+
+
+def _admits_null(node: dict) -> bool:
+    node_type = node.get("type")
+    if node_type == "null" or (isinstance(node_type, list) and "null" in node_type):
+        return True
+    return any(_admits_null(branch) for branch in node.get("anyOf", []))
+
+
+def _make_nullable(node: dict) -> dict:
+    """Wrap a schema that does not admit null so that it does."""
+    node_type = node.get("type")
+    if isinstance(node_type, str):
+        node = dict(node)
+        node["type"] = [node_type, "null"]
+        return node
+    if "anyOf" in node:
+        node = dict(node)
+        node["anyOf"] = [*node["anyOf"], {"type": "null"}]
+        return node
+    return {"anyOf": [node, {"type": "null"}]}
+
+
+def _strict_node(node: dict) -> dict:
+    """Recursively rewrite one schema node into OpenAI strict-mode form."""
+    node = dict(node)
+    node.pop("default", None)
+    if isinstance(node.get("properties"), dict):
+        required_before = set(node.get("required", []))
+        properties: dict = {}
+        for name, prop in node["properties"].items():
+            new_prop = _strict_node(prop)
+            if name not in required_before and not _admits_null(new_prop):
+                new_prop = _make_nullable(new_prop)
+            properties[name] = new_prop
+        node["properties"] = properties
+        node["required"] = list(properties.keys())
+        node["additionalProperties"] = False
+    if "items" in node:
+        node["items"] = _strict_node(node["items"])
+    any_of = node.get("anyOf")
+    if isinstance(any_of, list):
+        node["anyOf"] = [_strict_node(branch) for branch in any_of]
+    additional = node.get("additionalProperties")
+    if isinstance(additional, dict):
+        node["additionalProperties"] = _strict_node(additional)
+    defs = node.get("$defs")
+    if isinstance(defs, dict):
+        node["$defs"] = {key: _strict_node(value) for key, value in defs.items()}
+    return _ref_alone(node)
+
+
+def strict_schema(schema: dict) -> dict:
+    """Rewrite a pydantic JSON Schema into the strict form `codex exec --output-schema`
+    (OpenAI structured outputs, strict mode) requires (SPEC §6.3 codex).
+
+    Walks every entry of `$defs` and every nested object, array items and anyOf branch.
+    For every object schema with `properties`: sets `required` to every property name in
+    properties order and `additionalProperties` to false. Removes every `default`
+    keyword. A property that was not required before and whose schema does not already
+    admit null becomes nullable (wrapped in `anyOf` with `{"type": "null"}`, or by adding
+    "null" to a plain `type`). A bare `$ref` keeps only `title`/`description` siblings if
+    it had none besides those, else loses them.
+    """
+    return _strict_node(schema)
+
+
 def schema_text(name: str) -> str:
-    return json.dumps(SCHEMAS[name].model_json_schema(), indent=2, sort_keys=True) + "\n"
+    schema = SCHEMAS[name].model_json_schema()
+    if name == "agent-report":
+        schema = strict_schema(schema)
+    return json.dumps(schema, indent=2, sort_keys=True) + "\n"
 
 
 def write_schemas(directory: Path) -> list[Path]:
