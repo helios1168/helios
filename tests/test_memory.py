@@ -401,12 +401,8 @@ def test_import_order_and_scope(tmp_path: Path) -> None:
     src.mkdir()
     for name in ["b", "a", "a.b", "a-b"]:
         (src / f"{name}.md").write_bytes(canon({"source": "s", "status": "active"}, name))
-    (src / "dir.md").mkdir()
-    (src / "dir.md" / "inner.md").write_bytes(canon({"source": "s"}, "i"))
-    (src / "broken.md").symlink_to(tmp_path / "nowhere.md")
     (src / "x.MD").write_bytes(canon({"source": "s"}, "x"))
     (src / "y.md.txt").write_bytes(b"junk")
-    (src / ".hidden.md").write_bytes(b"junk")
     order: list[str] = []
 
     class Rec(mem.FilesBackend):
@@ -416,6 +412,40 @@ def test_import_order_and_scope(tmp_path: Path) -> None:
 
     Rec(tmp_path / "store").import_(src)
     assert order == ["a", "a-b", "a.b", "b"]
+
+
+# Round 3: import_ checks every entry ending in .md, dotfiles included; a bad
+# name or a non-regular-file entry (a broken symlink, a directory named
+# x.md) raises ValueError naming it, and nothing is written (decided).
+
+
+@pytest.mark.parametrize(
+    "kind,bad_name",
+    [("hidden", ".hidden"), ("broken-symlink", "c"), ("dir", "dir")],
+)
+def test_import_hidden_broken_and_dir_md_checked(
+    tmp_path: Path, kind: str, bad_name: str
+) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.md").write_bytes(canon({"source": "s", "status": "active"}, "a"))
+    (src / "b.md").write_bytes(canon({"source": "s", "status": "active"}, "b"))
+    if kind == "hidden":
+        (src / ".hidden.md").write_bytes(b"junk")
+    elif kind == "broken-symlink":
+        (src / "c.md").symlink_to(tmp_path / "nowhere.md")
+    else:
+        (src / "dir.md").mkdir()
+    fake = FakeBeads()
+    for backend, root in (
+        (mem.FilesBackend(tmp_path / f"store-{kind}"), tmp_path / f"store-{kind}"),
+        (mem.BeadsBackend(fake, tmp_path / f"e-{kind}"), tmp_path / f"e-{kind}"),
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            backend.import_(src)
+        assert bad_name in str(excinfo.value)
+        assert not root.exists() or list(root.glob("*.md")) == []
+    assert fake.argv_log == []
 
 
 def test_import_bad_file_writes_nothing(tmp_path: Path) -> None:
@@ -455,6 +485,33 @@ def test_import_ignores_subdirs_and_non_md(tmp_path: Path) -> None:
         backend.read("inner")
     with pytest.raises(KeyError):
         backend.read("notes")
+
+
+# Round 3: the files backend finds a key's file by exact name, never by a
+# path the filesystem may match case-insensitively (decided).
+
+
+def test_files_backend_reads_by_exact_case(tmp_path: Path) -> None:
+    probe = tmp_path / "CaseProbe.tmp"
+    probe.write_text("x")
+    if not (tmp_path / "caseprobe.tmp").exists():
+        pytest.skip("filesystem is case-sensitive")
+    store = tmp_path / "s"
+    store.mkdir()
+    (store / "A.md").write_bytes(canon({"source": "s", "status": "active"}, "upper"))
+    fb = mem.FilesBackend(store)
+    # A.md is not an exact match for key "a": read must not find it through
+    # the filesystem's case fold.
+    with pytest.raises(KeyError):
+        fb.read("a")
+    # A fresh key with no colliding name writes and reads back exactly.
+    store2 = tmp_path / "s2"
+    store2.mkdir()
+    fb2 = mem.FilesBackend(store2)
+    fb2.write("a", {"source": "s"}, "fresh")
+    assert os.listdir(store2) == ["a.md"]
+    fb2.write("a", {"source": "s"}, "updated")
+    assert fb2.read("a").body == "updated"
 
 
 def test_export_symlink_target_not_followed(tmp_path: Path) -> None:
@@ -932,6 +989,51 @@ def test_pathological_file_in_files_stale_gets_note(
     assert "deep" in capsys.readouterr().err
 
 
+# Round 3: a header nested deep enough to blow Python's own recursion limit
+# (json's decoder and encoder tolerate far deeper) must never crash with a
+# bare RecursionError; it either round-trips or raises ValueError naming the
+# key before anything is written (decided).
+
+
+def _nested_list(depth: int) -> list[Any]:
+    root: list[Any] = []
+    cur = root
+    for _ in range(depth - 1):
+        nxt: list[Any] = []
+        cur.append(nxt)
+        cur = nxt
+    return root
+
+
+@pytest.mark.parametrize("depth", [1000, 3000, 9000])
+def test_deep_header_write_never_crashes(tmp_path: Path, depth: int) -> None:
+    nested = _nested_list(depth)
+    fake = FakeBeads()
+    for backend in (mem.FilesBackend(tmp_path / "s"), mem.BeadsBackend(fake, tmp_path / "e")):
+        try:
+            backend.write("dw", {"source": "s", "n": nested}, "b")
+        except ValueError as exc:
+            assert "'dw'" in str(exc)
+        else:
+            assert backend.read("dw").header["n"] == nested
+
+
+@pytest.mark.parametrize("depth", [1000, 3000, 9000])
+def test_deep_header_import_never_crashes(tmp_path: Path, depth: int) -> None:
+    nested = _nested_list(depth)
+    text = mem.serialize({"source": "s", "n": nested, "status": "active"}, "b")
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "d.md").write_bytes(text.encode())
+    for backend in (mem.FilesBackend(tmp_path / "s"), mem.BeadsBackend(FakeBeads(), tmp_path / "e")):
+        try:
+            backend.import_(src)
+        except ValueError as exc:
+            assert "'d'" in str(exc)
+        else:
+            assert backend.read("d").header["n"] == nested
+
+
 # Round 2: import_ checks every file before writing any.
 
 
@@ -992,6 +1094,27 @@ def test_missing_status_file_is_bad(tmp_path: Path) -> None:
     with pytest.raises(ValueError) as excinfo:
         mem.parse("k", canon({"source": "s"}, "b").decode())
     assert "k" in str(excinfo.value)
+
+
+# Round 3: parse requires status to be one of the listed values, so export
+# after import stays byte for byte (decided).
+
+
+@pytest.mark.parametrize("status", ["bogus", 1, None])
+def test_parse_read_export_reject_bad_status_value(tmp_path: Path, status: Any) -> None:
+    text = mem.serialize({"source": "s", "status": status}, "b")
+    with pytest.raises(ValueError) as excinfo:
+        mem.parse("bs", text)
+    assert "bs" in str(excinfo.value)
+    store = tmp_path / "s"
+    store.mkdir()
+    (store / "bs.md").write_bytes(text.encode())
+    with pytest.raises(ValueError) as excinfo:
+        mem.FilesBackend(store).read("bs")
+    assert "bs" in str(excinfo.value)
+    with pytest.raises(ValueError) as excinfo:
+        mem.FilesBackend(store).export(tmp_path / "o")
+    assert "bs" in str(excinfo.value)
 
 
 # Round 2: the whole value is at most 65000 bytes.
@@ -1062,6 +1185,24 @@ def test_stale_malformed_show_shapes_propagate(tmp_path: Path) -> None:
         backend.write("x", {"source": "hel-1#1"}, "b")
         with pytest.raises(Exception):
             backend.stale()
+
+
+# Round 3: a flag-like bead id in source is a bead that does not exist; the
+# label lookup is never called for it (decided).
+
+
+@pytest.mark.parametrize("source", ["-h#1", "--json#1", "#1", " #1"])
+def test_stale_flag_like_bead_id_never_calls_lookup(tmp_path: Path, source: str) -> None:
+    calls: list[str] = []
+
+    def labels_of(bead_id: str) -> list[str] | None:
+        calls.append(bead_id)
+        return ["truth:wrong"]
+
+    backend = mem.FilesBackend(tmp_path / "s", labels_of=labels_of)
+    backend.write("k", {"source": source}, "b")
+    assert backend.stale() == []
+    assert calls == []
 
 
 # Round 2: real bd coverage.

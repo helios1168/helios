@@ -27,6 +27,8 @@ MAGIC = "helios-memory 1"
 
 _KEY_PATTERN = r"[a-z0-9][a-z0-9._-]{0,199}"
 
+_BEAD_ID_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}"
+
 _RESERVED_KEYS = frozenset({"schema_version"})
 
 _STATUSES = ("active", "superseded", "retracted")
@@ -106,6 +108,8 @@ def parse(key: str, text: str) -> Memory:
         raise ValueError(f"memory {key!r}: header must be a JSON object")
     if "status" not in header:
         raise ValueError(f"memory {key!r}: header needs 'status'")
+    if header["status"] not in _STATUSES:
+        raise ValueError(f"memory {key!r}: bad status {header['status']!r}")
     try:
         canonical = json.dumps(header, sort_keys=True, ensure_ascii=False, allow_nan=False)
     except (RecursionError, ValueError) as exc:
@@ -132,23 +136,35 @@ def _require_orchestrator() -> None:
 
 
 def _check_header_strings(key: str, value: Any) -> None:
-    """Reject NUL and non-UTF-8-encodable strings anywhere in the header (SPEC §13)."""
-    if isinstance(value, str):
-        if "\x00" in value:
-            raise ValueError(f"memory {key!r}: header string contains NUL")
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise ValueError(
-                f"memory {key!r}: header string is not UTF-8 encodable: {exc}"
-            ) from exc
-    elif isinstance(value, dict):
-        for entry_key, entry_value in value.items():
-            _check_header_strings(key, entry_key)
-            _check_header_strings(key, entry_value)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            _check_header_strings(key, item)
+    """Reject NUL and non-UTF-8-encodable strings anywhere in the header (SPEC §13).
+
+    A header nested deep enough to exceed Python's own recursion limit
+    (json's decoder and encoder tolerate far deeper) raises ValueError
+    naming the key here instead of crashing (SPEC §13, decided).
+    """
+
+    def _walk(item: Any) -> None:
+        if isinstance(item, str):
+            if "\x00" in item:
+                raise ValueError(f"memory {key!r}: header string contains NUL")
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    f"memory {key!r}: header string is not UTF-8 encodable: {exc}"
+                ) from exc
+        elif isinstance(item, dict):
+            for entry_key, entry_value in item.items():
+                _walk(entry_key)
+                _walk(entry_value)
+        elif isinstance(item, (list, tuple)):
+            for entry in item:
+                _walk(entry)
+
+    try:
+        _walk(value)
+    except RecursionError as exc:
+        raise ValueError(f"memory {key!r}: header is nested too deeply") from exc
 
 
 def _check_body(key: str, body: str) -> None:
@@ -166,17 +182,29 @@ def _check_body(key: str, body: str) -> None:
 
 
 def _check_finite(key: str, value: Any) -> None:
-    """Reject NaN and Infinity anywhere in the header, naming the key (SPEC §13)."""
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            raise ValueError(f"memory {key!r}: header has a non-finite float")
-    elif isinstance(value, dict):
-        for entry_key, entry_value in value.items():
-            _check_finite(key, entry_key)
-            _check_finite(key, entry_value)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            _check_finite(key, item)
+    """Reject NaN and Infinity anywhere in the header, naming the key (SPEC §13).
+
+    Catches RecursionError from a header nested deep enough to exceed
+    Python's own recursion limit, raising ValueError naming the key instead
+    (SPEC §13, decided).
+    """
+
+    def _walk(item: Any) -> None:
+        if isinstance(item, float):
+            if math.isnan(item) or math.isinf(item):
+                raise ValueError(f"memory {key!r}: header has a non-finite float")
+        elif isinstance(item, dict):
+            for entry_key, entry_value in item.items():
+                _walk(entry_key)
+                _walk(entry_value)
+        elif isinstance(item, (list, tuple)):
+            for entry in item:
+                _walk(entry)
+
+    try:
+        _walk(value)
+    except RecursionError as exc:
+        raise ValueError(f"memory {key!r}: header is nested too deeply") from exc
 
 
 def _normalize_header(key: str, header: dict[str, Any], body: str) -> dict[str, Any]:
@@ -233,6 +261,23 @@ def _read_text(key: str, path: Path) -> str:
         raise ValueError(f"memory {key!r}: file is not UTF-8: {exc}") from exc
 
 
+def _exact_file(directory: Path, name: str) -> Path | None:
+    """``<directory>/<name>`` only when ``name`` is exactly in the directory listing.
+
+    A case-insensitive filesystem makes ``path.is_file()`` match a
+    differently-cased name already on disk; a directory listing is the only
+    way to find a key's file by its exact name (SPEC §13, decided).
+    """
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return None
+    if name not in entries:
+        return None
+    path = directory / name
+    return path if path.is_file() else None
+
+
 def _candidate_files(directory: Path) -> list[Path]:
     """The ``*.md`` files directly in the directory, in sorted name order (SPEC §13).
 
@@ -255,7 +300,13 @@ def _bead_id_of(source: str) -> str:
 
 
 def _is_stale(mem: Memory, labels_of: LabelsOf | None) -> bool:
-    """True when the memory is active and its source bead carries truth:wrong."""
+    """True when the memory is active and its source bead carries truth:wrong.
+
+    A source whose bead id does not match the bead id shape (SPEC §13,
+    decided) is treated as a bead that does not exist: show is never called
+    for it, since a flag-like id (``-h``, ``--json``) would make bd read it
+    as an option instead of an id.
+    """
     if mem.header.get("status", "active") != "active":
         return False
     source = mem.header.get("source")
@@ -263,6 +314,8 @@ def _is_stale(mem: Memory, labels_of: LabelsOf | None) -> bool:
         return False
     bead_id = _bead_id_of(source)
     if not bead_id or labels_of is None:
+        return False
+    if re.fullmatch(_BEAD_ID_PATTERN, bead_id) is None:
         return False
     labels = labels_of(bead_id)
     return labels is not None and "truth:wrong" in labels
@@ -312,8 +365,8 @@ class FilesBackend:
     def read(self, key: str) -> Memory:
         """Parse the key file; a missing key raises KeyError (SPEC §13)."""
         _check_key(key)
-        path = self.directory / f"{key}.md"
-        if not path.is_file():
+        path = _exact_file(self.directory, f"{key}.md")
+        if path is None:
             raise KeyError(key)
         return parse(key, _read_text(key, path))
 
@@ -456,14 +509,33 @@ class BeadsBackend:
         return _inject(self.read, keys)
 
 
-def _load_dir(directory: Path) -> list[tuple[str, dict[str, Any], str]]:
-    """Parse and fully validate the ``*.md`` files directly in the directory.
+def _import_entries(directory: Path) -> list[Path]:
+    """Every directory entry whose name ends in ``.md``, dotfiles included.
 
-    Sorted by key (stem), then file name. Every write refusal runs here, so a
-    bad file raises before the caller writes any file (SPEC §13).
+    Sorted by key (stem) then file name. Unlike ``_candidate_files`` (used by
+    ``export`` and ``stale``), nothing is filtered out ahead of time here: a
+    bad name or a non-regular-file entry is caught in the check pass in
+    ``_load_dir``, before anything is written (SPEC §13, decided).
+    """
+    if not directory.is_dir():
+        return []
+    return sorted(
+        (path for path in directory.iterdir() if path.name.endswith(".md")),
+        key=lambda p: (p.stem, p.name),
+    )
+
+
+def _load_dir(directory: Path) -> list[tuple[str, dict[str, Any], str]]:
+    """Parse and fully validate every ``*.md`` entry directly in the directory.
+
+    Sorted by key (stem), then file name. Every write refusal, plus the
+    regular-file check (symlinks followed), runs here, so a bad entry raises
+    before the caller writes any file (SPEC §13, decided).
     """
     found: list[tuple[str, dict[str, Any], str]] = []
-    for path in _candidate_files(directory):
+    for path in _import_entries(directory):
+        if not path.is_file():
+            raise ValueError(f"memory {path.stem!r}: not a regular file")
         key = path.stem
         _check_key(key)
         mem = parse(key, _read_text(key, path))
