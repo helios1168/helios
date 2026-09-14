@@ -286,6 +286,39 @@ def test_learned_command_bd_runtime_error_on_mark_is_prefixed_and_exit_one(
 BD = shutil.which("bd")
 
 
+def test_learned_mark_missing_target_bead_curates_source_and_skips_label() -> None:
+    """Decided (item 1): a marker naming a bead that no longer exists writes the
+    curated comment on the source bead (the one carrying the marker comment) instead,
+    and skips the label step. The line then leaves the queue and a replay writes no
+    second comment."""
+    beads = FakeBeads([Bead("carrier", kind="impl", labels=["kind:impl", "unit:u"])])
+    beads.add_comment("carrier", "learned: [gone#1#1] x")
+    assert mark(beads, "learned:gone#1#1", "drop") == 0
+    assert beads.comments("carrier")[-1].text == "curated: [learned:gone#1#1] -> drop"
+    assert list_lines(beads) == []
+    comments_before = len(beads.comments("carrier"))
+    assert mark(beads, "learned:gone#1#1", "drop") == 0
+    assert len(beads.comments("carrier")) == comments_before
+
+
+def test_learned_mark_already_check_lets_runtime_error_propagate() -> None:
+    """Decided (item 2): the already-curated check inside mark catches only
+    BeadNotFound per bead; a bd RuntimeError for the marker's named bead propagates
+    instead of being read as "not yet curated", and nothing is written."""
+    beads = RuntimeErrorForOneBead(
+        [
+            Bead("carrier", kind="impl", labels=["kind:impl", "unit:u"]),
+            Bead("target", labels=[]),
+        ],
+        missing="target",
+    )
+    beads.add_comment("carrier", "learned: [target#1#1] x")
+    with pytest.raises(RuntimeError):
+        mark(beads, "learned:target#1#1", "memory")
+    assert beads.comments("carrier") == [Comment("c0", "carrier", "helios", "learned: [target#1#1] x")]
+    assert beads._comments.get("target", []) == []
+
+
 def init_bd(path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
     subprocess.run(["bd", "init", "--non-interactive", "--prefix", "t", "--skip-agents", "--quiet"], cwd=path, check=True, capture_output=True)
@@ -300,3 +333,18 @@ def test_real_bd_learned_comments_mark_and_label(tmp_path: Path) -> None:
     assert [line.text for line in list_lines(beads)] == ["text"]
     assert mark(beads, f"learned:{created}#1#1", "memory") == 0
     assert "curated" in beads.show(created).labels
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_learned_mark_missing_target_bead_curates_source(tmp_path: Path) -> None:
+    init_bd(tmp_path)
+    created = subprocess.run(["bd", "create", "--title", "learn", "--labels", "kind:impl,unit:u", "--silent"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
+    beads = __import__("helios.beads", fromlist=["Beads"]).Beads(tmp_path)
+    beads.add_comment(created, "learned: [gone#1#1] text")
+    assert [line.text for line in list_lines(beads)] == ["text"]
+    assert mark(beads, "learned:gone#1#1", "drop") == 0
+    assert beads.comments(created)[-1].text == "curated: [learned:gone#1#1] -> drop"
+    assert list_lines(beads) == []
+    comments_before = len(beads.comments(created))
+    assert mark(beads, "learned:gone#1#1", "drop") == 0
+    assert len(beads.comments(created)) == comments_before

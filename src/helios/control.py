@@ -124,7 +124,14 @@ def next_bead(
     read_envelope: Callable[[Bead], Envelope | None],
     attempt_state: Callable[[Bead], AttemptState] | None = None,
 ) -> int:
-    """Run the first candidate not covered by ``stop_at`` (SPEC section 11)."""
+    """Run the first candidate not covered by ``stop_at`` (SPEC section 11).
+
+    A run that returns without raising but leaves no envelope (SPEC section 8.4
+    in-place recovery that produced nothing, typically a preflight refusal such as an
+    unfinalized attempt already live or locked) is its own execution failure, reason
+    ``execution failure for <bead>: missing envelope``, exit the run's own code when
+    nonzero else 4 (Decided).
+    """
     bead = next((b for b in candidates(beads, unit) if b.kind not in stop_at), None)
     if bead is None:
         print("helios: no ready bead", file=sys.stderr)
@@ -134,8 +141,10 @@ def next_bead(
     except ExecutionFailure as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return execution_failure_exit(exc.code)
-    if envelope is not None:
-        print(envelope_line(envelope))
+    if envelope is None:
+        print(f"helios: execution failure for {bead.id}: missing envelope", file=sys.stderr)
+        return execution_failure_exit(code)
+    print(envelope_line(envelope))
     return code
 
 

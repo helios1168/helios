@@ -60,20 +60,26 @@ def _all_markers(beads: Any, unit: str | None = None) -> dict[str, tuple[Bead, L
     return found
 
 
-def _curated_texts(beads: Any, targets: set[str]) -> list[str]:
+def _curated_texts(beads: Any, targets: set[str], *, strict: bool = False) -> list[str]:
     """Every ``curated: [...]`` comment on one of ``targets`` (Decided: a curated
     comment for a marker counts on any bead, so ``targets`` covers every helios-kind
     bead plus every bead a queue marker names, kind label or not).
 
-    A marker can name a bead that no longer exists; ``BeadNotFound`` and a bd
-    ``RuntimeError`` for that one bead are skipped rather than failing the whole scan
-    (Decided).
+    A marker can name a bead that no longer exists; ``BeadNotFound`` for that one bead
+    is always skipped rather than failing the whole scan (Decided). A bd
+    ``RuntimeError`` is skipped too by default (the listing path, ``_lines``), but
+    ``strict=True`` (``mark``'s already-curated check) lets it propagate instead of
+    being read as "no curated comment" (Decided).
     """
     curated: list[str] = []
     for bead_id in targets:
         try:
             comments = beads.comments(bead_id)
-        except (BeadNotFound, RuntimeError):
+        except BeadNotFound:
+            continue
+        except RuntimeError:
+            if strict:
+                raise
             continue
         curated.extend(c.text for c in comments if c.text.startswith("curated: ["))
     return curated
@@ -107,6 +113,13 @@ def mark(beads: Any, marker: str, decision: str) -> int:
     the markers of the full listing (curated ones included, so a replay still works);
     an unmatched marker, including a leading-zero or Unicode-digit variant of a real
     one, is unknown.
+
+    When the marker's named bead no longer exists (``beads.show`` raises
+    ``BeadNotFound``), the curated comment is written on the source bead instead, the
+    bead whose comment carries the marker, and the label step is skipped since there
+    is no target bead to label (Decided). The already-curated check catches only
+    ``BeadNotFound`` per bead here; a bd ``RuntimeError`` propagates rather than being
+    read as "not yet curated" (Decided).
     """
     if decision not in {"memory", "template", "drop"}:
         raise ValueError(f"unknown decision {decision}")
@@ -114,14 +127,23 @@ def mark(beads: Any, marker: str, decision: str) -> int:
     found = _all_markers(beads)
     if bracketed not in found:
         raise ValueError(f"unknown marker {marker}")
-    _source, item = found[bracketed]
+    source, item = found[bracketed]
     target_bead = item.bead
     prefix = f"curated: {bracketed}"
 
-    targets = {bead.id for bead in _helios_beads(beads)} | {target_bead}
-    already = any(c.startswith(prefix) for c in _curated_texts(beads, targets))
+    try:
+        beads.show(target_bead)
+        target_exists = True
+    except BeadNotFound:
+        target_exists = False
+    write_bead = target_bead if target_exists else source.id
+
+    targets = {bead.id for bead in _helios_beads(beads)}
+    if target_exists:
+        targets.add(target_bead)
+    already = any(c.startswith(prefix) for c in _curated_texts(beads, targets, strict=True))
     if not already:
-        beads.add_comment(target_bead, f"{prefix} -> {decision}")
-    if not any(item.bead == target_bead for _bead, item in _lines(beads)):
+        beads.add_comment(write_bead, f"{prefix} -> {decision}")
+    if target_exists and not any(item.bead == target_bead for _bead, item in _lines(beads)):
         beads.add_label(target_bead, "curated")
     return 0

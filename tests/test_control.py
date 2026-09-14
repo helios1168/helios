@@ -103,6 +103,43 @@ def test_next_envelope_line_uses_dashes_when_no_report(capsys: pytest.CaptureFix
     assert capsys.readouterr().out == "b#1\tmissing_output\t-\t-\t-\n"
 
 
+def test_next_missing_envelope_after_in_place_recovery_uses_run_code(capsys: pytest.CaptureFixture[str]) -> None:
+    """Decided (item 3): a run that returns without raising but leaves no envelope
+    (here, SPEC section 8.4 in-place recovery of an unfinalized attempt whose run
+    refuses, exit 2, because the attempt is live or locked) prints the missing
+    envelope reason and exits with the run's own nonzero code, leaving the attempt
+    state as the fake left it (unchanged, not finalized)."""
+    rows = [bead("b")]
+    state = control.AttemptState(number=1, finalized=False)
+    code = control.next_bead(
+        ReadyInBdOrder(rows),
+        unit="u",
+        stop_at=(),
+        run=lambda _item: 2,
+        read_envelope=lambda _item: None,
+        attempt_state=lambda _item: state,
+    )
+    assert code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "helios: execution failure for b: missing envelope\n"
+
+
+def test_next_missing_envelope_with_run_code_zero_is_exit_four(capsys: pytest.CaptureFixture[str]) -> None:
+    """Decided (item 3): a missing envelope with the run's own code zero (or no
+    attempt_state tracking at all) falls back to exit 4."""
+    rows = [bead("b")]
+    code = control.next_bead(
+        ReadyInBdOrder(rows),
+        unit="u",
+        stop_at=(),
+        run=lambda _item: 0,
+        read_envelope=lambda _item: None,
+    )
+    assert code == 4
+    assert capsys.readouterr().err == "helios: execution failure for b: missing envelope\n"
+
+
 def test_next_no_candidate_is_prefixed_stderr_and_exit_three(capsys: pytest.CaptureFixture[str]) -> None:
     assert control.next_bead(FakeBeads(), unit=None, stop_at=(), run=lambda _item: 0, read_envelope=lambda _item: None) == 3
     captured = capsys.readouterr()
