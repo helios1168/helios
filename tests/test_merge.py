@@ -615,7 +615,7 @@ def test_command_writes_refusal_to_stderr_and_planned_steps_to_stdout(
     assert command.run(Namespace(bead="b1", dry_run=False)) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "verify evidence is not closed and verified\n"
+    assert captured.err == "helios: verify evidence is not closed and verified\n"
     beads.beads["v1"].metadata["verdict"] = "verified"
     assert command.run(Namespace(bead="b1", dry_run=True)) == 0
     assert capsys.readouterr().out == "would rebase, test, merge, push, and remove\n"

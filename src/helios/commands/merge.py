@@ -34,7 +34,7 @@ def run(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
         )
     except MergeError as exc:
-        print(str(exc), file=sys.stderr)
+        print(f"helios: {exc}", file=sys.stderr)
         return exc.code
     print(message)
     return code
