@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +45,15 @@ def append(
 
     The line, newline included, is at most 4096 bytes: ``detail`` is
     shortened first, and the call raises when the line is still too long.
+    The separator newline written to close a torn tail does not count
+    toward that limit.
+
+    A crash can leave the last line of the events file without its
+    trailing newline. To keep the next append from gluing onto it, this
+    takes an exclusive flock on the file, and if the file is non-empty and
+    its last byte is not a newline, writes a newline first, then writes
+    the line, then releases the lock. Both writes go through the same
+    O_APPEND descriptor, so they always land at the end of the file.
     """
     if type not in TYPES:
         raise ValueError(f"unknown event type {type!r}")
@@ -65,8 +76,18 @@ def append(
         raise ValueError(f"event line for bead {bead!r} exceeds {MAX_BYTES} bytes")
     path = hub / EVENT_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a") as fh:
-        fh.write(line.decode("utf-8"))
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            size = os.fstat(fd).st_size
+            if size > 0 and os.pread(fd, 1, size - 1) != b"\n":
+                os.write(fd, b"\n")
+            os.write(fd, line)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
     return event
 
 
