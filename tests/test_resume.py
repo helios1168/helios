@@ -169,6 +169,45 @@ def test_does_not_refuse_when_pid_reused(tmp_path: Path, monkeypatch) -> None:
         resume_mod.resume("b1", None, hub=hub, beads=beads, config=cfg)
 
 
+@pytest.mark.parametrize("bad_pid", [0, True])
+def test_normalizes_invalid_pid_before_liveness_check(tmp_path: Path, monkeypatch, bad_pid) -> None:
+    """SPEC §8.3: a pid that is not an int with 0 < pid < 2**31 (a bool
+    counts as not an int) reads as null before any liveness call, the same
+    validation as sessions.safe_state (rule item 4)."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    attempt_dir = hub / cfg.project.runs / "b1" / "attempt-1"
+    attempt_mod.transition(attempt_dir, "launched", pid=bad_pid)
+    # An invalid pid reads as null: not live, so resume refuses for being
+    # unfinalized, never for "still running".
+    with pytest.raises(resume_mod.ResumeRefusal, match="is not finalized"):
+        resume_mod.resume("b1", None, hub=hub, beads=beads, config=cfg)
+
+
+def test_normalizes_non_string_pid_start_before_liveness_check(tmp_path: Path, monkeypatch) -> None:
+    """A non-string pid_start reads as null (SPEC §8.3), falling back to the
+    process-group test alone; a genuinely live process is still refused."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    attempt_dir = hub / cfg.project.runs / "b1" / "attempt-1"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        attempt_mod.write_state(
+            attempt_dir, attempt_id="b1#1", state="launched", pid=proc.pid, pid_start=12345,  # type: ignore[arg-type]
+        )
+        with pytest.raises(resume_mod.ResumeRefusal, match="is still running"):
+            resume_mod.resume("b1", None, hub=hub, beads=beads, config=cfg)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 def test_refuses_when_not_finalized(tmp_path: Path, monkeypatch) -> None:
     hub = make_hub(tmp_path)
     cfg = config_mod.load(hub)

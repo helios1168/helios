@@ -43,7 +43,16 @@ def _latest_finalized(
     n = numbers[-1]
     attempt_dir = attempt_mod.attempt_dir(hub, runs_rel, bead_id, n)
     state = attempt_mod.read_state(attempt_dir)
-    if attempt_mod.is_pid_alive(state.get("pid"), state.get("pid_start")):
+    # SPEC §8.3: a pid that is not an int with 0 < pid < 2**31 (a bool
+    # counts as not an int), or a non-string pid_start, reads as null
+    # before any liveness call (the same validation as sessions.safe_state).
+    pid = state.get("pid")
+    if not (isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 2**31):
+        pid = None
+    pid_start = state.get("pid_start")
+    if not isinstance(pid_start, str):
+        pid_start = None
+    if attempt_mod.is_pid_alive(pid, pid_start):
         raise ResumeRefusal(f"attempt {state.get('attempt_id')} is still running")
     if state.get("state") != "finalized":
         raise ResumeRefusal(f"attempt {state.get('attempt_id')} is not finalized")

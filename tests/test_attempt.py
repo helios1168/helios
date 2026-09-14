@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -195,3 +196,97 @@ def test_is_pid_alive_leader_reaped_falls_back_to_group_test(tmp_path: Path) -> 
             except ProcessLookupError:
                 break
             time.sleep(0.1)
+
+
+def test_read_pid_start_ignores_caller_locale_and_timezone() -> None:
+    """read_pid_start forces a fixed C locale and UTC time zone for its own
+    `ps` call, so the text never depends on the calling process's own
+    ambient LC_ALL/LANG/TZ (SPEC §7.1 step 7, rule item 1)."""
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        script = f"from helios import attempt as att; print(att.read_pid_start({proc.pid}) or '')"
+        foreign_env = dict(os.environ, LC_ALL="de_DE.UTF-8", LANG="de_DE.UTF-8", TZ="Asia/Tokyo")
+        c_env = {k: v for k, v in os.environ.items() if k not in ("LC_ALL", "LANG", "LC_TIME", "TZ")}
+        c_env.update(LC_ALL="C", LANG="C", TZ="UTC")
+        written = subprocess.run([sys.executable, "-c", script], env=foreign_env,
+                                 capture_output=True, text=True, check=True).stdout.strip()
+        compared = subprocess.run([sys.executable, "-c", script], env=c_env,
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        assert written and written == compared
+        assert att.is_pid_alive(proc.pid, written) is True
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_read_pid_start_passes_timeout_and_returns_null_on_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_timeout = []
+
+    def fake_run(*args, **kwargs):
+        seen_timeout.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(cmd=args[0] if args else "ps", timeout=kwargs.get("timeout") or 5)
+
+    monkeypatch.setattr(att.subprocess, "run", fake_run)
+    assert att.read_pid_start(12345) is None
+    assert seen_timeout == [5]
+
+
+def test_is_pid_alive_falls_through_when_ps_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A live leader whose `ps` read times out (rule item 3) falls back to
+    the process-group test instead of reading dead."""
+    monkeypatch.setattr(att, "read_pid_start", lambda pid: None)
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        assert att.is_pid_alive(proc.pid, "some-recorded-start-time") is True
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_is_pid_alive_falls_through_when_leader_vanishes_before_ps_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The leader exists at the first check but is gone by the time `ps`
+    runs (a race): `ps` reports nothing (null), so fall through to the
+    group test rather than reading dead (rule item 3)."""
+    child_pid_file = tmp_path / "child.pid"
+    leader_script = (
+        "import subprocess, sys\n"
+        "child = subprocess.Popen(['sleep', '30'])\n"
+        "open(sys.argv[1], 'w').write(str(child.pid))\n"
+    )
+    leader = subprocess.Popen(
+        [sys.executable, "-c", leader_script, str(child_pid_file)], start_new_session=True
+    )
+    leader.wait(timeout=5)
+    child_pid = int(child_pid_file.read_text().strip())
+    monkeypatch.setattr(att, "_leader_exists", lambda pid: True)
+    monkeypatch.setattr(att, "read_pid_start", lambda pid: None)
+    try:
+        assert att.is_pid_alive(leader.pid, "a-start-time-that-no-longer-matters") is True
+    finally:
+        try:
+            os.killpg(leader.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        for _ in range(50):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+
+
+def test_is_pid_alive_ps_missing_from_path_reads_not_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`ps` entirely missing from PATH is not covered by the item-3
+    fallback (a documented follow-up): the attempt reads as not live even
+    though the process group is genuinely alive."""
+    monkeypatch.setattr(att.shutil, "which", lambda name: None)
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        assert att.is_pid_alive(proc.pid, "whatever-start-time") is False
+    finally:
+        proc.kill()
+        proc.wait()

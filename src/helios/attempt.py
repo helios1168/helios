@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -261,19 +262,28 @@ def classify_recovery(state: str | None, *, pid_alive: bool) -> RecoveryAction:
     return "crash_and_new"
 
 
+_PS_LOCALE_ENV = {"LC_ALL": "C", "LANG": "C", "LC_TIME": "C", "TZ": "UTC0"}
+
+
 def read_pid_start(pid: int) -> str | None:
-    """Stripped ``ps -o lstart= -p <pid>`` text, or null on failure or empty
-    output (SPEC §7.1 step 7). A small wrapper so tests can monkeypatch the
-    ``ps`` call instead of the real process table.
+    """Stripped ``ps -o lstart= -p <pid>`` text, or null on failure, a 5 s
+    timeout, or empty output (SPEC §7.1 step 7). Always run in a fixed C
+    locale and UTC time zone, at both the launch write and every later
+    compare, so the text never depends on the caller's locale or time zone.
+    A small wrapper so tests can monkeypatch the ``ps`` call instead of the
+    real process table.
     """
+    env = {**os.environ, **_PS_LOCALE_ENV}
     try:
         proc = subprocess.run(
             ["ps", "-o", "lstart=", "-p", str(pid)],
             capture_output=True,
             text=True,
             check=False,
+            env=env,
+            timeout=5,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
         return None
@@ -300,12 +310,21 @@ def is_pid_alive(pid: int | None, pid_start: str | None = None) -> bool:
     (``os.killpg(pid, 0)`` succeeds or raises ``PermissionError``). A leader
     pid whose start time differs from ``pid_start`` is a reused pid: never
     live, and helios never signals it. A null ``pid_start`` falls back to
-    the process-group test alone.
+    the process-group test alone. When the leader exists, ``ps`` is on
+    ``PATH``, but the read comes back null anyway (a 5 s timeout, or the
+    leader exits between the two checks so ``ps`` finds nothing), fall back
+    to the process-group test too, instead of reading the attempt as dead.
+    ``ps`` missing from ``PATH`` entirely is not covered by that fallback
+    (a follow-up): the attempt reads as not live.
     """
     if pid is None:
         return False
     if pid_start is not None and _leader_exists(pid):
-        return read_pid_start(pid) == pid_start
+        if shutil.which("ps") is None:
+            return False
+        current = read_pid_start(pid)
+        if current is not None:
+            return current == pid_start
     try:
         os.killpg(pid, 0)
     except ProcessLookupError:
