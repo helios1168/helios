@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -129,3 +131,70 @@ def test_unit_control_defaults_and_value_errors() -> None:
         run_unit([bead("b")], default="until", configured_until="wat")
     with pytest.raises(control.ControlError):
         run_unit([bead("b")], until="model")
+
+
+def test_unit_verify_kind_with_no_verdict_is_not_verified(capsys: pytest.CaptureFixture[str]) -> None:
+    result, reason = run_unit([bead("b", "verify-code")], read=lambda item: envelope(item.id, verdict=None))
+    assert result.code == 0 and reason == "bead b verdict -"
+    assert capsys.readouterr().out.endswith("stopped: bead b verdict -\n")
+
+
+def config_stub(*, default: str = "auto", until: str = "verify-code", stop_at: tuple[str, ...] = ()) -> Any:
+    from helios.config import Config, ControlConfig
+
+    return Config(hub=Path("."), control=ControlConfig(default=default, until=until, stop_at=stop_at))
+
+
+def test_next_command_config_error_is_prefixed_and_exit_two(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from helios.commands import next as command
+
+    def bad_load(_path: Path) -> Any:
+        raise ValueError("bad config key 'x'")
+
+    monkeypatch.setattr(command, "load", bad_load)
+    assert command.run(argparse.Namespace(unit=None)) == 2
+    assert capsys.readouterr().err == "helios: bad config key 'x'\n"
+
+
+def test_next_command_passes_through_run_code(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from helios.commands import next as command
+
+    rows = [bead("b")]
+    fake = ReadyInBdOrder(rows)
+    monkeypatch.setattr(command, "load", lambda _path: config_stub())
+    monkeypatch.setattr(command, "Beads", lambda _hub: fake)
+    monkeypatch.setattr(command, "run_bead", lambda _item: 7)
+    monkeypatch.setattr(command, "read_envelope", lambda item: envelope(item.id))
+    assert command.run(argparse.Namespace(unit=None)) == 7
+    assert capsys.readouterr().out == "b#1\tcompleted\tdone\t-\tok\n"
+
+
+def test_unit_run_command_config_error_is_prefixed_and_exit_two(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from helios.commands import unit_run as command
+
+    def bad_load(_path: Path) -> Any:
+        raise TypeError("config key 'control.default' has the wrong type: 1")
+
+    monkeypatch.setattr(command, "load", bad_load)
+    assert command.run(argparse.Namespace(unit="u", until=None)) == 2
+    assert capsys.readouterr().err == "helios: config key 'control.default' has the wrong type: 1\n"
+
+
+def test_unit_run_command_control_error_is_prefixed_and_exit_two(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from helios.commands import unit_run as command
+
+    monkeypatch.setattr(command, "load", lambda _path: config_stub(default="manual"))
+    monkeypatch.setattr(command, "Beads", lambda _hub: ReadyInBdOrder([bead("b")]))
+    assert command.run(argparse.Namespace(unit="u", until=None)) == 2
+    assert capsys.readouterr().err == "helios: manual control requires --until\n"
+
+
+def test_unit_run_command_passes_through_result_code(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    from helios.commands import unit_run as command
+
+    monkeypatch.setattr(command, "load", lambda _path: config_stub())
+    monkeypatch.setattr(command, "Beads", lambda _hub: ReadyInBdOrder([bead("b")]))
+    monkeypatch.setattr(command, "run_bead", lambda _item: 0)
+    monkeypatch.setattr(command, "read_envelope", lambda item: envelope(item.id))
+    assert command.run(argparse.Namespace(unit="u", until="impl")) == 0
+    assert capsys.readouterr().out.endswith("stopped: until stage reached\n")

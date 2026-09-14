@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from helios import control
@@ -19,7 +20,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         config = load(Path.cwd())
     except (ValueError, TypeError, RecursionError) as exc:
-        print(f"helios: {exc}", file=__import__("sys").stderr)
+        print(f"helios: {exc}", file=sys.stderr)
         return 2
     beads = Beads(config.hub)
     return control.next_bead(beads, unit=args.unit, stop_at=config.control.stop_at, run=run_bead, read_envelope=read_envelope)

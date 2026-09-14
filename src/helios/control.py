@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from helios.beads import Bead, BeadsLike
 from helios.envelope import Envelope
-from helios.stages import STAGES
+from helios.stages import STAGES, VERIFY_STAGES
 
 
 class ControlError(ValueError):
@@ -63,7 +64,7 @@ def next_bead(
     """Run the first candidate not covered by ``stop_at`` (SPEC section 11)."""
     bead = next((b for b in candidates(beads, unit) if b.kind not in stop_at), None)
     if bead is None:
-        print("helios: no ready bead", file=__import__("sys").stderr)
+        print("helios: no ready bead", file=sys.stderr)
         return 3
     code, _envelope, line = _run_one(bead, run, read_envelope)
     print(line)
@@ -136,20 +137,23 @@ def unit_run(
             return UnitResult(1, reason)
         print(line)
         last_code = code
+        data = envelope if isinstance(envelope, dict) else envelope.model_dump(mode="json")
+        report = data.get("report") or {}
+        # Report content decides the stop reason before the run's own exit code
+        # does, so a report of "done" with a nonzero code (a failed helios check)
+        # still reads as an execution failure rather than a false report mismatch.
+        if report.get("status") != "done":
+            reason = f"bead {bead.id} report status {report.get('status') or '-'}"
+            print(f"stopped: {reason}")
+            return UnitResult(code, reason)
+        if bead.kind in VERIFY_STAGES and report.get("verdict") != "verified":
+            reason = f"bead {bead.id} verdict {report.get('verdict') or '-'}"
+            print(f"stopped: {reason}")
+            return UnitResult(code, reason)
         if code != 0:
             reason = f"execution failure for {bead.id}"
             print(f"stopped: {reason}")
             return UnitResult(code, reason)
-        data = envelope if isinstance(envelope, dict) else envelope.model_dump(mode="json")
-        report = data.get("report") or {}
-        if report.get("status") != "done":
-            reason = f"bead {bead.id} report status {report.get('status') or '-'}"
-            print(f"stopped: {reason}")
-            return UnitResult(last_code, reason)
-        if report.get("verdict") not in (None, "verified") and bead.kind.startswith("verify"):
-            reason = f"bead {bead.id} verdict {report.get('verdict')}"
-            print(f"stopped: {reason}")
-            return UnitResult(last_code, reason)
         if effective_until == bead.kind:
             print("stopped: until stage reached")
             return UnitResult(0, "until stage reached")

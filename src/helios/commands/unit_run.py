@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,12 +19,16 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
-    config = load(Path.cwd())
+    try:
+        config = load(Path.cwd())
+    except (ValueError, TypeError, RecursionError) as exc:
+        print(f"helios: {exc}", file=sys.stderr)
+        return 2
     beads = Beads(config.hub)
     try:
         result = control.unit_run(beads, unit=args.unit, default=config.control.default, configured_until=config.control.until, stop_at=config.control.stop_at, until=args.until, run=run_bead, read_envelope=read_envelope)
     except control.ControlError as exc:
-        print(f"helios: {exc}", file=__import__("sys").stderr)
+        print(f"helios: {exc}", file=sys.stderr)
         return 2
     return result.code
 

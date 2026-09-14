@@ -40,8 +40,10 @@ def test_learned_unit_filter_and_status_and_unlabelled_filter() -> None:
     beads = queue_beads()
     beads.add_comment("b", "learned: [b#1#1] u")
     beads.add_comment("closed", "learned: [closed#1#1] closed")
+    beads.add_comment("ignored", "learned: [ignored#1#1] no kind label")
     assert [line.bead for line in list_lines(beads, "u")] == ["b"]
-    assert [line.bead for line in list_lines(beads)] == ["b", "closed"]
+    # "closed" carries no unit label, so its unit sorts as "-", ahead of "u".
+    assert [(line.unit, line.bead) for line in list_lines(beads)] == [("-", "closed"), ("u", "b")]
 
 
 def test_learned_mark_comment_replay_unknown_and_curated_label() -> None:

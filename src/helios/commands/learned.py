@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from helios.beads import Beads
@@ -21,18 +22,18 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run(args: argparse.Namespace) -> int:
     if args.mark and (args.unit or args.json) or bool(args.mark) != bool(args.decision):
-        print("helios: invalid learned options", file=__import__("sys").stderr)
+        print("helios: invalid learned options", file=sys.stderr)
         return 2
     try:
         beads = Beads(load(Path.cwd()).hub)
     except (ValueError, TypeError, RecursionError) as exc:
-        print(f"helios: {exc}", file=__import__("sys").stderr)
+        print(f"helios: {exc}", file=sys.stderr)
         return 2
     if args.mark:
         try:
             return queue.mark(beads, args.mark, args.decision)
         except ValueError as exc:
-            print(f"helios: {exc}", file=__import__("sys").stderr)
+            print(f"helios: {exc}", file=sys.stderr)
             return 2
     lines = queue.list_lines(beads, args.unit)
     if args.json:
