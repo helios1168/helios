@@ -34,21 +34,17 @@ def _helios_beads(beads: Any) -> list[Bead]:
     return [bead for bead in beads.list() if bead.kind in STAGES and f"kind:{bead.kind}" in bead.labels]
 
 
-def _curated_texts(beads: Any, relevant: list[Bead]) -> list[str]:
-    """Every ``curated: [...]`` comment on any helios-kind bead (Decided: a curated
-    comment for a marker counts on any bead, not just the one carrying the raw line)."""
-    curated: list[str] = []
-    for bead in relevant:
-        curated.extend(c.text for c in beads.comments(bead.id) if c.text.startswith("curated: ["))
-    return curated
+def _all_markers(beads: Any, unit: str | None = None) -> dict[str, tuple[Bead, LearnedLine]]:
+    """Every distinct marker found on a helios-kind bead's comments, curated or not.
 
-
-def _lines(beads: Any, unit: str | None = None) -> list[tuple[Bead, LearnedLine]]:
-    relevant = _helios_beads(beads)
-    curated = _curated_texts(beads, relevant)
-
-    found: dict[str, tuple[Bead, LearnedLine, str]] = {}
-    for bead in relevant:
+    Keyed by the exact bracketed marker text (``[<kind>:<bead>#<attempt>#<k>]``); the
+    first occurrence in bd order wins a duplicate marker. This is the full set
+    ``--mark`` validates against (Decided: comparison is on marker text, never on
+    parsed numbers, so a leading-zero or Unicode-digit variant of a real marker is
+    unknown, and a replay of an already-curated marker still finds it).
+    """
+    found: dict[str, tuple[Bead, LearnedLine]] = {}
+    for bead in _helios_beads(beads):
         if unit is not None and f"unit:{unit}" not in bead.labels:
             continue
         bead_unit = next((label[5:] for label in bead.labels if label.startswith("unit:")), "-")
@@ -60,15 +56,34 @@ def _lines(beads: Any, unit: str | None = None) -> list[tuple[Bead, LearnedLine]
             marker = f"[{kind}:{marker_bead}#{attempt}#{k}]"
             if marker in found:
                 continue  # dedupe by marker across all beads; the first in bd order wins
-            if any(c.startswith(f"curated: {marker}") for c in curated):
-                continue
-            item = LearnedLine(bead_unit, marker_bead, int(attempt), kind, int(k), text)
-            found[marker] = (bead, item, marker)
+            found[marker] = (bead, LearnedLine(bead_unit, marker_bead, int(attempt), kind, int(k), text))
+    return found
+
+
+def _curated_texts(beads: Any, targets: set[str]) -> list[str]:
+    """Every ``curated: [...]`` comment on one of ``targets`` (Decided: a curated
+    comment for a marker counts on any bead, so ``targets`` covers every helios-kind
+    bead plus every bead a queue marker names, kind label or not)."""
+    curated: list[str] = []
+    for bead_id in targets:
+        curated.extend(c.text for c in beads.comments(bead_id) if c.text.startswith("curated: ["))
+    return curated
+
+
+def _lines(beads: Any, unit: str | None = None) -> list[tuple[Bead, LearnedLine]]:
+    found = _all_markers(beads, unit)
+    targets = {bead.id for bead in _helios_beads(beads)} | {item.bead for _bead, item in found.values()}
+    curated = _curated_texts(beads, targets)
+    kept = [
+        (marker, bead, item)
+        for marker, (bead, item) in found.items()
+        if not any(c.startswith(f"curated: {marker}") for c in curated)
+    ]
     ordered = sorted(
-        found.values(),
-        key=lambda triple: (triple[1].unit, triple[1].bead, triple[1].attempt, triple[1].kind, triple[1].k, triple[2]),
+        kept,
+        key=lambda triple: (triple[2].unit, triple[2].bead, triple[2].attempt, triple[2].kind, triple[2].k, triple[0]),
     )
-    return [(bead, item) for bead, item, _marker in ordered]
+    return [(bead, item) for _marker, bead, item in ordered]
 
 
 def list_lines(beads: Any, unit: str | None = None) -> list[LearnedLine]:
@@ -77,23 +92,25 @@ def list_lines(beads: Any, unit: str | None = None) -> list[LearnedLine]:
 
 
 def mark(beads: Any, marker: str, decision: str) -> int:
-    """Curate one queue entry, replaying an existing mark as a no-op."""
+    """Curate one queue entry, replaying an existing mark as a no-op.
+
+    Decided: ``marker`` (``<kind>:<bead>#<attempt>#<k>``) must equal, as text, one of
+    the markers of the full listing (curated ones included, so a replay still works);
+    an unmatched marker, including a leading-zero or Unicode-digit variant of a real
+    one, is unknown.
+    """
     if decision not in {"memory", "template", "drop"}:
         raise ValueError(f"unknown decision {decision}")
-    match = re.fullmatch(r"(learned|missing_context):(.+#\d+)#(\d+)", marker)
-    if not match:
+    bracketed = f"[{marker}]"
+    found = _all_markers(beads)
+    if bracketed not in found:
         raise ValueError(f"unknown marker {marker}")
-    kind, attempt_id, k = match.groups()
-    target_bead, attempt = attempt_id.rsplit("#", 1)
-    prefix = f"curated: [{kind}:{attempt_id}#{k}]"
+    _source, item = found[bracketed]
+    target_bead = item.bead
+    prefix = f"curated: {bracketed}"
 
-    already = any(c.startswith(prefix) for c in _curated_texts(beads, _helios_beads(beads)))
-    known = any(
-        item.kind == kind and item.bead == target_bead and item.attempt == int(attempt) and item.k == int(k)
-        for _bead, item in _lines(beads)
-    )
-    if not already and not known:
-        raise ValueError(f"unknown marker {marker}")
+    targets = {bead.id for bead in _helios_beads(beads)} | {target_bead}
+    already = any(c.startswith(prefix) for c in _curated_texts(beads, targets))
     if not already:
         beads.add_comment(target_bead, f"{prefix} -> {decision}")
     if not any(item.bead == target_bead for _bead, item in _lines(beads)):

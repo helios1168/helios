@@ -35,7 +35,14 @@ def run(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"helios: {exc}", file=sys.stderr)
             return 2
-    lines = queue.list_lines(beads, args.unit)
+        except RuntimeError as exc:
+            print(f"helios: {exc}", file=sys.stderr)
+            return 1
+    try:
+        lines = queue.list_lines(beads, args.unit)
+    except RuntimeError as exc:
+        print(f"helios: {exc}", file=sys.stderr)
+        return 1
     if args.json:
         print(json.dumps([line.as_json() for line in lines]))
     else:

@@ -28,7 +28,17 @@ def run(args: argparse.Namespace) -> int:
         return 2
     beads = Beads(config.hub)
     try:
-        result = control.unit_run(beads, unit=args.unit, default=config.control.default, configured_until=config.control.until, stop_at=config.control.stop_at, until=args.until, run=run_bead, read_envelope=read_envelope)
+        result = control.unit_run(
+            beads,
+            unit=args.unit,
+            default=config.control.default,
+            configured_until=config.control.until,
+            stop_at=config.control.stop_at,
+            until=args.until,
+            run=run_bead,
+            read_envelope=read_envelope,
+            latest_attempt=latest_attempt,
+        )
     except control.ControlError as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2
@@ -58,3 +68,15 @@ def read_envelope(bead: Bead) -> Envelope | None:
     if not path.is_file():
         return None
     return Envelope.model_validate_json(path.read_text())
+
+
+def latest_attempt(bead: Bead) -> int | None:
+    """The bead's highest existing attempt number, or None (SPEC section 8.3).
+
+    Compared before and after ``run_bead`` (control.py's ``_execute``) to catch a run
+    that makes no new attempt (Decided).
+    """
+    config = load(Path.cwd())
+    bead_runs = runs_dir(config.hub, config.project.runs, bead.id)
+    numbers = existing_attempts(bead_runs)
+    return numbers[-1] if numbers else None

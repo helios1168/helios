@@ -52,14 +52,27 @@ def _execute(
     bead: Bead,
     run: Callable[[Bead], int],
     read_envelope: Callable[[Bead], Envelope | None],
+    latest_attempt: Callable[[Bead], int | None] | None = None,
 ) -> tuple[int, Envelope | None]:
     """Run ``bead`` and read its envelope, converting either callable's exception.
 
     A raising ``run`` or ``read_envelope`` is an execution failure (SPEC section 7.1 exit
     code 4), reported as ``execution failure for <bead>: <exception type>: <message>``.
+
+    When ``latest_attempt`` is given, its value before and after ``run`` is compared
+    (Decided): a run that makes no new attempt is its own execution failure, reason
+    ``execution failure for <bead>: no new attempt``, carrying the run's own exit code
+    so the caller can use it (``execution_failure_exit``). ``latest_attempt`` is
+    optional so existing callers that do not track attempts keep working unchanged.
     """
+    before = latest_attempt(bead) if latest_attempt is not None else None
     try:
         code = int(run(bead))
+    except Exception as exc:
+        raise ExecutionFailure(f"execution failure for {bead.id}: {type(exc).__name__}: {exc}") from exc
+    if latest_attempt is not None and latest_attempt(bead) == before:
+        raise ExecutionFailure(f"execution failure for {bead.id}: no new attempt", code=code)
+    try:
         envelope = read_envelope(bead)
     except Exception as exc:
         raise ExecutionFailure(f"execution failure for {bead.id}: {type(exc).__name__}: {exc}") from exc
@@ -67,7 +80,20 @@ def _execute(
 
 
 class ExecutionFailure(Exception):
-    """A run or its envelope could not be produced; carries the SPEC section 7.1 reason."""
+    """A run or its envelope could not be produced; carries the SPEC section 7.1 reason.
+
+    ``code`` is the run's own exit code when it is known (a raised exception leaves it
+    ``None``). ``execution_failure_exit`` turns it into the exit code to use (Decided).
+    """
+
+    def __init__(self, message: str, *, code: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def execution_failure_exit(code: int | None) -> int:
+    """SPEC section 7.1 exit code 4, or the run's own code when it is nonzero (Decided)."""
+    return code if code else 4
 
 
 def next_bead(
@@ -77,6 +103,7 @@ def next_bead(
     stop_at: tuple[str, ...],
     run: Callable[[Bead], int],
     read_envelope: Callable[[Bead], Envelope | None],
+    latest_attempt: Callable[[Bead], int | None] | None = None,
 ) -> int:
     """Run the first candidate not covered by ``stop_at`` (SPEC section 11)."""
     bead = next((b for b in candidates(beads, unit) if b.kind not in stop_at), None)
@@ -84,10 +111,10 @@ def next_bead(
         print("helios: no ready bead", file=sys.stderr)
         return 3
     try:
-        code, envelope = _execute(bead, run, read_envelope)
+        code, envelope = _execute(bead, run, read_envelope, latest_attempt)
     except ExecutionFailure as exc:
         print(f"helios: {exc}", file=sys.stderr)
-        return 4
+        return execution_failure_exit(exc.code)
     if envelope is not None:
         print(envelope_line(envelope))
     return code
@@ -121,6 +148,7 @@ def unit_run(
     until: str | None,
     run: Callable[[Bead], int],
     read_envelope: Callable[[Bead], Envelope | None],
+    latest_attempt: Callable[[Bead], int | None] | None = None,
 ) -> UnitResult:
     """Run a unit until a SPEC section 11 stopping condition.
 
@@ -162,11 +190,11 @@ def unit_run(
             return UnitResult(3, reason)
         seen.add(bead.id)
         try:
-            code, envelope = _execute(bead, run, read_envelope)
+            code, envelope = _execute(bead, run, read_envelope, latest_attempt)
         except ExecutionFailure as exc:
             reason = str(exc)
             print(f"stopped: {reason}")
-            return UnitResult(4, reason)
+            return UnitResult(execution_failure_exit(exc.code), reason)
         last_code = code
         if envelope is not None:
             print(envelope_line(envelope))
@@ -175,7 +203,7 @@ def unit_run(
             detail = envelope.execution_status if envelope is not None else "missing envelope"
             reason = f"execution failure for {bead.id}: {detail}"
             print(f"stopped: {reason}")
-            return UnitResult(4, reason)
+            return UnitResult(execution_failure_exit(code), reason)
 
         report = envelope.report  # completed always carries a report (Envelope's own rule)
         assert report is not None

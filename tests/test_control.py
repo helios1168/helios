@@ -134,8 +134,19 @@ def run_unit(
     stop_at: tuple[str, ...] = (),
     run: Any = lambda _item: 0,
     read: Any = lambda item: mk_envelope(item.id, kind=item.kind),
+    latest_attempt: Any = None,
 ) -> tuple[control.UnitResult, str]:
-    result = control.unit_run(ReadyInBdOrder(rows), unit="u", default=default, configured_until=configured_until, stop_at=stop_at, until=until, run=run, read_envelope=read)
+    result = control.unit_run(
+        ReadyInBdOrder(rows),
+        unit="u",
+        default=default,
+        configured_until=configured_until,
+        stop_at=stop_at,
+        until=until,
+        run=run,
+        read_envelope=read,
+        latest_attempt=latest_attempt,
+    )
     return result, result.reason
 
 
@@ -258,6 +269,51 @@ def test_unit_read_envelope_raising_is_execution_failure_exit_four(capsys: pytes
     assert (result.code, reason) == (4, "execution failure for b: ValueError: bad json")
 
 
+def test_unit_execution_failure_exit_uses_run_code_when_nonzero(capsys: pytest.CaptureFixture[str]) -> None:
+    """Decided (item 2): an execution failure exits with the run's own code when it is
+    nonzero (a preflight refusal, exit 2), not the hardcoded 4."""
+    e = mk_envelope("b", execution_status="crashed", with_report=False)
+    result, reason = run_unit([bead("b")], run=lambda _item: 2, read=lambda _item: e)
+    assert (result.code, reason) == (2, "execution failure for b: crashed")
+
+
+def test_unit_no_new_attempt_is_execution_failure_using_run_code(capsys: pytest.CaptureFixture[str]) -> None:
+    """Decided (item 3): a run that makes no new attempt is its own execution failure,
+    reason 'no new attempt', exit with the run's own nonzero code."""
+    result, reason = run_unit(
+        [bead("b")],
+        run=lambda _item: 2,
+        read=lambda item: mk_envelope(item.id),
+        latest_attempt=lambda _item: 5,  # same before and after: no new attempt
+    )
+    assert (result.code, reason) == (2, "execution failure for b: no new attempt")
+    assert capsys.readouterr().out.endswith("stopped: execution failure for b: no new attempt\n")
+
+
+def test_unit_no_new_attempt_with_run_code_zero_exits_four(capsys: pytest.CaptureFixture[str]) -> None:
+    result, reason = run_unit(
+        [bead("b")],
+        run=lambda _item: 0,
+        read=lambda item: mk_envelope(item.id),
+        latest_attempt=lambda _item: None,  # no attempt before, none after either
+    )
+    assert (result.code, reason) == (4, "execution failure for b: no new attempt")
+
+
+def test_next_no_new_attempt_is_execution_failure_using_run_code(capsys: pytest.CaptureFixture[str]) -> None:
+    rows = [bead("b")]
+    code = control.next_bead(
+        ReadyInBdOrder(rows),
+        unit="u",
+        stop_at=(),
+        run=lambda _item: 2,
+        read_envelope=lambda item: mk_envelope(item.id),
+        latest_attempt=lambda _item: 5,
+    )
+    assert code == 2
+    assert capsys.readouterr().err == "helios: execution failure for b: no new attempt\n"
+
+
 def test_unit_until_reached_only_after_an_earlier_candidate(capsys: pytest.CaptureFixture[str]) -> None:
     rows = [bead("i", "impl"), bead("v", "verify-code")]
     envelopes = {
@@ -290,6 +346,13 @@ def test_next_command_config_error_is_prefixed_and_exit_two(monkeypatch: pytest.
     assert capsys.readouterr().err == "helios: bad config key 'x'\n"
 
 
+def _incrementing_attempt() -> Any:
+    """A latest_attempt stub whose value differs on the after-call (a new attempt was
+    made), so tests unrelated to item 3 are not tripped up by that check."""
+    counter = iter(range(1_000_000))
+    return lambda _item: next(counter)
+
+
 def test_next_command_passes_through_run_code(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     from helios.commands import next as command
 
@@ -299,6 +362,7 @@ def test_next_command_passes_through_run_code(monkeypatch: pytest.MonkeyPatch, c
     monkeypatch.setattr(command, "Beads", lambda _hub: fake)
     monkeypatch.setattr(command, "run_bead", lambda _item: 7)
     monkeypatch.setattr(command, "read_envelope", lambda item: mk_envelope(item.id))
+    monkeypatch.setattr(command, "latest_attempt", _incrementing_attempt())
     assert command.run(argparse.Namespace(unit=None)) == 7
     assert capsys.readouterr().out == "b#1\tcompleted\tdone\t-\tok\n"
 
@@ -330,6 +394,7 @@ def test_unit_run_command_passes_through_result_code(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(command, "Beads", lambda _hub: ReadyInBdOrder([bead("b")]))
     monkeypatch.setattr(command, "run_bead", lambda _item: 0)
     monkeypatch.setattr(command, "read_envelope", lambda item: mk_envelope(item.id))
+    monkeypatch.setattr(command, "latest_attempt", _incrementing_attempt())
     assert command.run(argparse.Namespace(unit="u", until="impl")) == 0
     assert capsys.readouterr().out.endswith("stopped: until stage reached\n")
 
@@ -363,12 +428,17 @@ def test_next_command_run_bead_and_read_envelope_wire_to_run_many_and_attempt_fi
     (tmp_path / ".agents" / "workflow.toml").write_text("")
     monkeypatch.chdir(tmp_path)
 
-    fake_module = FakeHeliosRun()
+    envelope = mk_envelope("b", attempt=1)
+
+    class WritesAttempt(FakeHeliosRun):
+        def run_many(self, bead_ids: list[str], *, hub: Path, beads: Any, config: Any) -> int:
+            super().run_many(bead_ids, hub=hub, beads=beads, config=config)
+            _write_envelope(tmp_path / ".helios" / "runs" / "b" / "attempt-1" / "envelope.json", envelope)
+            return self.code
+
+    fake_module = WritesAttempt()
     monkeypatch.setitem(sys.modules, "helios.run", fake_module)
     importlib.invalidate_caches()
-
-    envelope = mk_envelope("b", attempt=1)
-    _write_envelope(tmp_path / ".helios" / "runs" / "b" / "attempt-1" / "envelope.json", envelope)
 
     fake = ReadyInBdOrder([bead("b")])
     monkeypatch.setattr(command, "Beads", lambda _hub: fake)
@@ -381,12 +451,23 @@ def test_next_command_run_bead_and_read_envelope_wire_to_run_many_and_attempt_fi
 def test_next_command_run_bead_missing_helios_run_module_is_execution_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """main now ships a real helios.run (hel-6ks), so simulating 'missing' means
+    making the import itself fail, not removing it from sys.modules (which would just
+    re-import the real file from disk)."""
     from helios.commands import next as command
 
     (tmp_path / ".agents").mkdir()
     (tmp_path / ".agents" / "workflow.toml").write_text("")
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delitem(sys.modules, "helios.run", raising=False)
+
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name: str, *a: Any, **kw: Any) -> Any:
+        if name == "helios.run":
+            raise ModuleNotFoundError("No module named 'helios.run'")
+        return real_import_module(name, *a, **kw)
+
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
 
     fake = ReadyInBdOrder([bead("b")])
     monkeypatch.setattr(command, "Beads", lambda _hub: fake)
@@ -415,24 +496,32 @@ def test_unit_run_command_read_envelope_none_when_no_attempt(
     result_code = command.run(argparse.Namespace(unit="u", until=None))
     assert result_code == 4
     out = capsys.readouterr().out
-    assert out.endswith("stopped: execution failure for b: missing envelope\n")
+    assert out.endswith("stopped: execution failure for b: no new attempt\n")
 
 
 def test_unit_run_command_read_envelope_uses_highest_attempt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """The command reads the highest attempt written for the new run, not an older one
+    already on disk (item 3: a run that leaves the attempt count unchanged is instead
+    'no new attempt', so the run here must create attempt-2 to succeed)."""
     from helios.commands import unit_run as command
 
     (tmp_path / ".agents").mkdir()
     (tmp_path / ".agents" / "workflow.toml").write_text('[control]\ndefault = "auto"\n')
     monkeypatch.chdir(tmp_path)
 
-    fake_module = FakeHeliosRun()
+    _write_envelope(tmp_path / ".helios" / "runs" / "b" / "attempt-1" / "envelope.json", mk_envelope("b", attempt=1, status="partial"))
+
+    class WritesNewAttempt(FakeHeliosRun):
+        def run_many(self, bead_ids: list[str], *, hub: Path, beads: Any, config: Any) -> int:
+            super().run_many(bead_ids, hub=hub, beads=beads, config=config)
+            _write_envelope(tmp_path / ".helios" / "runs" / "b" / "attempt-2" / "envelope.json", mk_envelope("b", attempt=2))
+            return self.code
+
+    fake_module = WritesNewAttempt()
     monkeypatch.setitem(sys.modules, "helios.run", fake_module)
     importlib.invalidate_caches()
-
-    _write_envelope(tmp_path / ".helios" / "runs" / "b" / "attempt-1" / "envelope.json", mk_envelope("b", attempt=1, status="partial"))
-    _write_envelope(tmp_path / ".helios" / "runs" / "b" / "attempt-2" / "envelope.json", mk_envelope("b", attempt=2))
 
     rows = [bead("b")]
     fake = ReadyInBdOrder(rows)

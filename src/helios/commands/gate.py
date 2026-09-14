@@ -28,9 +28,13 @@ def run(args: argparse.Namespace) -> int:
     except GateError:
         print("helios: unexpected bd gate output", file=sys.stderr)
         return 1
+    except RuntimeError as exc:
+        print(f"helios: {exc}", file=sys.stderr)
+        return 1
     if args.json:
         print(json.dumps(gates))
     else:
         for gate in gates:
-            print(f"{gate['id']}: {', '.join(gate['blocks'])}")
+            blocks = ", ".join(gate["blocks"])
+            print(f"{gate['id']}: {blocks}" if blocks else f"{gate['id']}:")
     return 0

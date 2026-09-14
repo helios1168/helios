@@ -70,6 +70,18 @@ def test_learned_leading_zero_markers_are_distinct() -> None:
     assert [line.text for line in lines] == ["zero", "plain"]  # marker text tiebreak: "01" < "1"
 
 
+def test_learned_curated_comment_on_marker_target_without_kind_label() -> None:
+    """Decided: the curated set also includes comments of every bead a queue marker
+    names, even without a helios kind label of its own."""
+    beads = FakeBeads([
+        Bead("carrier", kind="impl", labels=["kind:impl", "unit:u"]),
+        Bead("other", labels=[]),
+    ])
+    beads.add_comment("carrier", "learned: [other#1#1] x")
+    beads.add_comment("other", "curated: [learned:other#1#1] -> drop")
+    assert list_lines(beads) == []
+
+
 def test_learned_curated_comment_on_another_bead_still_counts() -> None:
     """Decided: a curated: comment for a marker counts on any bead."""
     beads = FakeBeads([
@@ -110,6 +122,31 @@ def test_learned_mark_comment_text_replay_unknown_and_curated_label() -> None:
     assert "curated" in beads.show("b").labels
     with pytest.raises(ValueError):
         mark(beads, "learned:nope#1#1", "drop")
+
+
+def test_learned_mark_unknown_marker_text_variants_are_rejected() -> None:
+    """Decided: --mark compares marker text exactly, never parsed numbers, so a
+    leading-zero or Unicode-digit variant of a real marker is unknown, not curated."""
+    beads = FakeBeads([Bead("t-a7v", kind="impl", labels=["kind:impl", "unit:u"])])
+    beads.add_comment("t-a7v", "learned: [t-a7v#1#1] only line")
+    with pytest.raises(ValueError, match="unknown marker"):
+        mark(beads, "learned:t-a7v#01#1", "drop")
+    with pytest.raises(ValueError, match="unknown marker"):
+        mark(beads, "learned:t-a7v#1#01", "drop")
+    with pytest.raises(ValueError, match="unknown marker"):
+        mark(beads, "learned:t-a7v#١#1", "drop")  # Arabic-Indic digit one
+    assert len(beads.comments("t-a7v")) == 1  # nothing written by the rejected marks
+
+
+def test_learned_mark_replay_of_curated_marker_still_matches() -> None:
+    """Decided: --mark validates against the full listing including curated markers,
+    so a replay of an already-curated marker is still known, not unknown."""
+    beads = FakeBeads([Bead("b", kind="impl", labels=["kind:impl", "unit:u"])])
+    beads.add_comment("b", "learned: [b#1#1] x")
+    beads.add_comment("b", "curated: [learned:b#1#1] -> drop")
+    assert "curated" not in beads.show("b").labels
+    assert mark(beads, "learned:b#1#1", "drop") == 0
+    assert "curated" in beads.show("b").labels
 
 
 def test_learned_mark_replay_after_crash_before_label_adds_label() -> None:
@@ -154,6 +191,42 @@ def test_learned_command_mark_flags_exit_two_and_unknown_marker_prefixed(monkeyp
         assert capsys.readouterr().err.startswith("helios: ")
     assert command.run(Namespace(unit=None, json=False, mark="learned:b#1#1", decision="drop")) == 2
     assert capsys.readouterr().err.startswith("helios: ")
+
+
+class FailingList(FakeBeads):
+    def list(self, *, labels: list[str] = [], status: str | None = None) -> list[Bead]:
+        raise RuntimeError("bd list failed: boom")
+
+
+def test_learned_command_bd_runtime_error_on_list_is_prefixed_and_exit_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Decided: a bd RuntimeError in `learned` prints `helios: <message>` and exits 1,
+    never a traceback."""
+    from helios.commands import learned as command
+
+    monkeypatch.setattr(command, "Beads", lambda _hub: FailingList())
+    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path(".")))
+    assert command.run(Namespace(unit=None, json=False, mark=None, decision=None)) == 1
+    assert capsys.readouterr().err == "helios: bd list failed: boom\n"
+
+
+class FailingComment(FakeBeads):
+    def add_comment(self, bead_id: str, text: str) -> None:
+        raise RuntimeError("bd comment failed: boom")
+
+
+def test_learned_command_bd_runtime_error_on_mark_is_prefixed_and_exit_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from helios.commands import learned as command
+
+    fake = FailingComment([Bead("b", kind="impl", labels=["kind:impl"])])
+    fake._comments["b"] = [Comment("1", "b", "a", "learned: [b#1#1] x")]
+    monkeypatch.setattr(command, "Beads", lambda _hub: fake)
+    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path(".")))
+    assert command.run(Namespace(unit=None, json=False, mark="learned:b#1#1", decision="drop")) == 1
+    assert capsys.readouterr().err == "helios: bd comment failed: boom\n"
 
 
 BD = shutil.which("bd")

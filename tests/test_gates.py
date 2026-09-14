@@ -55,6 +55,35 @@ def test_open_gates_raises_gate_error_when_gate_list_is_not_a_list() -> None:
         open_gates(WeirdGates({"id": "g"}))  # type: ignore[arg-type]
 
 
+def test_gate_command_no_blocks_has_no_trailing_space(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Decided: a gate that blocks nothing prints 'g2:' with no trailing space."""
+    from helios.commands import gate as command
+
+    fake = FakeBeads([Bead("g2", status="open", metadata={"issue_type": "gate"})])
+    monkeypatch.setattr(command, "Beads", lambda _hub: fake)
+    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path(".")))
+    assert command.run(Namespace(json=False)) == 0
+    assert capsys.readouterr().out == "g2:\n"
+
+
+class FailingGateList(FakeBeads):
+    def gate_list(self) -> Any:
+        raise RuntimeError("bd gate list failed: boom")
+
+
+def test_gate_command_bd_runtime_error_is_prefixed_and_exit_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Decided: a bd RuntimeError in `gate` prints `helios: <message>` and exits 1,
+    never a traceback."""
+    from helios.commands import gate as command
+
+    monkeypatch.setattr(command, "Beads", lambda _hub: FailingGateList())
+    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path(".")))
+    assert command.run(Namespace(json=False)) == 1
+    assert capsys.readouterr().err == "helios: bd gate list failed: boom\n"
+
+
 def test_gate_command_unexpected_bd_output_exits_one_distinct_from_config_error(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
