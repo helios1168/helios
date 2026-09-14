@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -346,3 +350,132 @@ def test_exit_code_is_highest_over_turns(tmp_path: Path, monkeypatch) -> None:
     assert rc == 5
     assert (runs / "b1" / "acks" / msg_id).exists()
     assert (hub / cfg.project.runs / "b1" / "attempt-3").exists()
+
+
+def wait_for(path: Path, needle: str = "", limit: float = 20) -> None:
+    end = time.monotonic() + limit
+    while time.monotonic() < end:
+        if path.exists() and needle in path.read_text():
+            return
+        time.sleep(0.05)
+    raise TimeoutError(str(path))
+
+
+# ------------------------------------------------- round-1-fix item 3: chaining
+
+
+def test_resume_chains_session_and_attempt_per_turn(tmp_path: Path, monkeypatch) -> None:
+    """Each turn resumes the session of the highest attempt read fresh, not the
+    session resume started with (round-1-fix item 3)."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch, session_id="s1")
+    runs = hub / cfg.project.runs
+    _msg_file(runs, "b1", "20250101T000000Z", "aaaaaaaa", "hi")
+
+    seen: list[tuple[int, str | None]] = []
+    orig_argv = fake_mod.FakeHarness.argv
+
+    def spy_argv(self, spec):
+        seen.append((spec.attempt, spec.resume_session))
+        return orig_argv(self, spec)
+
+    monkeypatch.setattr(fake_mod.FakeHarness, "argv", spy_argv)
+    shared = Path(os.environ["HELIOS_FAKE_SCRIPT"])
+    orig_wait = run_mod._launch_and_wait
+    scripts = {
+        2: {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s2",
+            "report": {"status": "done", "summary": "t1"}},
+        3: {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s3",
+            "report": {"status": "done", "summary": "t2"}},
+    }
+
+    def wrapped(*a, **kw):
+        n = int(kw["env"]["HELIOS_ATTEMPT"].rsplit("#", 1)[1])
+        shared.write_text(json.dumps(scripts[n]))
+        return orig_wait(*a, **kw)
+
+    monkeypatch.setattr(run_mod, "_launch_and_wait", wrapped)
+    rc = resume_mod.resume("b1", "final", hub=hub, beads=beads, config=cfg)
+    assert rc == 0
+    assert seen == [(2, "s1"), (3, "s2")]
+    in3 = json.loads((runs / "b1" / "attempt-3" / "input.json").read_text())
+    assert in3["resumed_from"] == "b1#2"
+
+
+# ---------------------------------------- round-1-fix item 4: recheck under lock
+
+
+def test_resume_rechecks_refusals_under_the_lock(tmp_path: Path, monkeypatch) -> None:
+    """Closed, live, unfinalized and null-session are (re)checked only once
+    the lock is held, so a change that lands exactly at lock-acquisition time
+    is still caught (round-1-fix item 4, forced interleaving)."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    orig_acquire = run_mod._BeadLock.acquire
+
+    def acquire_then_close(self, *, create):
+        ok = orig_acquire(self, create=create)
+        if ok:
+            # Simulates another process closing the bead in the instant
+            # between resume's cheap pre-lock check and taking the lock.
+            beads.beads["b1"].status = "closed"
+        return ok
+
+    monkeypatch.setattr(run_mod._BeadLock, "acquire", acquire_then_close)
+    with pytest.raises(resume_mod.ResumeRefusal, match="closed"):
+        resume_mod.resume("b1", None, hub=hub, beads=beads, config=cfg)
+    assert not (hub / cfg.project.runs / "b1" / "attempt-2").exists()
+
+
+# -------------------------------------------- round-1-fix item 6: SIGINT handling
+
+
+RESUME_SIGINT_CHILD = """\
+import sys
+from pathlib import Path
+from helios import beads as B, config as C, resume as RS
+hub = Path(sys.argv[1])
+beads = B.FakeBeads([B.Bead(id="b1", kind="impl", files=["src/"], test="true")])
+rc = RS.resume("b1", "go on", hub=hub, beads=beads, config=C.load(hub))
+sys.stderr.write(f"RC={rc}\\n")
+sys.exit(rc)
+"""
+
+
+def test_resume_sigint_during_turn_stops_with_exit4_no_further_turns(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch, session_id="s1")
+    runs = hub / cfg.project.runs
+    _msg_file(runs, "b1", "20250101T000000Z", "aaaaaaaa", "hi")
+    sleepy = tmp_path / "sleepy.json"
+    sleepy.write_text(json.dumps(
+        {"exit_code": 0, "sleep_s": 30, "stdout": "slow", "session_id": "s2",
+         "report": {"status": "done", "summary": "x"}}
+    ))
+    child = tmp_path / "resume_sigint_child.py"
+    child.write_text(RESUME_SIGINT_CHILD)
+    proc = subprocess.Popen(
+        [sys.executable, str(child), str(hub)],
+        env=dict(os.environ, HELIOS_FAKE_SCRIPT=str(sleepy)),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+    )
+    wait_for(runs / "b1" / "attempt-2" / "stdout.jsonl", "slow")
+    os.kill(proc.pid, signal.SIGINT)
+    out, err = proc.communicate(timeout=30)
+    assert proc.returncode == 4, err
+    assert "RC=4" in err
+    assert json.loads((runs / "b1" / "attempt-2" / "envelope.json").read_text())[
+        "execution_status"
+    ] == "interrupted"
+    # No further turns: neither the second message (there is only one here)
+    # nor the trailing text turn ran after the interrupt.
+    assert not (runs / "b1" / "attempt-3").exists()
+    _ = out

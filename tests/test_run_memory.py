@@ -424,3 +424,56 @@ def test_run_sets_in_progress_real_bd(tmp_path: Path, monkeypatch) -> None:
     assert rc == 3
     assert real.show(bead_id).status == "in_progress"
     assert not any(b.id == bead_id for b in real.ready())
+
+
+# ------------------------------------------------- round-1-fix item 2: no fallbacks
+
+
+def test_memory_lookup_failure_after_allocation_no_fallback_exit2(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A memory value preflight reported as present but that cannot actually be
+    read never becomes "" in the prompt: refuse with exit 2, finalize the
+    already-allocated attempt as any launch that never started, and never
+    close the bead (round-1-fix item 2)."""
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1", memories=["m1"])])  # never remembered
+    set_fake(monkeypatch, write_script(tmp_path, DONE_SCRIPT))
+    cfg = config_mod.load(hub)
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "helios: memory lookup failed for m1: " in err
+    attempt_dir = hub / ".helios" / "runs" / "b1" / "attempt-1"
+    assert not (attempt_dir / "prompt.md").exists()
+    state = attempt_mod.read_state(attempt_dir)
+    assert state["state"] == "finalized"
+    assert state["execution_status"] == "launch_failed"
+    env = json.loads((attempt_dir / "envelope.json").read_text())
+    assert env["output_commit"] is None
+    assert "b1" not in beads.closed
+    assert beads.states.get("b1", {}).get("run") == "failed"
+
+
+def test_verify_start_no_fallback_to_main_bypassing_preflight(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A verify worktree never falls back to main: calling run_one directly,
+    bypassing run_many's preflight, still refuses instead of silently
+    starting the worktree from main (round-1-fix item 2, defense in depth)."""
+    hub = make_hub(tmp_path)
+    parent = beads_mod.Bead(id="impl1", kind="impl", files=["src/"], test="true")
+    verify_bead = beads_mod.Bead(
+        id="v1", kind="verify-code", unit="U1", parent="impl1",
+        files=["tools/verify/U1/"], test="true",
+    )
+    beads = beads_mod.FakeBeads([parent, verify_bead])
+    set_fake(monkeypatch, write_script(tmp_path, DONE_SCRIPT))
+    cfg = config_mod.load(hub)
+    rc = run_mod.run_one("v1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "output_commit" in err
+    assert not (hub / ".claude" / "worktrees" / "v1").exists()
+    assert not (hub / ".helios" / "runs" / "v1" / "attempt-1").exists()
+    assert beads.beads["v1"].status == "open"

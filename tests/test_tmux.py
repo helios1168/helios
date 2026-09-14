@@ -265,3 +265,84 @@ def test_in_window_hup_and_term_interrupt_like_sigint(tmp_path: Path, sig: int) 
     assert read_envelope(hub, "b1", 1)["execution_status"] == "interrupted"
     # --in-window tees the child's stdout bytes to its own stdout (SPEC §9.1).
     assert "slow" in out
+
+
+# ------------------------------------------------- round-1-fix item 1: preflight
+
+
+def test_in_window_runs_preflight_missing_memory_no_side_effects(tmp_path: Path, capsys) -> None:
+    """``--in-window`` refuses a missing memory before any attempt, worktree or
+    status change (round-1-fix item 1)."""
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1", memories=["ghost"])])
+    cfg = config_mod.load(hub)
+    rc = run_mod.run_one_in_window("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "ghost" in err
+    assert not (hub / ".helios" / "runs" / "b1" / "attempt-1").exists()
+    assert not (hub / ".claude" / "worktrees" / "b1").exists()
+    assert beads.beads["b1"].status == "open"
+    assert beads.argv_log == []
+
+
+def test_in_window_runs_preflight_disjoint_files_not_checked_alone(tmp_path: Path, capsys) -> None:
+    """``--in-window`` also catches a plain preflight failure (missing test)."""
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([beads_mod.Bead(id="b1", kind="impl", files=["src/"], test="")])
+    cfg = config_mod.load(hub)
+    rc = run_mod.run_one_in_window("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert err.startswith("preflight: ")
+    assert not (hub / ".helios" / "runs" / "b1").exists()
+
+
+# --------------------------------------------- round-1-fix item 5: dry-run conflict
+
+
+@pytest.mark.parametrize("flag", ["--tmux", "--in-window"])
+def test_dry_run_with_tmux_or_in_window_refuses(tmp_path: Path, flag: str, capsys) -> None:
+    hub = make_hub(tmp_path)
+    args = argparse.Namespace(
+        beads=["b1"], harness=None, again=False, timeout=None, dry_run=True,
+        max_parallel=3, tmux=(flag == "--tmux"), in_window=(flag == "--in-window"),
+    )
+    cwd = os.getcwd()
+    os.chdir(hub)
+    try:
+        rc = run_cmd.run(args)
+    finally:
+        os.chdir(cwd)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert err == "helios: --dry-run cannot be combined with --tmux or --in-window\n"
+    assert not (hub / ".helios").exists()
+
+
+# ------------------------------------------- round-1-fix item 7: handler restore
+
+
+def test_in_window_restores_previous_sighup_sigterm_handlers(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    script = tmp_path / "script.json"
+    script.write_text(json.dumps(
+        {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s1",
+         "report": {"status": "done", "summary": "ok"}}
+    ))
+    monkeypatch.setenv("HELIOS_FAKE_SCRIPT", str(script))
+    marker = object()
+
+    def previous_hup(signum, frame):
+        return marker
+
+    prev = signal.signal(signal.SIGHUP, previous_hup)
+    try:
+        rc = run_mod.run_one_in_window(
+            "b1", hub=hub, beads=beads, config=config_mod.load(hub), harness_override="fake"
+        )
+        assert rc == 0
+        assert signal.getsignal(signal.SIGHUP) is previous_hup
+    finally:
+        signal.signal(signal.SIGHUP, prev)

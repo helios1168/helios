@@ -1851,6 +1851,7 @@ def test_session_survives_crash_before_envelope(
 
 
 def test_memory_lookup_gates_preflight(tmp_path: Path, monkeypatch) -> None:
+    from helios import memory as memory_mod
     from helios.commands import run as run_cmd
 
     hub = make_hub(tmp_path)
@@ -1862,6 +1863,12 @@ def test_memory_lookup_gates_preflight(tmp_path: Path, monkeypatch) -> None:
     assert run_mod.run_many(["b1"], hub=hub, beads=beads, config=cfg,
                             harness_override="fake") == 2
     beads2 = beads_mod.FakeBeads([make_bead("b1", memories=["m1"])])
+    # A memory lookup failure never falls back to "" in the prompt (round-1-fix
+    # item 2), so this second run, whose injected memory_has is decoupled from
+    # the backend, needs the memory to actually be there once preflight passes.
+    beads2.remember(
+        "m1", memory_mod.serialize({"source": "hel-1#1", "status": "active"}, "m1 body")
+    )
     assert run_mod.run_many(["b1"], hub=hub, beads=beads2, config=cfg,
                             harness_override="fake",
                             memory_has=lambda key: key == "m1") == 0

@@ -8,6 +8,7 @@ Several beads run in parallel up to ``max_parallel`` (default 3).
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -36,7 +37,19 @@ from helios import worktree as worktree_mod
 from helios.harness.base import Harness, LaunchSpec
 
 class MemoryLookupError(RuntimeError):
-    """A memory backend lookup failed during preflight (SPEC §7.1, §13)."""
+    """A memory backend lookup failed, at preflight or while assembling the
+    prompt (SPEC §7.1, §13). Either way there is no "" fallback: the caller
+    prints this message and refuses (round-1-fix item 2).
+    """
+
+
+class VerifyStartError(RuntimeError):
+    """A fresh verify worktree could not resolve its parent's ``output_commit``
+    (SPEC §7.3). Preflight (``_check_verify_worktree_start``) already refuses
+    this in every production path; raising here instead of falling back to
+    ``main`` means a caller that bypasses preflight never gets a silently
+    wrong base commit (round-1-fix item 2).
+    """
 
 
 _RUNNING: dict[str, subprocess.Popen[str]] = {}
@@ -185,6 +198,54 @@ def _restore_handler() -> None:
             signal.signal(signal.SIGINT, prev)  # type: ignore[arg-type]
         except ValueError:
             pass
+
+
+@contextlib.contextmanager
+def interrupt_scope():
+    """Install SPEC §7.1 Interrupts for the caller's whole run.
+
+    Shared by ``run_many``, ``run_one_in_window`` (which layers SIGHUP and
+    SIGTERM on top) and ``helios resume`` (SPEC §9.2, round-1-fix item 6):
+    the first SIGINT anywhere in scope sets the run-wide flag, a stopper
+    thread runs the stop sequence on every currently running group, and a
+    nested scope (an inner ``run_one`` call) only counts depth, never
+    reinstalling the handler or clearing the flag it did not set.
+    """
+    depth = _run_depth_enter()
+    outermost = depth == 1
+    stopper: threading.Thread | None = None
+    try:
+        if outermost:
+            _INTERRUPT.clear()
+            with _SEQ_LOCK:
+                _SEQ_THREADS.clear()
+                _SEQ_DONE.clear()
+            if _install_handler():
+                _RUN_ACTIVE.set()
+                stopper = threading.Thread(
+                    target=_stopper_main, name="_stopper_main", daemon=True
+                )
+                stopper.start()
+        yield
+    finally:
+        try:
+            if outermost:
+                _RUN_ACTIVE.clear()
+                if stopper is not None:
+                    # See run_many: never call set() on the main thread while
+                    # our handler is installed.
+                    waker = threading.Thread(
+                        target=_INTERRUPT.set, name="_interrupt_waker", daemon=True
+                    )
+                    waker.start()
+                    waker.join()
+                    stopper.join()
+                for thread in _seq_threads():
+                    thread.join()
+        finally:
+            if outermost:
+                _restore_handler()
+            _run_depth_exit()
 
 
 def sha256_text(text: str) -> str:
@@ -1154,6 +1215,36 @@ def _finish_attempt(
     )
 
 
+def _finalize_unlaunched_lookup_failure(
+    finish_args: _FinishArgs, exc: MemoryLookupError
+) -> int:
+    """An attempt already allocated when a memory lookup then failed (SPEC §7.1
+    step 6, round-1-fix item 2): print the message, finalize the attempt as
+    any launch that never started (SPEC §8: no checks run, nothing staged or
+    committed), and refuse with exit 2. Write-back never closes the bead,
+    since the checks are recorded as not run.
+    """
+    print(str(exc), file=sys.stderr)
+    attempt_mod.transition(
+        finish_args.attempt.dir,
+        "launch_failed",
+        execution_status=envelope_mod.ExecutionStatus.LAUNCH_FAILED.value,
+    )
+    _finish_attempt(
+        finish_args,
+        capture=_Capture(None, None, None, None, []),
+        native_session=None,
+        native_error=None,
+        proc_exit=None,
+        interrupted=False,
+        timed_out=False,
+        launch_failed=True,
+        transition_from=None,
+        launched=False,
+    )
+    return 2
+
+
 def _assemble_inputs(
     *,
     hub: Path,
@@ -1191,12 +1282,15 @@ def _assemble_inputs(
         for key in bead.memories:
             try:
                 memories[key] = backend.read(key).body
-            except (KeyError, ValueError, RuntimeError, OSError):
-                # Preflight's own lookup (SPEC §13) is the gate; a test or a
-                # caller running without it (SPEC §8.4 resume, dry-run) never
-                # crashes assembly over a key it cannot actually read, same
-                # as a missing docs entry just above.
-                memories[key] = ""
+            except (KeyError, ValueError, RuntimeError, OSError) as exc:
+                # No "" fallback (round-1-fix item 2): preflight's lookup
+                # (SPEC §13) is the real gate; a value it reported as present
+                # that cannot actually be read here is a refusal, exactly
+                # like a lookup failure at preflight time, not a silently
+                # empty section in the prompt.
+                raise MemoryLookupError(
+                    f"helios: memory lookup failed for {key}: {exc}"
+                ) from exc
     report_schema = envelope_mod.schema_text("agent-report")
     prompt = prompt_mod.assemble(
         kind=bead.kind,
@@ -1288,20 +1382,36 @@ class _BeadLock:
 
 
 def _verify_start_kwargs(
-    beads: beads_mod.BeadsLike, bead: beads_mod.Bead
+    hub: Path, worktrees_rel: str, beads: beads_mod.BeadsLike, bead: beads_mod.Bead
 ) -> dict[str, str]:
     """``start=`` for ``worktree.prepare``: a verify kind starts at its parent's
-    ``output_commit`` metadata (SPEC §7.3); preflight already refused a fresh
-    verify worktree with none. An existing worktree ignores ``start``, and any
-    other kind keeps ``worktree.prepare``'s own ``main`` default.
+    ``output_commit`` metadata (SPEC §7.3). An existing worktree ignores
+    ``start`` (``worktree.prepare`` just reuses it), and any other kind keeps
+    ``worktree.prepare``'s own ``main`` default.
+
+    Preflight (``_check_verify_worktree_start``) already refuses a fresh
+    verify worktree with no such metadata in every production path (it is
+    always wired with the real ``bead_show``), so a missing or unreadable
+    parent here raises ``VerifyStartError`` rather than quietly falling back
+    to ``main`` (round-1-fix item 2); it is defense in depth for a caller
+    that bypasses preflight.
     """
     if not bead.kind.startswith("verify") or not bead.parent:
         return {}
+    if (hub / worktrees_rel / bead.id).exists():
+        return {}
     try:
         commit = beads.show(bead.parent).metadata.get("output_commit")
-    except Exception:
-        return {}
-    return {"start": commit} if isinstance(commit, str) and commit else {}
+    except Exception as exc:
+        raise VerifyStartError(
+            f"helios: verify worktree for {bead.id}: parent {bead.parent} lookup failed: {exc}"
+        ) from exc
+    if not isinstance(commit, str) or not commit:
+        raise VerifyStartError(
+            f"helios: verify worktree for {bead.id}: "
+            f"parent {bead.parent} has no output_commit metadata"
+        )
+    return {"start": commit}
 
 
 def _refuse_live(bead_id: str, attempt_id: str | None) -> int:
@@ -1356,16 +1466,20 @@ def _dry_run_one(
     else:
         next_n = numbers[-1] if numbers else 1
     report_path = attempt_mod.worktree_report_path(worktree_path, next_n)
-    prompt, _, _, _, _, _ = _assemble_inputs(
-        hub=hub,
-        config=config,
-        beads=beads,
-        bead=bead,
-        worktree_path=worktree_path,
-        branch=branch,
-        attempt_id=f"{bead_id}#{next_n}",
-        report_path=report_path,
-    )
+    try:
+        prompt, _, _, _, _, _ = _assemble_inputs(
+            hub=hub,
+            config=config,
+            beads=beads,
+            bead=bead,
+            worktree_path=worktree_path,
+            branch=branch,
+            attempt_id=f"{bead_id}#{next_n}",
+            report_path=report_path,
+        )
+    except MemoryLookupError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     harness_cfg = config.harness.get(harness_name)
     spec = LaunchSpec(
         bead=bead_id,
@@ -1586,6 +1700,12 @@ def _run_one_inner(
                     except (OSError, ValueError, KeyError):
                         pass
 
+        try:
+            verify_kwargs = _verify_start_kwargs(hub, cfg.project.worktrees, beads, bead)
+        except VerifyStartError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
         # Once preflight has passed and before launch: a bead that does not
         # close (SPEC §7.5) would otherwise stay `open`, a SPEC §11 `next`
         # candidate that `helios run` would launch again. Never for
@@ -1601,7 +1721,7 @@ def _run_one_inner(
             worktrees=cfg.project.worktrees,
             link_into_worktrees=cfg.project.link_into_worktrees,
             again=again,
-            **_verify_start_kwargs(beads, bead),
+            **verify_kwargs,
         )
         if _INTERRUPT.is_set():
             return 4
@@ -1611,16 +1731,24 @@ def _run_one_inner(
             hub=hub, runs_rel=cfg.project.runs, bead=bead_id, worktree=worktree_path
         )
         report_path = attempt_mod.worktree_report_path(worktree_path, attempt_obj.n)
-        prompt, hashes, _, _, _, _ = _assemble_inputs(
-            hub=hub,
-            config=cfg,
-            beads=beads,
-            bead=bead,
-            worktree_path=worktree_path,
-            branch=info.branch,
-            attempt_id=attempt_obj.attempt_id,
-            report_path=report_path,
-        )
+        try:
+            prompt, hashes, _, _, _, _ = _assemble_inputs(
+                hub=hub,
+                config=cfg,
+                beads=beads,
+                bead=bead,
+                worktree_path=worktree_path,
+                branch=info.branch,
+                attempt_id=attempt_obj.attempt_id,
+                report_path=report_path,
+            )
+        except MemoryLookupError as exc:
+            finish_args = _FinishArgs(
+                hub=hub, config=cfg, beads=beads, bead=bead, harness_name=harness_name,
+                attempt=attempt_obj, worktree_path=worktree_path, base_commit=base_commit,
+                input_hashes={}, started_at=attempt_mod.utc_now(), notes=list(alloc_notes),
+            )
+            return _finalize_unlaunched_lookup_failure(finish_args, exc)
         (attempt_obj.dir / "prompt.md").write_text(prompt)
         (attempt_obj.dir / "report-schema.json").write_text(
             envelope_mod.schema_text("agent-report")
@@ -2148,7 +2276,7 @@ def run_one_in_window(
     bead_id: str,
     *,
     hub: Path,
-    beads: beads_mod.BeadsLike,
+    beads: beads_mod.Beads | beads_mod.FakeBeads,
     config: config_mod.Config | None = None,
     harness_override: str | None = None,
     timeout_s: int | None = None,
@@ -2156,15 +2284,35 @@ def run_one_in_window(
 ) -> int:
     """``helios run --in-window`` (SPEC §9.1).
 
-    Runs one bead through the normal pipeline, tee-ing the child's stdout to
-    this process's own stdout, and treats SIGHUP and SIGTERM exactly like
-    SIGINT (both delivered to ``_handle_sigint``), since closing a tmux
-    window sends SIGHUP.
+    Runs preflight itself, exactly as plain ``helios run`` does, before any
+    attempt, worktree or status change (round-1-fix item 1): ``--tmux``'s
+    outer preflight only gates opening the windows, and each spawned
+    ``helios run <bead> --in-window`` is its own process. Then runs the bead
+    through the normal pipeline, tee-ing the child's stdout to this
+    process's own stdout, and treats SIGHUP and SIGTERM exactly like SIGINT
+    (both delivered to ``_handle_sigint``, since closing a tmux window sends
+    SIGHUP), restoring whatever handlers were there before on the way out
+    (round-1-fix item 7).
     """
+    cfg = config if config is not None else config_mod.load(hub)
+    from helios.commands.run import memory_has_for
+
+    try:
+        errors = preflight_errors(
+            [bead_id], hub=hub, beads=beads, config=cfg, memory_has=memory_has_for(beads, cfg)
+        )
+    except MemoryLookupError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if errors:
+        for line in errors:
+            print(f"preflight: {line}", file=sys.stderr)
+        return 2
+
     depth = _run_depth_enter()
     outermost = depth == 1
     stopper: threading.Thread | None = None
-    extra_signals: list[int] = []
+    prev_signals: dict[int, object] = {}
     try:
         if outermost:
             _INTERRUPT.clear()
@@ -2175,8 +2323,7 @@ def run_one_in_window(
                 _RUN_ACTIVE.set()
                 for sig in (signal.SIGHUP, signal.SIGTERM):
                     try:
-                        signal.signal(sig, _handle_sigint)
-                        extra_signals.append(sig)
+                        prev_signals[sig] = signal.signal(sig, _handle_sigint)
                     except (ValueError, OSError):
                         pass
                 stopper = threading.Thread(
@@ -2187,7 +2334,7 @@ def run_one_in_window(
             bead_id,
             hub=hub,
             beads=beads,
-            config=config,
+            config=cfg,
             harness_override=harness_override,
             timeout_s=timeout_s,
             again=again,
@@ -2208,9 +2355,9 @@ def run_one_in_window(
                     thread.join()
         finally:
             if outermost:
-                for sig in extra_signals:
+                for sig, prev in prev_signals.items():
                     try:
-                        signal.signal(sig, signal.SIG_DFL)
+                        signal.signal(sig, prev)  # type: ignore[arg-type]
                     except (ValueError, OSError):
                         pass
                 _restore_handler()

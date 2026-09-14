@@ -84,6 +84,12 @@ def memory_has_for(
 
 def run(args: argparse.Namespace) -> int:
     """Load config, read beads, and run the pipeline (SPEC §7.1, §9.1)."""
+    if args.dry_run and (args.tmux or args.in_window):
+        print(
+            "helios: --dry-run cannot be combined with --tmux or --in-window",
+            file=sys.stderr,
+        )
+        return 2
     hub = config_mod.find_hub(Path.cwd())
     cfg = config_mod.load(hub)
     beads = beads_mod.Beads(hub)
