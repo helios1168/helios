@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
+import subprocess
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -478,7 +481,7 @@ class FakeHeliosRun:
         self.calls: list[list[str]] = []
         self.code = 0
 
-    def run_many(self, bead_ids: list[str], *, hub: Path, beads: Any, config: Any) -> int:
+    def run_many(self, bead_ids: list[str], *, hub: Path, beads: Any, config: Any, memory_has: Any = None) -> int:
         self.calls.append(list(bead_ids))
         return self.code
 
@@ -500,8 +503,8 @@ def test_next_command_run_bead_and_read_envelope_wire_to_run_many_and_attempt_fi
     envelope = mk_envelope("b", attempt=1)
 
     class WritesAttempt(FakeHeliosRun):
-        def run_many(self, bead_ids: list[str], *, hub: Path, beads: Any, config: Any) -> int:
-            super().run_many(bead_ids, hub=hub, beads=beads, config=config)
+        def run_many(self, bead_ids: list[str], *, hub: Path, beads: Any, config: Any, memory_has: Any = None) -> int:
+            super().run_many(bead_ids, hub=hub, beads=beads, config=config, memory_has=memory_has)
             _write_envelope(tmp_path / ".helios" / "runs" / "b" / "attempt-1" / "envelope.json", envelope)
             return self.code
 
@@ -583,8 +586,8 @@ def test_unit_run_command_read_envelope_uses_highest_attempt(
     _write_envelope(tmp_path / ".helios" / "runs" / "b" / "attempt-1" / "envelope.json", mk_envelope("b", attempt=1, status="partial"))
 
     class WritesNewAttempt(FakeHeliosRun):
-        def run_many(self, bead_ids: list[str], *, hub: Path, beads: Any, config: Any) -> int:
-            super().run_many(bead_ids, hub=hub, beads=beads, config=config)
+        def run_many(self, bead_ids: list[str], *, hub: Path, beads: Any, config: Any, memory_has: Any = None) -> int:
+            super().run_many(bead_ids, hub=hub, beads=beads, config=config, memory_has=memory_has)
             _write_envelope(tmp_path / ".helios" / "runs" / "b" / "attempt-2" / "envelope.json", mk_envelope("b", attempt=2))
             return self.code
 
@@ -600,3 +603,133 @@ def test_unit_run_command_read_envelope_uses_highest_attempt(
     assert result_code == 0
     out = capsys.readouterr().out
     assert out.startswith("b#2\tcompleted\tdone\t-\tok\n")
+
+
+# ---- round 3 item 2: memory_has wired into run_many (a missing kwarg always refused) ----
+
+
+def test_next_run_bead_passes_memory_has_built_from_configured_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Decided (round 3, item 2): run_bead must pass memory_has to run_many; without
+    it, run_many defaults to a lambda that is always False, so preflight refuses every
+    bead that lists memories, present or not."""
+    from helios.commands import next as command
+
+    (tmp_path / ".agents").mkdir()
+    (tmp_path / ".agents" / "workflow.toml").write_text("")
+    monkeypatch.chdir(tmp_path)
+
+    fake = FakeBeads([bead("b")])
+    fake.remember("m1", "value")
+    monkeypatch.setattr(command, "Beads", lambda _hub: fake)
+
+    captured: dict[str, Any] = {}
+
+    def run_many(bead_ids: list[str], *, hub: Path, beads: Any, config: Any, memory_has: Any = None) -> int:
+        captured["memory_has"] = memory_has
+        return 0
+
+    monkeypatch.setitem(sys.modules, "helios.run", types.SimpleNamespace(run_many=run_many))
+    importlib.invalidate_caches()
+
+    assert command.run_bead(bead("b")) == 0
+    assert captured["memory_has"] is not None
+    assert captured["memory_has"]("m1") is True
+    assert captured["memory_has"]("missing") is False
+
+
+def _memory_hub(tmp_path: Path) -> Path:
+    """A minimal git hub for a FakeBeads-driven, real helios.run.run_many call with the
+    fake harness (mirrors tests/test_run_fake.py's make_hub; duplicated here to keep
+    this file self-contained)."""
+    hub = tmp_path / "hub"
+    hub.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=hub, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=hub, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=hub, check=True)
+    (hub / "README.md").write_text("hi\n")
+    (hub / ".gitignore").write_text(".helios/\n.claude/worktrees/\n")
+    (hub / "skills" / "impl").mkdir(parents=True)
+    (hub / "skills" / "impl" / "SKILL.md").write_text("---\nname: impl\n---\n\n# impl\n\nDo it.\n")
+    (hub / "AGENTS.md").write_text("# p\n\n## Worker contract\n\nOne bead.\n")
+    subprocess.run(["git", "add", "."], cwd=hub, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=hub, check=True)
+    (hub / ".agents").mkdir()
+    (hub / ".agents" / "workflow.toml").write_text('[agents]\nimplement = "fake"\n')
+    return hub
+
+
+def test_next_run_bead_with_present_memory_runs_through_real_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end regression for item 2: a bead whose memory is present in the
+    configured (beads) backend must pass preflight and run, through the real
+    helios.run and the fake harness."""
+    from helios.commands import next as command
+
+    hub = _memory_hub(tmp_path)
+    monkeypatch.chdir(hub)
+    script = tmp_path / "script.json"
+    script.write_text(json.dumps({"exit_code": 0, "sleep_s": 0, "stdout": "ok", "session_id": "s1",
+                                   "report": {"status": "done", "summary": "did it"}}))
+    monkeypatch.setenv("HELIOS_FAKE_SCRIPT", str(script))
+
+    b1 = Bead("b1", kind="impl", files=["src/"], test="true", memories=["m1"])
+    fake = FakeBeads([b1])
+    fake.remember("m1", "value")
+    monkeypatch.setattr(command, "Beads", lambda _hub: fake)
+
+    assert command.run_bead(b1) == 0
+
+
+def test_next_run_bead_with_missing_memory_refuses_at_preflight_exit_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A memory absent from the configured backend still gives the preflight refusal,
+    exit 2, and creates no attempt."""
+    from helios.commands import next as command
+
+    hub = _memory_hub(tmp_path)
+    monkeypatch.chdir(hub)
+    script = tmp_path / "script.json"
+    script.write_text(json.dumps({"exit_code": 0, "sleep_s": 0, "stdout": "ok", "session_id": "s1",
+                                   "report": {"status": "done", "summary": "did it"}}))
+    monkeypatch.setenv("HELIOS_FAKE_SCRIPT", str(script))
+
+    b1 = Bead("b1", kind="impl", files=["src/"], test="true", memories=["missing"])
+    fake = FakeBeads([b1])
+    monkeypatch.setattr(command, "Beads", lambda _hub: fake)
+
+    assert command.run_bead(b1) == 2
+    assert not (hub / ".helios" / "runs" / "b1").exists()
+
+
+# ---- round 3 item 3: a bd RuntimeError while listing candidates, not a traceback ----
+
+
+class FailingReadyBeads(FakeBeads):
+    def ready(self, *, labels: list[str] = []) -> list[Bead]:
+        raise RuntimeError("bd ready failed: boom")
+
+
+def test_next_command_bd_runtime_error_listing_candidates_is_prefixed_and_exit_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from helios.commands import next as command
+
+    monkeypatch.setattr(command, "load", lambda _path: config_stub())
+    monkeypatch.setattr(command, "Beads", lambda _hub: FailingReadyBeads())
+    assert command.run(argparse.Namespace(unit=None)) == 1
+    assert capsys.readouterr().err == "helios: bd ready failed: boom\n"
+
+
+def test_unit_run_command_bd_runtime_error_listing_candidates_is_prefixed_and_exit_one(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from helios.commands import unit_run as command
+
+    monkeypatch.setattr(command, "load", lambda _path: config_stub())
+    monkeypatch.setattr(command, "Beads", lambda _hub: FailingReadyBeads())
+    assert command.run(argparse.Namespace(unit="u", until=None)) == 1
+    assert capsys.readouterr().err == "helios: bd ready failed: boom\n"

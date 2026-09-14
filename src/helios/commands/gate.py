@@ -35,6 +35,6 @@ def run(args: argparse.Namespace) -> int:
         print(json.dumps(gates))
     else:
         for gate in gates:
-            blocks = ", ".join(gate["blocks"])
+            blocks = " ".join(gate["blocks"])
             print(f"{gate['id']}: {blocks}" if blocks else f"{gate['id']}:")
     return 0

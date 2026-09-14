@@ -42,6 +42,9 @@ def run(args: argparse.Namespace) -> int:
     except control.ControlError as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2
+    except RuntimeError as exc:
+        print(f"helios: {exc}", file=sys.stderr)
+        return 1
     return result.code
 
 
@@ -49,12 +52,16 @@ def run_bead(bead: Bead) -> int:
     """Dispatch through ``helios.run`` (SPEC section 7.1).
 
     Imported lazily: hel-6ks, which adds that module, is not on main yet. A missing
-    module surfaces as a normal execution failure (control.py).
+    module surfaces as a normal execution failure (control.py). ``memory_has`` is
+    built the same way `helios run` itself builds it (``helios.commands.run``,
+    imported lazily too); without it ``run_many`` defaults to always-False, so
+    preflight refuses every bead that lists memories (Decided).
     """
     config = load(Path.cwd())
     beads = Beads(config.hub)
     run_many = importlib.import_module("helios.run").run_many
-    return int(run_many([bead.id], hub=config.hub, beads=beads, config=config))
+    memory_has = importlib.import_module("helios.commands.run").memory_has_for(beads, config)
+    return int(run_many([bead.id], hub=config.hub, beads=beads, config=config, memory_has=memory_has))
 
 
 def read_envelope(bead: Bead) -> Envelope | None:

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from helios.beads import Bead, Comment, FakeBeads
+from helios.beads import Bead, BeadNotFound, Comment, FakeBeads
 from helios.learned import LINE_RE, list_lines, mark
 
 
@@ -80,6 +80,60 @@ def test_learned_curated_comment_on_marker_target_without_kind_label() -> None:
     beads.add_comment("carrier", "learned: [other#1#1] x")
     beads.add_comment("other", "curated: [learned:other#1#1] -> drop")
     assert list_lines(beads) == []
+
+
+class BeadNotFoundForOneBead(FakeBeads):
+    def __init__(self, beads: list[Bead], missing: str) -> None:
+        super().__init__(beads)
+        self.missing = missing
+
+    def comments(self, bead_id: str) -> list[Comment]:
+        if bead_id == self.missing:
+            raise BeadNotFound(bead_id)
+        return super().comments(bead_id)
+
+
+def test_learned_marker_target_bead_not_found_is_skipped_not_raised() -> None:
+    """Decided (round 3, item 4): a queue marker naming a bead that no longer exists
+    must not crash the listing; that one bead's (unreachable) curated comments are
+    simply skipped."""
+    beads = BeadNotFoundForOneBead([Bead("carrier", kind="impl", labels=["kind:impl", "unit:u"])], missing="gone")
+    beads.add_comment("carrier", "learned: [gone#1#1] x")
+    lines = list_lines(beads)
+    assert [line.bead for line in lines] == ["gone"]
+
+
+class RuntimeErrorForOneBead(FakeBeads):
+    def __init__(self, beads: list[Bead], missing: str) -> None:
+        super().__init__(beads)
+        self.missing = missing
+
+    def comments(self, bead_id: str) -> list[Comment]:
+        if bead_id == self.missing:
+            raise RuntimeError("bd comments gone failed: no such issue")
+        return super().comments(bead_id)
+
+
+def test_learned_marker_target_bead_runtime_error_is_skipped_not_raised() -> None:
+    beads = RuntimeErrorForOneBead([Bead("carrier", kind="impl", labels=["kind:impl", "unit:u"])], missing="gone")
+    beads.add_comment("carrier", "learned: [gone#1#1] x")
+    lines = list_lines(beads)
+    assert [line.bead for line in lines] == ["gone"]
+
+
+def test_learned_command_marker_target_not_found_returns_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from helios.commands import learned as command
+
+    fake = BeadNotFoundForOneBead([Bead("carrier", kind="impl", labels=["kind:impl", "unit:u"])], missing="gone")
+    fake.add_comment("carrier", "learned: [gone#1#1] x")
+    monkeypatch.setattr(command, "Beads", lambda _hub: fake)
+    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path(".")))
+    assert command.run(Namespace(unit=None, json=True, mark=None, decision=None)) == 0
+    assert json.loads(capsys.readouterr().out) == [
+        {"unit": "u", "bead": "gone", "attempt": 1, "kind": "learned", "k": 1, "text": "x"}
+    ]
 
 
 def test_learned_curated_comment_on_another_bead_still_counts() -> None:

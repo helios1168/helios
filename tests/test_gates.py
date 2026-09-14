@@ -33,6 +33,22 @@ def test_gate_command_text_and_json(monkeypatch: pytest.MonkeyPatch, capsys: pyt
     assert json.loads(capsys.readouterr().out) == [{"id": "g", "issue_type": "gate", "status": "open", "blocks": ["b"]}]
 
 
+def test_gate_command_two_blocked_beads_are_space_separated(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Decided (round 3, item 1): SPEC 14 gate text is space-separated, not
+    comma-separated."""
+    from helios.commands import gate as command
+
+    fake = FakeBeads([Bead("g", status="open", metadata={"issue_type": "gate"}), Bead("a"), Bead("b")])
+    fake.dep_add("a", "g")
+    fake.dep_add("b", "g")
+    monkeypatch.setattr(command, "Beads", lambda _hub: fake)
+    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path(".")))
+    assert command.run(Namespace(json=False)) == 0
+    assert capsys.readouterr().out == "g: a b\n"
+
+
 class WeirdGates(FakeBeads):
     def __init__(self, gates: Any) -> None:
         super().__init__()

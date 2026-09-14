@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from helios.beads import Bead, BeadsLike
+from helios.beads import Bead, BeadNotFound, BeadsLike
 from helios.stages import STAGES
 
 # ASCII digits only, at most 9 of them, and the bead group cannot span "]", "#" or a newline
@@ -63,10 +63,19 @@ def _all_markers(beads: Any, unit: str | None = None) -> dict[str, tuple[Bead, L
 def _curated_texts(beads: Any, targets: set[str]) -> list[str]:
     """Every ``curated: [...]`` comment on one of ``targets`` (Decided: a curated
     comment for a marker counts on any bead, so ``targets`` covers every helios-kind
-    bead plus every bead a queue marker names, kind label or not)."""
+    bead plus every bead a queue marker names, kind label or not).
+
+    A marker can name a bead that no longer exists; ``BeadNotFound`` and a bd
+    ``RuntimeError`` for that one bead are skipped rather than failing the whole scan
+    (Decided).
+    """
     curated: list[str] = []
     for bead_id in targets:
-        curated.extend(c.text for c in beads.comments(bead_id) if c.text.startswith("curated: ["))
+        try:
+            comments = beads.comments(bead_id)
+        except (BeadNotFound, RuntimeError):
+            continue
+        curated.extend(c.text for c in comments if c.text.startswith("curated: ["))
     return curated
 
 
