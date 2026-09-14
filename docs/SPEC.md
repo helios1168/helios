@@ -13,7 +13,8 @@ until the orchestrator amends it. Beads cite sections as `SPEC §N`.
 - **stage**: one step of a unit chain (§3). Each stage is one bead.
 - **bead**: one issue in the beads tracker (`bd`). One bead is one task for one agent.
 - **attempt**: one launch of a bead, numbered from 1. A rerun is a new attempt.
-- **turn**: one prompt and response inside an attempt's native session. Resume adds a turn.
+- **turn**: one prompt and response in a native session. A resume adds a turn as a new attempt
+  on the same session (§9.2).
 - **harness**: an agent CLI helios can drive: `claude`, `codex`, `opencode`, `agy`, and `fake`
   for tests.
 - **orchestrator**: the main agent session that plans, files beads, reviews, merges and writes
@@ -100,7 +101,8 @@ Fields: `schema_version`, `status`, `summary`, `files_changed`, `tests`, `findin
 `question`, `learned`, `missing_context`, `followups`. Status values:
 
 - `done`: the accept text is met and the bead test passes.
-- `partial`: progress made, work remains inside the same contract. helios resumes once.
+- `partial`: progress made, work remains inside the same contract. `helios run` does not
+  resume automatically in this wave; `partial` exits 3 (§7.1).
 - `needs_input`: blocked on the orchestrator; `question` is required. End the turn after
   writing the report; the answer arrives as the next turn.
 - `needs_review`: the agent wants review before continuing. Same mechanics as `needs_input`.
@@ -155,7 +157,9 @@ Fields: `schema_version`, `task_id`, `attempt`, `attempt_id` (`<bead>#<n>`), `ki
 helios takes the first value that applies, in this order:
 1. `launch_failed`: `Popen` raised.
 2. `interrupted`: helios received SIGINT, or the attempt directory holds `stop-requested`
-   (written by `helios stop`, §9.2). This holds whatever the child printed or wrote.
+   (written by `helios stop`, §9.2). This holds whatever the child printed or wrote. The
+   file's existence is tested once, after the process group is gone and before parse; recovery
+   (§8.4) tests it too when it classifies.
 3. `timed_out`: helios hit the timeout.
 4. `completed`: a valid report was captured. A nonzero exit or a native error only adds a note.
 5. `invalid_output`: a report exists but fails validation.
@@ -348,14 +352,15 @@ These apply to claude, codex, opencode and agy.
 ## 7. `helios run`
 
 `helios run <bead>... [--harness H] [--again] [--timeout S] [--dry-run] [--max-parallel N]
-[--tmux]`
+[--tmux | --in-window]` (§9.1)
 
 ### 7.1 Steps
 
 1. Load config (§5). Read each bead with `bd show <id> --json` through `helios.beads` (the only
    module that calls `bd`). Metadata values may arrive JSON-encoded as strings; decode them.
 2. Preflight (`helios.preflight`), all failures exit 2 before anything is created:
-   - `impl` and `validate` need `files` and `test`; verify kinds need `unit` and `parent`.
+   - `impl` and `validate` need `files` and `test`; verify kinds need `unit` and `parent`, and
+     a verify bead without a worktree needs `output_commit` metadata on its parent (§7.3).
    - every name in `memories` exists (preflight takes the memory lookup as a required argument);
      every path in `docs` is an existing file (a directory is an error), and every `path#key`
      resolves to a section (§7.2);
@@ -376,8 +381,13 @@ These apply to claude, codex, opencode and agy.
 3. Resolve the harness (§5). `--harness` overrides.
 4. Prepare the worktree (§7.3).
 5. Allocate the attempt (§8).
-6. Assemble the prompt (§7.2); write `prompt.md` and `input.json` with the input hashes.
-   `input.json` also holds `harness`, the resolved harness name.
+6. Assemble the prompt (§7.2); write `prompt.md` and `input.json`. `input.json` is a JSON
+   object written with `sort_keys` and indent 2, to a temp file then moved with `os.replace`.
+   It holds at least `harness` (the resolved harness name) and `input_hashes`, and for a
+   resumed attempt (§9.2) `resumed_from` (the attempt id resumed) and, when the attempt delivers
+   a message, `msg_id`. `input_hashes` maps keys to sha256 digests: `prompt`; `bead`, the §7.2
+   `Bead` section JSON exactly as it appears in the prompt; `docs/<entry>` per docs entry;
+   `memory/<key>` per memory; and `unit` when the unit file exists.
 7. Launch with `subprocess.Popen(argv, cwd=worktree, stdin=<stdin_text, else DEVNULL>,
    stdout=stdout file, stderr=stderr.log, start_new_session=True)`, environment plus
    `HELIOS_BEAD`, `HELIOS_ATTEMPT`, `HELIOS_HARNESS`, `HELIOS_HUB`, `HELIOS_REPORT`. Record
@@ -387,7 +397,8 @@ These apply to claude, codex, opencode and agy.
    group is gone (`os.killpg(pgid, 0)` raises `ProcessLookupError`), not when the leader exits.
    On timeout run the stop sequence and record `timed_out`. The session id comes only from the
    adapter's `parse`; `helios.run` never reads harness inputs such as `HELIOS_FAKE_SCRIPT` (an
-   adapter may read its own).
+   adapter may read its own). While waiting, `helios run` checks for `stop-requested` in the
+   attempt directory every 1 s and, when it appears, runs the stop sequence.
 8. Parse with the adapter, capture the report (§6.2), classify execution status (§4.4), then
    record the result in one `state.json` write: the terminal state of §8.2, `execution_status`
    and the parsed `session_id`. A crash before that write leaves `launched`, which recovery
@@ -493,6 +504,8 @@ so the bytes are identical across harnesses; a test asserts this.
 - `--again` on an existing worktree resets it to its branch tip (`git reset --hard` inside the
   worktree, then `git clean -fd -e .helios`). Earlier attempt records are never deleted.
 - Symlink each `link_into_worktrees` glob match from the hub; skip matches the hub lacks.
+- A new worktree for a verify kind starts at the parent bead's `output_commit` (metadata of the
+  bead named by `parent`) instead of `main`; preflight fails when that metadata is missing.
 - Record `base_commit` as the worktree HEAD before launch.
 
 ### 7.4 Ownership
@@ -558,7 +571,7 @@ attempt to stop (§9.2). The agent writes its report inside the worktree at
 `execution_status` is null until step 8 classifies the attempt and never changes after. Every
 write carries all six keys, and a transition keeps the stored `execution_status` (and `pid`
 and `session_id`) unless it sets a new value, so the key survives `validated`, `invalid`,
-`finalized` and every resume. It is written to a temp file and
+`finalized` and every recovery write (§8.4). It is written to a temp file and
 moved with `os.replace`. Every transition appends one line to `state.log`. `launched` is
 recorded with the pid as soon as the process starts, so a running attempt is always `launched`
 with a live pid.
@@ -580,8 +593,8 @@ never raises. Preflight reads attempt state without the lock, so it must accept 
 leave the decision to recovery under the lock. Before launch helios checks the
 worktree report path; if a file is there (stale), it moves it to `attempt-<n>/stale-report.json`
 and adds a note. A report is accepted only from the current attempt's path or the native schema
-channel of the current process. The input hashes (sha256 of the prompt, the bead JSON, each doc
-and memory value, the unit file) are fixed in `input.json` before launch.
+channel of the current process. The input hashes (§7.1 step 6) are fixed in `input.json`
+before launch.
 
 ### 8.4 Recovery
 
@@ -603,19 +616,32 @@ When `helios run` finds the latest attempt not finalized:
 
 ### 8.5 Stale evidence
 
-A verify envelope is stale when any `input_hashes` value differs from the current value, or its
-`base_commit` is not an ancestor of the impl bead's current `output_commit`. `helios merge`
+A verify envelope is stale when any key of its `input_hashes` other than `prompt` differs from
+the current value computed the same way (a key missing on either side counts as different), or
+its `base_commit` differs from the impl bead's current `output_commit` metadata. `helios merge`
 refuses stale evidence (§12).
 
 ## 9. Sessions, messages and events
 
 ### 9.1 Windows
 
-`helios run --tmux` launches each attempt in window `<bead>` of session `helios` on the tmux
-server `tmux -L helios` (created with `tmux -L helios new-session -d -s helios` when absent),
-running `helios run <bead> --in-window` so the output is visible. For opencode with a server,
-the window runs the attach command and the attempt runs headless. Users attach with
-`tmux -CC -L helios new -A -s helios`. `helios ps` works without tmux.
+- `helios run --tmux <bead>...` runs preflight in the outer process (exit 2 on failure). It
+  ensures session `helios` on the tmux server `tmux -L helios`: it runs
+  `tmux -L helios new-session -d -s helios` when `tmux -L helios has-session -t =helios` fails,
+  and a failed `new-session` still succeeds when `has-session` then exits 0. For each bead it
+  runs `tmux -L helios new-window -d -t helios: -n <bead> helios run <bead> --in-window` plus
+  the forwarded `--harness`, `--again` and `--timeout`, then
+  `tmux -L helios set-option -w -t helios:<bead> remain-on-exit on`. It prints
+  `<bead>\t<window>` per bead to stdout, exits 0, and never waits. A missing `tmux` binary
+  exits 2.
+- `--in-window` accepts exactly one bead. It copies the child's stdout bytes to its own stdout
+  as well as to `stdout.jsonl`. Under `--in-window`, SIGHUP and SIGTERM are handled exactly like
+  SIGINT (§7.1 Interrupts), because closing a window sends SIGHUP.
+- Every harness, opencode included, runs `helios run --in-window` in its window. The attach
+  command is for users (`helios attach`, §9.2), since the session id is known only after §7.1
+  step 8.
+- Users attach to the session with `tmux -CC -L helios new -A -s helios`. `helios ps` works
+  without tmux.
 
 ### 9.2 Commands
 
@@ -655,10 +681,24 @@ the window runs the attach command and the attempt runs headless. Users attach w
   group is already gone). It never escalates and never writes `state.json`. The running
   `helios run` classifies an attempt whose `stop-requested` file exists as `interrupted` in
   step 8. The opencode abort route is not used in this wave.
-- `helios resume <bead> ["<text>"]`: new turn on the same session and attempt; default text
-  `Continue.`; the turn writes `stdout-turn-<k>.jsonl`. `resume` first delivers every message in
-  `inbox/` that has no ack, in `msg_id` order, one turn each (§9.4), then runs its own turn when
-  text was given or no message was pending.
+- `helios resume <bead> ["<text>"]`: exits 2 with a message on stderr when the bead has no
+  attempt, the bead is closed, the bead lock (§8.3) is held, the highest attempt is live or not
+  finalized, or its `session_id` is null. Otherwise it takes the bead lock and handles the
+  inbox, then its own turn.
+  - Inbox: only file names matching `^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\.json$` count, sorted as
+    strings and listed once at start. A file that is not a valid §9.4 message is skipped with a
+    note on stderr. An id with an ack is skipped.
+  - Each message is one turn. Then the text (default `Continue.`) is one turn, run when text was
+    given or no message was delivered.
+  - A turn allocates attempt n+1 with `resume_session` set to the `session_id` of the highest
+    attempt and the harness from that attempt's `input.json`, and runs §7.1 steps 5 to 11
+    (never `--again`). The turn prompt is `<text>` followed by `\n\nReport path: <report
+    path>\n`; for a message, `<text>` is `[helios-msg <msg_id>] <message text>`.
+  - After a message turn whose `execution_status` is `completed`, `missing_output` or
+    `invalid_output`, resume writes the ack. Any other status writes no ack and stops, and
+    resume exits with that turn's code. Otherwise the exit code is the highest §7.1 code over
+    the turns.
+  - The envelope `steered` field lists the delivered msg_ids.
 
 ### 9.3 Events
 
@@ -673,7 +713,8 @@ file.
 
 A message is `<runs>/<bead>/inbox/<msg_id>.json`: `{"id", "kind", "text", "created", "from",
 "to"}`. `msg_id` is `<UTC yyyymmddThhmmssZ>-<8 hex>`. Delivery resumes the session with
-`[helios-msg <msg_id>]` prefixed to the text, and after the resumed turn completes writes
+`[helios-msg <msg_id>]` prefixed to the text (§9.2), and after the resumed turn ends with
+`execution_status` `completed`, `missing_output` or `invalid_output` writes
 `<runs>/<bead>/acks/<msg_id>`. Before delivering, skip any id already acked. A crash between
 delivery and ack can deliver twice; the marker lets the agent and the transcript audit
 recognise the duplicate. Workers never message workers.
@@ -726,33 +767,68 @@ Tests run against a real `bd init` in a temporary repository when `bd` is on PAT
 
 ## 11. Control
 
-- `helios next [<unit>]`: the first bead from `bd ready --json` (filtered by label
-  `unit:<unit>` when given) whose kind is not in `control.stop_at`; run it (§7); print the
-  envelope summary.
-- `helios unit run <unit> [--until <stage>]`: repeat `next` for the unit. Stop at: the `until`
-  stage (after running it), a stage in `stop_at` (before running it), no ready bead (an open gate
-  or blocker), a report status other than `done`, a verdict other than verified, or an execution
-  failure. Print why it stopped.
-- `control.default = "manual"` makes `unit run` refuse without an explicit `--until`;
-  `"until"` uses `control.until` when `--until` is absent.
+Candidates are the beads from `bd ready --json` (through `helios.beads`) with status `open` that
+carry a `kind:<stage>` label naming a §3 stage, filtered by label `unit:<unit>` when a unit is
+given, in bd's order. The §3 stage order comes from `helios.stages.STAGES`.
+
+- `helios next [<unit>]` runs the first candidate whose kind is not in `control.stop_at`
+  (`helios run`, §7.1) and prints one line from its envelope:
+  `<attempt_id>\t<execution_status>\t<status or ->\t<verdict or ->\t<summary or ->`. With no
+  such candidate it prints `no ready bead` to stderr and exits 3. Otherwise it exits with the
+  run's code.
+- `helios unit run <unit> [--until <stage>]` loops. Each round takes the first candidate,
+  `stop_at` kinds included. It stops before running that candidate when its kind is in
+  `control.stop_at`; otherwise it runs it and prints its line as `next` does. It also stops
+  after running the `until` stage; on a report status other than `done`, a verdict other than
+  verified, or an execution failure; when no candidate remains (an open gate or blocker); and
+  when a candidate was already run in this invocation (reason
+  `bead <id> still ready after its run`). On stopping it prints `stopped: <reason>` to stdout.
+- `unit run` exits 0 when it stopped after a successful `until` stage, 3 when it stopped at a
+  `stop_at` kind or with no ready bead, else with the last run's code.
+- `control.default`: `manual` makes `unit run` refuse without `--until` (exit 2); `until` uses
+  `control.until` when `--until` is absent; `auto` runs until a stop condition other than
+  `until`. An unknown `control.default`, an `--until` that is not a §3 stage, or an `--until`
+  stage with no bead of the unit (label `kind:<until>`) exits 2. These value checks live in the
+  control module, not in config loading.
 
 ## 12. Merge
 
-`helios merge <bead> [--dry-run]` integrates an impl bead:
+`helios merge <bead> [--dry-run]` integrates an impl bead. It holds `<runs>/<bead>/lock` (§8.3)
+for its whole run; a held lock exits 2. Steps run in the order 1, 2, 8, 3, 4, 5, 6, 7.
 
-1. Refuse unless the bead is closed, its verify bead (the bead whose `parent` is this bead) is
-   closed with verdict verified, and that verify envelope is not stale (§8.5).
-2. Refuse unless the hub is on `main` with a clean tree.
+1. Find the evidence. The verify beads are the beads with label `unit:<unit>` (the bead's
+   `unit`) whose metadata `parent` is the bead, listed through `helios.beads`; none means
+   refuse. Every one must be closed with metadata `verdict` `verified`. Its evidence is
+   `<runs>/<verify>/attempt-<n>/envelope.json`, with `<n>` its metadata `attempt`, which must
+   exist and not be stale (§8.5). The impl bead must be closed. Any failure refuses.
+2. Refuse unless the hub is on `main` and both trees are clean. The hub is on `main` when
+   `git symbolic-ref --short HEAD` prints `main`. A tree is clean when
+   `git status --porcelain --untracked-files=no` prints nothing, in the hub and in the worktree.
 3. Record `main_before`. In the worktree run `git rebase main`; on conflict run
    `git rebase --abort`, set `run=conflict`, stop.
 4. Rerun `project.test` and `project.typecheck` in the worktree; failure stops.
 5. If `main` moved since step 3, stop and say so; a second run starts over.
-6. In the hub `git merge --ff-only worktree-<bead>`; record the candidate commit on the bead.
-7. Push `main` when a remote named `origin` exists. Then `git worktree unlock`, `git worktree
-   remove`, and delete the branch.
-8. Recovery: when `main` already contains the candidate commit, skip to step 7.
+6. Write metadata `merge_commit` = the worktree HEAD, then in the hub run
+   `git merge --ff-only worktree-<bead>`.
+7. When `origin` exists (`git remote` lists it), run `git push origin main`. Then remove the
+   worktree: `git worktree unlock <path>`, `git worktree remove --force <path>`,
+   `git branch -d worktree-<bead>`.
+8. Recovery runs after step 2 and before step 3: when metadata `merge_commit` is set and
+   `git merge-base --is-ancestor <merge_commit> main` exits 0, skip to step 7.
 
-Every step writes `merge: [<bead>] <step>` comments with the replay rule of §7.5.
+Every step writes the comment `merge: [<bead>@<main_before>:<step>] <detail>` under the replay
+rule of §7.5, where `<step>` is one of `rebased` or `conflict` (step 3), `tested` or
+`test-failed` (step 4), `main-moved` (step 5), `merged` (step 6), `pushed` and `removed`
+(step 7).
+
+A test checks that `bd set-state` on a closed bead does not reopen it. If it does, merge sets no
+state on closed beads.
+
+Exit codes: 0 merged or recovered; 2 refusal (steps 1 and 2, lock); 3 rebase conflict or `main`
+moved; 5 test or typecheck failed; 4 push or worktree removal failed. Messages go to stderr.
+
+`--dry-run` runs steps 1 and 2 and the recovery test of step 8, prints the planned steps, and
+writes nothing.
 
 ## 13. Memory
 
@@ -805,12 +881,22 @@ its trailing newline or lack of one.
 
 ## 14. Learned queue and gates
 
-- `helios learned [--unit U] [--json]`: every `learned:` and `missing_context:` comment line,
-  across beads of any status, whose `[attempt_id#k]` marker has no matching `curated:` comment.
-  Grouped by unit, then bead, then attempt.
-- `helios learned --mark <attempt_id#k> memory|template|drop`: add `curated: [attempt_id#k] ->
-  <decision>`. When every line of a bead is marked, add label `curated`.
-- `helios gate [--json]`: open gates (`bd gate list --json`) with the beads each blocks.
+- `helios learned [--unit U] [--json]` lists the comment lines matching
+  `^(learned|missing_context): \[(.+)#(\d+)#(\d+)\] (.*)\Z`, compiled with `re.DOTALL`; the
+  groups are kind, bead, attempt number, k and text. It reads beads of any status that carry a
+  helios `kind:<stage>` label (§3), deduplicates lines by kind and marker, and keeps only lines
+  without a matching `curated:` comment. `--unit U` keeps beads with label `unit:U`. Lines are
+  sorted by unit (`-` when none), bead, attempt number as a number, kind, then k. Text output
+  groups by unit, then bead, then attempt. `--json` prints a list of
+  `{"unit", "bead", "attempt", "kind", "k", "text"}`.
+- `helios learned --mark <kind>:<attempt_id>#<k> memory|template|drop` adds
+  `curated: [<kind>:<attempt_id>#<k>] -> <decision>` under the replay rule of §7.5. The marker
+  includes the kind because `learned` and `missing_context` lines share `[<attempt_id>#<k>]`.
+  An unknown marker exits 2; an existing curated mark is a no-op with exit 0; `--mark` with
+  `--unit` or `--json` exits 2. When no uncurated line of that bead remains, add label
+  `curated`.
+- `helios gate [--json]` lists open gates from `bd gate list --json -n 0` with the beads each
+  blocks, read from the gate's dependents in `bd show <gate> --json` (through `helios.beads`).
 
 ## 15. Claims and program
 
