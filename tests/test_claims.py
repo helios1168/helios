@@ -832,3 +832,160 @@ def test_duplicate_claim_names_step1(
     assert cli.main(["claims", "check"]) == 2
     err = capsys.readouterr().err
     assert err == "same: duplicate claim name\n"
+
+
+# ============================================================ round 3 review fixes
+
+
+def test_ctypes_unavailable_in_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """The runner flushes C stdio best-effort; ctypes unavailable must not fail the claim."""
+    block = tmp_path / "blk"
+    block.mkdir()
+    (block / "sitecustomize.py").write_text(
+        "import sys\n"
+        'if "helios.claims.runner" in sys.orig_argv:\n'
+        "    class _Block:\n"
+        "        def find_spec(self, name, path=None, target=None):\n"
+        '            if name in ("ctypes", "_ctypes") or name.startswith("ctypes."):\n'
+        '                raise ImportError("ctypes blocked by verifier")\n'
+        "            return None\n"
+        "    sys.meta_path.insert(0, _Block())\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(block))
+    hub = make_hub(tmp_path, "noct", BASE_PROG, claim_src("noct", "return True"))
+    code, lines, err = run_check(hub, monkeypatch, capsys)
+    assert code == 0, err
+    assert json.loads(lines[0])["verdict"] == "verified"
+
+
+def test_setsid_grandchild_returns_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A grandchild that left the runner's process group must not block collection."""
+    pidfile = tmp_path / "ss.pid"
+    monkeypatch.setenv("VERIFY_PIDFILE", str(pidfile))
+    body = (
+        'p = subprocess.Popen(["sleep", "25"], start_new_session=True)\n'
+        'open(os.environ["VERIFY_PIDFILE"], "w").write(str(p.pid))\nreturn True'
+    )
+    hub = make_hub(tmp_path, "ssgc", BASE_PROG, claim_src("ssgc", body))
+    start = time.monotonic()
+    code, lines, err = run_check(hub, monkeypatch, capsys, "--timeout", "30")
+    secs = time.monotonic() - start
+    assert code == 0, err
+    assert json.loads(lines[0])["verdict"] == "verified"
+    assert secs < 5, secs
+    try:
+        os.kill(int(pidfile.read_text()), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def test_setsid_grandchild_timeout_returns_fast(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A timed-out claim with a setsid grandchild still returns within the collection bound."""
+    pidfile = tmp_path / "sst.pid"
+    monkeypatch.setenv("VERIFY_PIDFILE", str(pidfile))
+    body = (
+        'p = subprocess.Popen(["sleep", "25"], start_new_session=True)\n'
+        'open(os.environ["VERIFY_PIDFILE"], "w").write(str(p.pid))\n'
+        "time.sleep(60)\nreturn True"
+    )
+    hub = make_hub(tmp_path, "sstgc", BASE_PROG, claim_src("sstgc", body))
+    start = time.monotonic()
+    code, lines, _ = run_check(hub, monkeypatch, capsys, "--timeout", "2")
+    secs = time.monotonic() - start
+    finding = json.loads(lines[0])
+    assert code == 3
+    assert finding["notes"] == "timeout after 2 s"
+    assert secs < 7, secs
+    try:
+        os.kill(int(pidfile.read_text()), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def test_reimport_replaces_identity_not_duplicate(tmp_path: Path) -> None:
+    """A re-import of the same claim (same module, qualname, source line) replaces silently."""
+    hub = make_hub(tmp_path, "reim", BASE_PROG, claim_src("c_reim", "return True"))
+    claims_lib.load_claims(hub, "clm_reim")
+    claims_lib.load_claims(hub, "clm_reim")
+    assert len(claims_lib._CLAIMS["c_reim"]) == 1
+
+
+def test_duplicate_detected_before_filters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Duplicate names are a step 1 problem before --backend or --covers narrow the set."""
+    hub = make_hub(tmp_path, "dupf", BASE_PROG, "")
+    (hub / "clm_dupf.py").unlink()
+    (hub / "clm_dupf").mkdir()
+    (hub / "clm_dupf" / "__init__.py").write_text("from clm_dupf import a, b\n")
+    (hub / "clm_dupf" / "a.py").write_text(
+        HEADER + claim_src("fb", "return False", backend="meter",
+                           method="numerical_certificate", scope="instance",
+                           extra=', bound={"instance": "i1"}')
+    )
+    (hub / "clm_dupf" / "b.py").write_text(HEADER + claim_src("fb", "return True"))
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check", "--backend", "meter"]) == 2
+    err = capsys.readouterr().err
+    assert err == "fb: duplicate claim name\n"
+
+
+def test_foreign_module_never_shadows_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A claim registered by a module outside the configured package never runs instead."""
+    hub = make_hub(tmp_path, "frn", BASE_PROG, "")
+    (hub / "clm_frn.py").unlink()
+    (hub / "clm_frn").mkdir()
+    (hub / "clm_frn" / "__init__.py").write_text(
+        claim_src("xn", "return False") + "import shared_frn  # noqa: F401\n"
+    )
+    (hub / "shared_frn.py").write_text(claim_src("xn", "return True"))
+    monkeypatch.chdir(hub)
+    code = cli.main(["claims", "check"])
+    out = capsys.readouterr().out.splitlines()
+    assert code == 3
+    finding = json.loads(out[0])
+    assert finding["verdict"] == "refuted"
+
+
+def test_unimported_submodule_not_collected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A submodule the package never imports contributes no claim (SPEC §15.2, decided)."""
+    hub = make_hub(tmp_path, "lone", BASE_PROG, "")
+    (hub / "clm_lone.py").unlink()
+    (hub / "clm_lone").mkdir()
+    (hub / "clm_lone" / "__init__.py").write_text(claim_src("top", "return True"))
+    (hub / "clm_lone" / "lonely.py").write_text(claim_src("lonely", "return False"))
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert [json.loads(line)["id"] for line in out] == ["top"]
+
+
+@pytest.mark.parametrize(
+    "bad_name,tag",
+    [("a\nb", "bnnl"), ("", "bnem"), ("has/slash", "bnsl"), ("x" * 201, "bnlong")],
+)
+def test_invalid_claim_name_rejected(
+    bad_name: str, tag: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A claim name outside ^[A-Za-z0-9_][A-Za-z0-9._-]{0,199}$ fails at registration."""
+    src = (
+        f"{HEADER}"
+        f"@claim({bad_name!r}, covers=('b1',), backend='prover', method='proof',"
+        " scope='universal')\n"
+        "def f():\n    return True\n"
+    )
+    hub = make_hub(tmp_path, tag, BASE_PROG, src)
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith(f"helios: cannot import clm_{tag}: ValueError: "), err

@@ -607,3 +607,98 @@ def test_real_cli_diff_subprocess(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout == "+b\n"
+
+
+# ============================================================ round 3 review fixes
+
+
+@pytest.mark.parametrize("where", ["root", "src"])
+def test_program_diff_child_stdlib_named_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, where: str
+) -> None:
+    """A committed json.py must not shadow the diff child's own json import (decided)."""
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    (hub / ".agents").mkdir(parents=True)
+    (hub / ".agents" / "workflow.toml").write_text('[project]\nprogram = "jprog"\n')
+    git(hub, "init", "-q")
+    pre = "" if where == "root" else "src/"
+    reg_src = (
+        "from helios.program import Block, Registry\nREGISTRY = Registry()\n"
+        "REGISTRY.add(Block('a', 'set', 'x'))\n"
+    )
+    for rel in (f"{pre}jprog.py", f"{pre}json.py"):
+        (hub / rel).parent.mkdir(parents=True, exist_ok=True)
+    (hub / f"{pre}jprog.py").write_text(reg_src)
+    (hub / f"{pre}json.py").write_text("DATA = {'k': 1}\n")
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r1")
+    rev1 = git(hub, "rev-parse", "HEAD")
+    (hub / f"{pre}jprog.py").write_text(reg_src + "REGISTRY.add(Block('b', 'set', 'x'))\n")
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r2")
+    rev2 = git(hub, "rev-parse", "HEAD")
+    monkeypatch.chdir(hub)
+    assert cli.main(["program", "diff", rev1, rev2]) == 0
+    assert capsys.readouterr().out == "+b\n"
+
+
+def test_program_diff_child_imports_third_party(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A registry module importing sympy still resolves in the diff child (SPEC §15.1, decided)."""
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    write_hub(hub, "syprog", "")
+    git(hub, "init", "-q")
+    src = (
+        "import sympy\nfrom helios.program import Block, Registry\n"
+        "x = sympy.Symbol('x')\nREGISTRY = Registry()\n"
+        "REGISTRY.add(Block('c1', 'constraint', x <= 1))\n"
+    )
+    (hub / "syprog.py").write_text(src)
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r1")
+    rev1 = git(hub, "rev-parse", "HEAD")
+    (hub / "syprog.py").write_text(src + "REGISTRY.add(Block('c2', 'constraint', 2 * x <= 3))\n")
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r2")
+    rev2 = git(hub, "rev-parse", "HEAD")
+    monkeypatch.chdir(hub)
+    assert cli.main(["program", "diff", rev1, rev2]) == 0
+    assert capsys.readouterr().out == "+c2\n"
+
+
+def test_program_diff_tempdir_left_empty(tmp_path: Path) -> None:
+    """The extracted tree and the ids file both sit under one TemporaryDirectory (decided).
+
+    Run as a real subprocess (like test_real_cli_diff_subprocess): tempfile
+    caches TMPDIR per process, so an in-process cli.main call would not see a
+    monkeypatched TMPDIR reliably.
+    """
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    write_hub(hub, "tfprog", "")
+    git(hub, "init", "-q")
+    rev1 = commit_prog(hub, "tfprog.py", ["a"], "r1")
+    rev2 = commit_prog(hub, "tfprog.py", ["b"], "r2")
+    tmpd = tmp_path / "tmpd"
+    tmpd.mkdir()
+    env = {**os.environ, "TMPDIR": str(tmpd)}
+
+    def run_diff(*rev: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "helios.cli", "program", "diff", *rev],
+            cwd=hub,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+
+    proc = run_diff(rev1, rev2)
+    assert (proc.returncode, proc.stdout) == (0, "+b\n-a\n"), proc.stderr
+    assert list(tmpd.iterdir()) == []
+    proc2 = run_diff(rev1, "deadbeef")
+    assert proc2.returncode == 2
+    assert list(tmpd.iterdir()) == []

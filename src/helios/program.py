@@ -425,10 +425,13 @@ def module_relpath(module_name: str) -> str:
 
 
 _CHILD_SCRIPT = (
-    "import sys\n"
-    "name, root, out, helios_dir, stdlib, platstdlib = sys.argv[1:7]\n"
-    "sys.path[:] = [root + '/src', root, helios_dir, stdlib, platstdlib]\n"
-    "import importlib, json\n"
+    # Import everything the script itself needs before sys.path is replaced,
+    # so a committed module of the same name (json.py, say) in the extracted
+    # tree can never shadow it (SPEC §15.3, decided).
+    "import sys, os, importlib, json\n"
+    "name, root, out, helios_dir, stdlib, platstdlib, sitepkgs = sys.argv[1:8]\n"
+    "extra = sitepkgs.split(os.pathsep) if sitepkgs else []\n"
+    "sys.path[:] = [root + '/src', root, helios_dir, stdlib, platstdlib] + extra\n"
     "try:\n"
     "    module = importlib.import_module(name)\n"
     "    ids = sorted(b.id for b in module.REGISTRY.active())\n"
@@ -450,20 +453,26 @@ def extract_revision(hub: Path, rev: str, target: Path) -> None:
         tar.extractall(target, filter="fully_trusted")
 
 
-def import_ids_at_revision(module_name: str, root: Path, rev: str) -> set[str]:
+def import_ids_at_revision(module_name: str, root: Path, rev: str, out_path: Path) -> set[str]:
     """Import the module from the extracted tree and read its active ids (SPEC §15.3).
 
     The child runs with cwd the extracted tree, -P, and an explicit sys.path of
-    its src, the tree itself and the installed helios location, so sibling imports
-    resolve at the same revision and the working tree never leaks in. Ids travel
-    back in a temp file; child stdout is ignored.
+    its src, the tree itself, the installed helios location, the stdlib and
+    every site-packages directory of this interpreter (SPEC §15.3, decided),
+    so sibling imports resolve at the same revision, a third-party import such
+    as sympy still works, and the working tree never leaks in. Ids travel back
+    in out_path; child stdout is ignored.
     """
+    import site
     import sysconfig
 
     env = dict(os.environ)
     env.pop(OMIT_ENV, None)
     helios_dir = str(Path(__file__).resolve().parent.parent)
-    out_path = root.parent / (root.name + ".ids.json")
+    try:
+        site_packages = site.getsitepackages()
+    except AttributeError:
+        site_packages = []
     argv = [
         sys.executable,
         "-P",
@@ -475,6 +484,7 @@ def import_ids_at_revision(module_name: str, root: Path, rev: str) -> set[str]:
         helios_dir,
         sysconfig.get_path("stdlib"),
         sysconfig.get_path("platstdlib"),
+        os.pathsep.join(site_packages),
     ]
     try:
         proc = subprocess.run(argv, cwd=root, capture_output=True, text=True, env=env,
@@ -503,14 +513,21 @@ def import_ids_at_revision(module_name: str, root: Path, rev: str) -> set[str]:
 
 
 def active_ids_at_revision(hub: Path, module_name: str, rev: str) -> set[str]:
-    """Active block ids of the registry module at a git revision (SPEC §15.3)."""
+    """Active block ids of the registry module at a git revision (SPEC §15.3).
+
+    The extracted tree and the ids file both live under one TemporaryDirectory
+    so nothing is left in TMPDIR on success or on an import failure (decided).
+    """
     rel = module_relpath(module_name)
     with tempfile.TemporaryDirectory(prefix="helios-diff-") as tmp:
-        root = Path(tmp)
+        tmp_path = Path(tmp)
+        root = tmp_path / "tree"
+        root.mkdir()
         extract_revision(hub, rev, root)
         if not (root / "src" / rel).is_file() and not (root / rel).is_file():
             raise ValueError(f"program module {module_name!r} not found at revision {rev!r}")
-        return import_ids_at_revision(module_name, root, rev)
+        out_path = tmp_path / "ids.json"
+        return import_ids_at_revision(module_name, root, rev, out_path)
 
 
 def diff_ids(old: set[str], new: set[str]) -> list[str]:
