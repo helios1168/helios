@@ -261,6 +261,33 @@ def run_state_for(report_status: str | None, execution_status: str) -> str:
     return "failed"
 
 
+class BeadNotFound(KeyError):
+    """Raised by `Beads.show` when bd has no bead matching `bead_id` exactly.
+
+    Covers a missing id, an ambiguous prefix (bd reports both with the same
+    "no issues found matching the provided IDs" JSON body on stdout, differing
+    only in the stderr message) and a partial id that bd resolved to a
+    different bead. Subclasses `KeyError` so existing callers that catch
+    `KeyError` keep working unchanged.
+    """
+
+    def __init__(self, bead_id: str) -> None:
+        super().__init__(bead_id)
+        self.bead_id = bead_id
+
+
+_SHOW_NOT_FOUND_ERROR = "no issues found matching the provided IDs"
+
+
+def _parse_json_object(raw: bytes) -> dict[str, Any] | None:
+    """Best-effort parse of `raw` as a JSON object; `None` if it is not one."""
+    try:
+        payload = json.loads(raw.decode("utf-8", errors="replace"))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 class BeadsLike(Protocol):
     def show(self, bead_id: str) -> Bead: ...
     def comments(self, bead_id: str) -> list[Comment]: ...
@@ -281,13 +308,17 @@ class Beads:
         self.cwd = cwd
         self.binary = binary
 
-    def _run_bytes(self, argv: list[str]) -> bytes:
-        proc = subprocess.run(
+    def _run_raw(self, argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+        """Like `_run_bytes`, but returns the process instead of raising on failure."""
+        return subprocess.run(
             [self.binary, *argv],
             cwd=self.cwd,
             capture_output=True,
             check=False,
         )
+
+    def _run_bytes(self, argv: list[str]) -> bytes:
+        proc = self._run_raw(argv)
         if proc.returncode != 0:
             stderr = proc.stderr.decode("utf-8", errors="replace").strip()
             raise RuntimeError(f"bd {' '.join(argv)} failed: {stderr}")
@@ -308,11 +339,31 @@ class Beads:
         return self._run_bytes(argv).decode("utf-8")
 
     def show(self, bead_id: str) -> Bead:
-        out = self._run_json(["show", bead_id, "--json"])
+        """`bd show <bead_id> --json`, raising `BeadNotFound` rather than `RuntimeError`
+        for a missing id, an ambiguous prefix, or a partial id bd resolved to a
+        different bead (SPEC §7.1 step 1). See `BeadNotFound` for how bd reports each.
+        """
+        argv = ["show", bead_id, "--json"]
+        proc = self._run_raw(argv)
+        if proc.returncode != 0:
+            error = _parse_json_object(proc.stdout)
+            if error is not None and error.get("error") == _SHOW_NOT_FOUND_ERROR:
+                raise BeadNotFound(bead_id)
+            stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"bd {' '.join(argv)} failed: {stderr}")
+        out = proc.stdout.decode("utf-8")
         payloads = json.loads(out)
-        if not payloads:
-            raise KeyError(f"bead {bead_id} not found")
-        return Bead.from_show(payloads[0])
+        if (
+            not isinstance(payloads, list)
+            or not payloads
+            or not isinstance(payloads[0], dict)
+            or "id" not in payloads[0]
+        ):
+            raise RuntimeError(f"bd {' '.join(argv)} returned an unexpected payload: {out!r}")
+        payload = payloads[0]
+        if str(payload["id"]) != bead_id:
+            raise BeadNotFound(bead_id)
+        return Bead.from_show(payload)
 
     def comments(self, bead_id: str) -> list[Comment]:
         out = self._run_json(["comments", bead_id, "--json"])
@@ -478,7 +529,10 @@ class FakeBeads:
         self._next_id = 1
 
     def show(self, bead_id: str) -> Bead:
-        return self.beads[bead_id]
+        try:
+            return self.beads[bead_id]
+        except KeyError:
+            raise BeadNotFound(bead_id) from None
 
     def comments(self, bead_id: str) -> list[Comment]:
         return list(self._comments.get(bead_id, []))

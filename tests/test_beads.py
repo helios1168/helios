@@ -11,6 +11,7 @@ import pytest
 
 from helios.beads import (
     Bead,
+    BeadNotFound,
     Beads,
     Comment,
     FakeBeads,
@@ -224,6 +225,13 @@ def test_fake_gate_list_and_gate_blocks() -> None:
     assert fake.gate_blocks("g1") == ["b1", "b2"]
 
 
+def test_fake_show_raises_bead_not_found_for_unknown_id() -> None:
+    fake = FakeBeads([Bead(id="b1")])
+    with pytest.raises(BeadNotFound) as exc_info:
+        fake.show("missing")
+    assert exc_info.value.bead_id == "missing"
+
+
 BD = shutil.which("bd")
 
 
@@ -233,6 +241,24 @@ def _init_bd_repo(tmp_path: Path) -> None:
     subprocess.run(
         ["bd", "init", "--non-interactive"], cwd=tmp_path, check=True, capture_output=True
     )
+
+
+def _create_with_id(tmp_path: Path, title: str, bead_id: str) -> None:
+    """`bd create --id <bead_id> --force`, so the id need not match the db's own prefix."""
+    subprocess.run(
+        ["bd", "create", "--title", title, "--type", "task", "--id", bead_id, "--force"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _write_shim_bd(tmp_path: Path, script: str) -> str:
+    """A fake `bd` executable whose whole body is `script`; returns its path."""
+    shim = tmp_path / "bd"
+    shim.write_text(f"#!/bin/sh\n{script}\n")
+    shim.chmod(0o755)
+    return str(shim)
 
 
 @pytest.mark.skipif(BD is None, reason="bd is not on PATH")
@@ -250,6 +276,72 @@ def test_real_bd_show_round_trip(tmp_path: Path) -> None:
     bead = beads.show(bead_id)
     assert bead.id == bead_id
     assert bead.title == "probe"
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_show_raises_bead_not_found_for_missing_id(tmp_path: Path) -> None:
+    """bd exits 1 with stdout `{"error": "no issues found matching the provided IDs", ...}`
+    and stderr `Error fetching <id>: no issue found matching "<id>"` (checked against a
+    real bd 1.2.2 in a temp repo).
+    """
+    _init_bd_repo(tmp_path)
+    beads = Beads(tmp_path)
+    with pytest.raises(BeadNotFound) as exc_info:
+        beads.show("no-such-bead")
+    assert exc_info.value.bead_id == "no-such-bead"
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_show_raises_bead_not_found_for_partial_id(tmp_path: Path) -> None:
+    """A prefix that resolves to exactly one bead still exits 0, but the returned
+    bead's id does not equal the requested (partial) id, so `show` treats it as
+    not found rather than silently returning the wrong bead.
+    """
+    _init_bd_repo(tmp_path)
+    _create_with_id(tmp_path, "probe", "zz-partial1")
+    beads = Beads(tmp_path)
+    with pytest.raises(BeadNotFound) as exc_info:
+        beads.show("zz-partial")
+    assert exc_info.value.bead_id == "zz-partial"
+    # the exact id still resolves
+    assert beads.show("zz-partial1").id == "zz-partial1"
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_show_raises_bead_not_found_for_ambiguous_prefix(tmp_path: Path) -> None:
+    """An ambiguous prefix exits 1 with the same stdout error body as a missing id;
+    only bd's stderr message differs (`ambiguous ID "<id>" matches N issues: [...]`,
+    checked against a real bd 1.2.2 in a temp repo).
+    """
+    _init_bd_repo(tmp_path)
+    _create_with_id(tmp_path, "A", "zz-amb1")
+    _create_with_id(tmp_path, "B", "zz-amb2")
+    beads = Beads(tmp_path)
+    with pytest.raises(BeadNotFound) as exc_info:
+        beads.show("zz-amb")
+    assert exc_info.value.bead_id == "zz-amb"
+
+
+def test_shim_bd_show_raises_runtime_error_when_locked(tmp_path: Path) -> None:
+    """A real failure (for example a locked database) keeps raising `RuntimeError`,
+    not `BeadNotFound`, even though bd still exits 1.
+    """
+    shim = _write_shim_bd(tmp_path, 'echo "Error: database is locked" >&2\nexit 1\n')
+    beads = Beads(tmp_path, binary=shim)
+    with pytest.raises(RuntimeError, match="database is locked"):
+        beads.show("any-id")
+
+
+def test_shim_bd_show_raises_runtime_error_for_malformed_success_payload(
+    tmp_path: Path,
+) -> None:
+    """`bd show` exiting 0 with a bead object that has no `id` field is malformed,
+    not a not-found signal, so it raises `RuntimeError` rather than `BeadNotFound`.
+    """
+    shim = _write_shim_bd(tmp_path, 'echo \'[{"labels":[]}]\'\n')
+    beads = Beads(tmp_path, binary=shim)
+    with pytest.raises(RuntimeError):
+        beads.show("any-id")
 
 
 @pytest.mark.skipif(BD is None, reason="bd is not on PATH")
