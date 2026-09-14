@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,11 @@ from helios.preflight import PreflightContext, check, globs_overlap, memory_map
 
 def make_hub(tmp_path: Path) -> Path:
     hub = tmp_path / "hub"
+    hub.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=hub, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=hub, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=hub, check=True)
+    (hub / ".gitignore").write_text(".helios/\n.claude/worktrees/\n")
     (hub / "skills" / "impl").mkdir(parents=True)
     (hub / "skills" / "impl" / "SKILL.md").write_text(
         "---\nname: impl\n---\n\n# Implementation bead\n\nDo the work.\n"
@@ -29,6 +35,8 @@ def make_hub(tmp_path: Path) -> Path:
         "## 9. Sessions\n\nSessions.\n\n"
         "### 9.3 Events\n\nEvent words.\n"
     )
+    subprocess.run(["git", "add", "."], cwd=hub, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=hub, check=True)
     return hub
 
 
@@ -351,6 +359,40 @@ def test_globs_overlap_rule() -> None:
     assert globs_overlap("src/", "*.py")
     assert not globs_overlap("src/helios/config.py", "src/helios/beads.py")
     assert not globs_overlap("src/a/", "src/b/*.py")
+
+
+def test_preflight_gitignore_must_ignore_helios_and_worktrees(tmp_path: Path) -> None:
+    hub = tmp_path / "hub2"
+    hub.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=hub, check=True)
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}))
+    bead = impl_bead()
+
+    (hub / ".gitignore").write_text("")
+    assert check([bead], ctx) == [
+        ".gitignore must ignore .helios/",
+        ".gitignore must ignore .claude/worktrees/",
+    ]
+
+    (hub / ".gitignore").write_text(".claude/worktrees/\n")
+    assert check([bead], ctx) == [".gitignore must ignore .helios/"]
+
+    (hub / ".gitignore").write_text(".helios/\n")
+    assert check([bead], ctx) == [".gitignore must ignore .claude/worktrees/"]
+
+    (hub / ".gitignore").write_text(".helios/\n.claude/worktrees/\n")
+    assert check([bead], ctx) == []
+
+
+def test_preflight_gitignore_honors_git_info_exclude(tmp_path: Path) -> None:
+    hub = tmp_path / "hub3"
+    hub.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=hub, check=True)
+    (hub / ".gitignore").write_text(".claude/worktrees/\n")
+    (hub / ".git" / "info").mkdir(parents=True, exist_ok=True)
+    (hub / ".git" / "info" / "exclude").write_text(".helios/\n")
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}))
+    assert check([impl_bead()], ctx) == []
 
 
 def test_preflight_unfinalized_attempt(tmp_path: Path) -> None:
