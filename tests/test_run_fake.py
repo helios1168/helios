@@ -721,9 +721,23 @@ def test_launched_event_has_null_session(tmp_path: Path, monkeypatch) -> None:
 def test_harness_get_errors() -> None:
     from helios.harness import get as _get
 
-    for name in ("base", "nope", "fake.x", "__init__", "claude"):
+    for name in ("base", "nope", "fake.x", "__init__"):
         with pytest.raises(ValueError, match=name.split(".")[0]):
             _get(name)
+
+
+def test_harness_get_real_adapters() -> None:
+    from helios.harness import get as _get
+
+    for name, class_name in (
+        ("claude", "ClaudeAdapter"),
+        ("codex", "CodexAdapter"),
+        ("opencode", "OpencodeAdapter"),
+        ("agy", "AgyAdapter"),
+    ):
+        harness = _get(name)
+        assert type(harness).__name__ == class_name
+        assert harness.name == name
 
 
 def group_dead(pgid: int | None) -> bool:
@@ -1866,6 +1880,53 @@ def test_memory_has_for_backends(tmp_path: Path) -> None:
     assert run_cmd.memory_has_for(beads, cfg)("nope") is False
 
 
+def test_memory_key_rule_rejected_both_backends(tmp_path: Path) -> None:
+    """Bad keys and ``schema_version`` never exist, before any lookup (SPEC §13)."""
+    from helios import config as C
+    from helios.commands import run as run_cmd
+
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([])
+    beads.remember("schema_version", "v")
+    beads_has = run_cmd.memory_has_for(beads, config_mod.load(hub))
+    for bad in ("M1", "../../README", "schema_version", "has space", ""):
+        assert beads_has(bad) is False, bad
+
+    export = hub / ".helios" / "memories"
+    export.mkdir(parents=True)
+    (export / "schema_version.md").write_text(
+        "helios-memory 1\n{\"source\": \"x#1\", \"status\": \"active\"}\n\nbody"
+    )
+    files_cfg = C.Config(hub=hub, memory=C.MemoryConfig(backend="files"))
+    files_has = run_cmd.memory_has_for(beads_mod.FakeBeads([]), files_cfg)
+    for bad in ("M1", "../../README", "schema_version", "has space", ""):
+        assert files_has(bad) is False, bad
+
+
+def test_memory_lookup_failure_is_distinct_preflight_error(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A failing ``bd recall`` is a preflight error distinct from "does not exist"."""
+    from helios.commands import run as run_cmd
+
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1", memories=["m1"])])
+
+    def boom(key: str) -> str | None:
+        raise RuntimeError("bd exploded")
+
+    monkeypatch.setattr(beads, "recall", boom)
+    cfg = config_mod.load(hub)
+    rc = run_mod.run_many(["b1"], hub=hub, beads=beads, config=cfg,
+                          harness_override="fake",
+                          memory_has=run_cmd.memory_has_for(beads, cfg))
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "helios: memory lookup failed for m1: bd exploded" in err
+    assert "does not exist" not in err
+    assert not (hub / ".helios" / "runs").exists()
+
+
 def test_lock_refusal_second_process(tmp_path: Path) -> None:
     hub = make_hub(tmp_path)
     script = write_script(
@@ -1890,3 +1951,102 @@ def test_lock_refusal_second_process(tmp_path: Path) -> None:
         if proc.poll() is None:
             proc.kill()
             proc.communicate()
+
+
+DEADLOCK_CHILD = """\
+import os, signal, sys, threading, time
+from pathlib import Path
+from helios import beads as B, config as C, run as R
+
+hub = Path(os.environ["HELIOS_CHILD_HUB"])
+beads = B.FakeBeads([B.Bead(id="b1", kind="impl", files=["src/"], test="true")])
+cfg = C.load(hub)
+prev = signal.getsignal(signal.SIGINT)
+
+ev = R._INTERRUPT
+orig_notify = ev._cond.notify_all
+shot = {"n": 0}
+
+def notify_all():
+    # Fires the first time _INTERRUPT.set() runs after the outermost run's
+    # cleanup begins: exactly the site of the round 6 reentrancy deadlock.
+    if shot["n"] == 0 and not R._RUN_ACTIVE.is_set():
+        shot["n"] = 1
+        os.kill(os.getpid(), signal.SIGINT)
+        time.sleep(0.02)
+    return orig_notify()
+
+ev._cond.notify_all = notify_all
+rc = R.run_many(["b1"], hub=hub, beads=beads, config=cfg, harness_override="fake")
+ok = (rc == 0 and shot["n"] == 1
+      and signal.getsignal(signal.SIGINT) is prev and R._RUN_DEPTH == 0)
+print(f"RESULT rc={rc} shot={shot['n']} ok={ok}", flush=True)
+sys.exit(0 if ok else 1)
+"""
+
+
+def test_sigint_reentry_in_cleanup_does_not_deadlock(tmp_path: Path) -> None:
+    """A SIGINT racing _INTERRUPT.set() in run_many's own cleanup must not hang (SPEC §7.1)."""
+    hub = make_hub(tmp_path)
+    script = write_script(tmp_path, {"report": {"status": "done", "summary": "ok"}})
+    env = dict(os.environ, HELIOS_FAKE_SCRIPT=str(script), HELIOS_CHILD_HUB=str(hub))
+    proc = subprocess.run(
+        [sys.executable, "-c", DEADLOCK_CHILD], env=env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+STORM_EMPTY_CHILD = """\
+import os, signal, sys, threading, time
+from pathlib import Path
+from helios import beads as B, config as C, run as R
+
+hub = Path(os.environ["HELIOS_CHILD_HUB"])
+cfg = C.load(hub)
+beads = B.FakeBeads([])
+# Ignore SIGINT outside run_many so the storm thread never hits this
+# script's own default handler between calls; run_many installs and
+# restores its own handler around each call.
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+prev = signal.getsignal(signal.SIGINT)
+
+stop = threading.Event()
+sent = [0]
+
+def storm():
+    while not stop.is_set():
+        try:
+            os.kill(os.getpid(), signal.SIGINT)
+        except ProcessLookupError:
+            return
+        sent[0] += 1
+        time.sleep(0.0005)
+
+t = threading.Thread(target=storm, daemon=True)
+t.start()
+end = time.monotonic() + 4
+n = 0
+try:
+    while time.monotonic() < end:
+        R.run_many([], hub=hub, beads=beads, config=cfg)
+        n += 1
+finally:
+    stop.set()
+    t.join()
+
+ok = (sent[0] >= 2000 and signal.getsignal(signal.SIGINT) is prev and R._RUN_DEPTH == 0)
+print(f"RESULT n={n} sent={sent[0]} ok={ok}", flush=True)
+sys.exit(0 if ok else 1)
+"""
+
+
+def test_sigint_storm_on_empty_run_many_no_exception(tmp_path: Path) -> None:
+    """A SIGINT storm on ``run_many([])`` never raises; the handler is always restored."""
+    hub = make_hub(tmp_path)
+    env = dict(os.environ, HELIOS_CHILD_HUB=str(hub))
+    proc = subprocess.run(
+        [sys.executable, "-c", STORM_EMPTY_CHILD], env=env,
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr

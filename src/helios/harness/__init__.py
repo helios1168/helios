@@ -6,34 +6,32 @@ from typing import cast
 
 from helios.harness.base import Harness
 
-_REGISTERED = ("claude", "codex", "opencode", "agy", "fake")
+# Explicit registry: name -> the adapter class defined in that module. Every
+# adapter module also imports ``Harness`` itself (its base class), so
+# searching the module's attributes for anything matching ``Harness`` would
+# find that import instead of the concrete class; naming the class avoids it.
+_ADAPTER_CLASS = {
+    "claude": "ClaudeAdapter",
+    "codex": "CodexAdapter",
+    "opencode": "OpencodeAdapter",
+    "agy": "AgyAdapter",
+}
 
 
 def get(name: str) -> Harness:
     """Return the adapter for ``name`` (SPEC §6.1, §6.4).
 
-    Only the registered harness names resolve; any other name raises
-    ``ValueError`` naming it.
+    Only the registered harness names resolve; any other name (including
+    ``base``, the interface module) raises ``ValueError`` naming it.
     """
     if name == "fake":
         from helios.harness.fake import FakeHarness
 
         return FakeHarness()
-    if name not in _REGISTERED:
+    if name not in _ADAPTER_CLASS:
         raise ValueError(f"unknown harness {name!r}")
-    try:
-        import importlib
+    import importlib
 
-        mod = importlib.import_module(f"helios.harness.{name}")
-    except ImportError as exc:
-        raise ValueError(f"unknown harness {name!r}") from exc
-    for attr in ("Harness", f"{name.capitalize()}Harness", "Adapter"):
-        candidate = getattr(mod, attr, None)
-        if isinstance(candidate, type):
-            return cast(Harness, candidate())
-    harness_attr = getattr(mod, "harness", None)
-    if isinstance(harness_attr, type):
-        return cast(Harness, harness_attr())
-    if isinstance(harness_attr, Harness):
-        return harness_attr
-    raise ValueError(f"unknown harness {name!r}")
+    mod = importlib.import_module(f"helios.harness.{name}")
+    candidate = getattr(mod, _ADAPTER_CLASS[name])
+    return cast(Harness, candidate())

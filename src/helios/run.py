@@ -32,6 +32,10 @@ from helios import prompt as prompt_mod
 from helios import worktree as worktree_mod
 from helios.harness.base import Harness, LaunchSpec
 
+class MemoryLookupError(RuntimeError):
+    """A memory backend lookup failed during preflight (SPEC §7.1, §13)."""
+
+
 _RUNNING: dict[str, subprocess.Popen[str]] = {}
 _RUNNING_LOCK = threading.Lock()
 _INTERRUPT = threading.Event()
@@ -90,8 +94,12 @@ def _handle_sigint(signum: int, frame: FrameType | None) -> None:
 
     The handler never blocks and takes no lock: a stopper thread started
     by the run waits on the flag and runs the stop sequences. Later
-    SIGINTs are ignored.
+    SIGINTs are ignored: the guard also keeps a signal that arrives while
+    ``set()`` is already in progress (a storm) from re-entering the same
+    call on this thread and recursing on the Event's internal lock.
     """
+    if _INTERRUPT.is_set():
+        return
     _INTERRUPT.set()
 
 
@@ -1662,7 +1670,11 @@ def run_many(
             runs_rel=cfg.project.runs,
             units_dir=cfg.project.units,
         )
-        errors = preflight_mod.check(loaded, ctx)
+        try:
+            errors = preflight_mod.check(loaded, ctx)
+        except MemoryLookupError as exc:
+            print(f"preflight: {exc}", file=sys.stderr)
+            return 2
         for bead in loaded:
             missing = _missing_skill(hub, bead.kind)
             if missing is not None:
@@ -1728,12 +1740,23 @@ def run_many(
             return 4
         return max(results.values(), default=0)
     finally:
-        if outermost:
-            _RUN_ACTIVE.clear()
-            if stopper is not None:
-                _INTERRUPT.set()
-                stopper.join()
-            for thread in _seq_threads():
-                thread.join()
-            _restore_handler()
-        _run_depth_exit()
+        try:
+            if outermost:
+                _RUN_ACTIVE.clear()
+                if stopper is not None:
+                    # Never call set() on the main thread while our handler is
+                    # installed: a SIGINT landing inside it would re-enter
+                    # ``_handle_sigint`` -> ``set()`` on the same non-reentrant
+                    # Event lock and deadlock. A helper thread does it instead.
+                    waker = threading.Thread(
+                        target=_INTERRUPT.set, name="_interrupt_waker", daemon=True
+                    )
+                    waker.start()
+                    waker.join()
+                    stopper.join()
+                for thread in _seq_threads():
+                    thread.join()
+        finally:
+            if outermost:
+                _restore_handler()
+            _run_depth_exit()
