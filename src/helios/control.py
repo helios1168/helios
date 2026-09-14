@@ -63,7 +63,7 @@ def next_bead(
     """Run the first candidate not covered by ``stop_at`` (SPEC section 11)."""
     bead = next((b for b in candidates(beads, unit) if b.kind not in stop_at), None)
     if bead is None:
-        print("no ready bead", file=__import__("sys").stderr)
+        print("helios: no ready bead", file=__import__("sys").stderr)
         return 3
     code, _envelope, line = _run_one(bead, run, read_envelope)
     print(line)
@@ -81,7 +81,8 @@ def validate_until(beads: Any, unit: str, until: str | None) -> str | None:
     if until is not None and until not in STAGES:
         raise ControlError(f"unknown until stage {until}")
     if until is not None and not any(
-        bead.kind == until for bead in beads.list(labels=[f"unit:{unit}"])
+        bead.kind == until and f"kind:{until}" in bead.labels
+        for bead in beads.list(labels=[f"unit:{unit}"])
     ):
         raise ControlError(f"until stage {until} absent from unit {unit}")
     return until

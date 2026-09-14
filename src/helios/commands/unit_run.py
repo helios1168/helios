@@ -23,7 +23,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         result = control.unit_run(beads, unit=args.unit, default=config.control.default, configured_until=config.control.until, stop_at=config.control.stop_at, until=args.until, run=run_bead, read_envelope=read_envelope)
     except control.ControlError as exc:
-        print(str(exc), file=__import__("sys").stderr)
+        print(f"helios: {exc}", file=__import__("sys").stderr)
         return 2
     return result.code
 

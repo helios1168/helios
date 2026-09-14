@@ -16,7 +16,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
-    config = load(Path.cwd())
+    try:
+        config = load(Path.cwd())
+    except (ValueError, TypeError, RecursionError) as exc:
+        print(f"helios: {exc}", file=__import__("sys").stderr)
+        return 2
     beads = Beads(config.hub)
     return control.next_bead(beads, unit=args.unit, stop_at=config.control.stop_at, run=run_bead, read_envelope=read_envelope)
 

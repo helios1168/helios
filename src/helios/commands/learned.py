@@ -21,17 +21,35 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run(args: argparse.Namespace) -> int:
     if args.mark and (args.unit or args.json) or bool(args.mark) != bool(args.decision):
+        print("helios: invalid learned options", file=__import__("sys").stderr)
         return 2
-    beads = Beads(load(Path.cwd()).hub)
+    try:
+        beads = Beads(load(Path.cwd()).hub)
+    except (ValueError, TypeError, RecursionError) as exc:
+        print(f"helios: {exc}", file=__import__("sys").stderr)
+        return 2
     if args.mark:
         try:
             return queue.mark(beads, args.mark, args.decision)
-        except ValueError:
+        except ValueError as exc:
+            print(f"helios: {exc}", file=__import__("sys").stderr)
             return 2
     lines = queue.list_lines(beads, args.unit)
     if args.json:
         print(json.dumps([line.as_json() for line in lines]))
     else:
+        current_unit: str | None = None
+        current_bead: str | None = None
+        current_attempt: int | None = None
         for line in lines:
-            print(f"{line.unit}\t{line.bead}\t{line.attempt}\t{line.kind}#{line.k}\t{line.text}")
+            if line.unit != current_unit:
+                print(f"unit: {line.unit}")
+                current_unit, current_bead, current_attempt = line.unit, None, None
+            if line.bead != current_bead:
+                print(f"  bead: {line.bead}")
+                current_bead, current_attempt = line.bead, None
+            if line.attempt != current_attempt:
+                print(f"    attempt: {line.attempt}")
+                current_attempt = line.attempt
+            print(f"      {line.kind}#{line.k}: {line.text}")
     return 0

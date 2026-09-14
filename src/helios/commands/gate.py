@@ -17,7 +17,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
-    gates = open_gates(Beads(load(Path.cwd()).hub))
+    try:
+        gates = open_gates(Beads(load(Path.cwd()).hub))
+    except (ValueError, TypeError, RecursionError) as exc:
+        print(f"helios: {exc}", file=__import__("sys").stderr)
+        return 2
     if args.json:
         print(json.dumps(gates))
     else:
