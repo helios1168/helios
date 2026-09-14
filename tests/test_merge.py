@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from helios.beads import Bead, FakeBeads
+from helios.beads import Bead, Beads, FakeBeads
 from helios.config import ProjectConfig
 from helios.envelope import AgentReport, Envelope, ExecutionStatus, WorkStatus
 from helios.merge import MergeError, merge_bead
@@ -937,6 +937,170 @@ def test_second_merge_with_new_verified_commit_creates_new_markers(tmp_path: Pat
     assert texts.count(f"merge: [b1@{second_main_before}:merged] merged") == 1
 
 
+# ---------------------------------------------------------------- h3c-fix4 item 1:
+# the verified-commit check runs on every attempt; a rebase is accepted by patch-id.
+
+
+def _crash_right_after_rebase(monkeypatch):
+    import helios.merge as merge_module
+
+    original = merge_module._git
+
+    def crash(cwd: Path, *args: str):
+        result = original(cwd, *args)
+        if args == ("rebase", "main") and result.returncode == 0:
+            raise RuntimeError("crash")
+        return result
+
+    monkeypatch.setattr(merge_module, "_git", crash)
+    return original
+
+
+def test_hand_fix_commit_after_check_failure_refuses(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub, runner=lambda _c, _w: 1)
+    assert error.value.code == 5
+    (worktree / "handfix.txt").write_text("fix\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "hand fix")
+    with pytest.raises(MergeError) as error2:
+        _run(beads, hub)
+    assert error2.value.code == 2
+    assert str(error2.value).startswith("worktree HEAD")
+
+
+def test_hand_resolved_conflict_with_different_patch_refuses(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    (hub / "value.txt").write_text("hub\n")
+    _git(hub, "add", ".")
+    _git(hub, "commit", "-m", "conflict")
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 3
+    proc = subprocess.run(["git", "rebase", "main"], cwd=worktree, capture_output=True, text=True)
+    assert proc.returncode != 0
+    (worktree / "value.txt").write_text("resolved-differently\n")
+    _git(worktree, "add", "value.txt")
+    _git(worktree, "-c", "core.editor=true", "rebase", "--continue")
+    with pytest.raises(MergeError) as error2:
+        _run(beads, hub)
+    assert error2.value.code == 2
+    assert str(error2.value).startswith("worktree HEAD")
+
+
+@pytest.mark.parametrize("mutation", ["extra-commit", "amend", "beads-commit"])
+def test_worktree_mutation_after_post_rebase_crash_refuses(
+    tmp_path: Path, monkeypatch, mutation: str
+) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    import helios.merge as merge_module
+
+    original = _crash_right_after_rebase(monkeypatch)
+    with pytest.raises(RuntimeError):
+        _run(beads, hub)
+    monkeypatch.setattr(merge_module, "_git", original)
+    if mutation == "extra-commit":
+        (worktree / "extra.txt").write_text("extra\n")
+        _git(worktree, "add", ".")
+        _git(worktree, "commit", "-m", "extra")
+    elif mutation == "amend":
+        (worktree / "value.txt").write_text("amended\n")
+        _git(worktree, "add", ".")
+        _git(worktree, "commit", "--amend", "--no-edit")
+    else:
+        (worktree / ".beads" / "extra.jsonl").write_text("{}\n")
+        _git(worktree, "add", ".")
+        _git(worktree, "commit", "-m", "beads change")
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+
+
+def test_post_rebase_crash_then_main_moves_then_rerun_merges(tmp_path: Path, monkeypatch) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    # Move main once before the first attempt, so its rebase is a real rebase (a
+    # new commit hash), not a no-op.
+    (hub / "first.txt").write_text("first\n")
+    _git(hub, "add", "first.txt")
+    _git(hub, "commit", "-m", "first move")
+    import helios.merge as merge_module
+
+    original = _crash_right_after_rebase(monkeypatch)
+    with pytest.raises(RuntimeError):
+        _run(beads, hub)
+    monkeypatch.setattr(merge_module, "_git", original)
+    rebased_once = _git(worktree, "rev-parse", "HEAD")
+    assert rebased_once != beads.beads["b1"].metadata["output_commit"]
+    # Move main again; the rerun's own rebase must run a second time.
+    (hub / "second.txt").write_text("second\n")
+    _git(hub, "add", "second.txt")
+    _git(hub, "commit", "-m", "second move")
+    final_main_before = _git(hub, "rev-parse", "main")
+    assert _run(beads, hub) == (0, "merged")
+    texts = [comment.text for comment in beads.comments("b1")]
+    for step in ("rebased", "tested", "merged", "removed"):
+        assert texts.count(f"merge: [b1@{final_main_before}:{step}] {step}") == 1
+
+
+def test_second_merge_crash_after_rebase_then_rerun_merges(tmp_path: Path, monkeypatch) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    assert _run(beads, hub) == (0, "merged")
+    _git(hub, "worktree", "add", str(worktree), "-b", "worktree-b1", "main")
+    (worktree / "second.txt").write_text("second\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "second change")
+    new_head = _git(worktree, "rev-parse", "HEAD")
+    beads.beads["b1"].metadata["output_commit"] = new_head
+    _new_envelope(hub, worktree)
+    import helios.merge as merge_module
+
+    original = _crash_right_after_rebase(monkeypatch)
+    with pytest.raises(RuntimeError):
+        _run(beads, hub)
+    monkeypatch.setattr(merge_module, "_git", original)
+    assert _run(beads, hub) == (0, "merged")
+    assert _git(hub, "show", "main:second.txt") == "second"
+
+
+# ---------------------------------------------------------------- h3c-fix4 items
+# 2, 3, 4.
+
+
+def test_check_success_with_non_utf8_output_does_not_crash(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    project = ProjectConfig(worktrees="../worktree", test="printf '\\xff'")
+    code, message = merge_bead(hub, "b1", project=project, beads=beads, input_hashes=lambda _b: {})
+    assert (code, message) == (0, "merged")
+
+
+def test_branch_renaming_out_of_beads_still_refuses(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    _git(worktree, "mv", ".beads/issues.jsonl", "notbeads.txt")
+    _git(worktree, "commit", "-m", "rename out of beads")
+    beads = _beads(hub, worktree)
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == "branch changes .beads/"
+
+
+def test_clean_does_not_ignore_a_change_to_a_path_named_dot_beads_itself(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    import helios.merge as merge_module
+
+    shutil.rmtree(hub / ".beads")
+    (hub / ".beads").write_text("not a directory\n")
+    _git(hub, "add", "-A")
+    assert merge_module._clean(hub, ignore_beads=True) is False
+
+
 BD = shutil.which("bd")
 
 
@@ -954,3 +1118,78 @@ def test_real_bd_closed_set_state_does_not_reopen(tmp_path: Path) -> None:
         [BD, "show", bead, "--json"], cwd=tmp_path, check=True, capture_output=True, text=True
     ).stdout
     assert '"status":"closed"' in payload.replace(" ", "")
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not installed")
+def test_real_bd_hand_fix_after_check_failure_refuses(tmp_path: Path) -> None:
+    """h3c-fix4 item 1's exit-5-then-hand-fix case, against real bd."""
+    assert BD is not None
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    _git(hub, "init", "-b", "main")
+    _git(hub, "config", "user.email", "test@example.com")
+    _git(hub, "config", "user.name", "Test")
+    (hub / "value.txt").write_text("base\n")
+    _git(hub, "add", ".")
+    _git(hub, "commit", "-m", "base")
+    subprocess.run(
+        [BD, "init", "--non-interactive", "--prefix", "t", "--skip-agents", "--quiet"],
+        cwd=hub,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    beads = Beads(hub)
+    impl = beads.create("impl", labels=["unit:u1"], metadata={"unit": "u1", "kind": "impl"})
+    worktree = hub / ".claude" / "worktrees" / impl
+    worktree.parent.mkdir(parents=True)
+    _git(hub, "worktree", "add", str(worktree), "-b", f"worktree-{impl}", "main")
+    (worktree / "feature.txt").write_text("feature\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "feature")
+    output_commit = _git(worktree, "rev-parse", "HEAD")
+
+    beads.set_metadata(impl, {"output_commit": output_commit})
+    beads.close(impl, "done")
+    verify = beads.create(
+        "verify", labels=["unit:u1"], metadata={"unit": "u1", "kind": "verify-code", "parent": impl}
+    )
+    beads.set_metadata(verify, {"verdict": "verified", "attempt": "1"})
+    beads.close(verify, "verified")
+    envelope_dir = hub / ".helios" / "runs" / verify / "attempt-1"
+    envelope_dir.mkdir(parents=True)
+    (envelope_dir / "envelope.json").write_text(
+        Envelope(
+            task_id=verify,
+            attempt=1,
+            attempt_id=f"{verify}#1",
+            kind="verify-code",
+            harness="fake",
+            started_at="now",
+            base_commit=output_commit,
+            input_hashes={},
+            execution_status=ExecutionStatus.COMPLETED,
+            report=AgentReport(status=WorkStatus.DONE, summary="ok"),
+        ).model_dump_json()
+    )
+
+    project = ProjectConfig(worktrees=".claude/worktrees")
+    with pytest.raises(MergeError) as error:
+        merge_bead(
+            hub,
+            impl,
+            project=project,
+            beads=beads,
+            check_runner=lambda _c, _w: 1,
+            input_hashes=lambda _b: {},
+        )
+    assert error.value.code == 5
+
+    (worktree / "handfix.txt").write_text("fix\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "hand fix")
+
+    with pytest.raises(MergeError) as error2:
+        merge_bead(hub, impl, project=project, beads=beads, input_hashes=lambda _b: {})
+    assert error2.value.code == 2
+    assert str(error2.value).startswith("worktree HEAD")

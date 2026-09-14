@@ -49,7 +49,12 @@ class _DefaultRunner:
 
     def __call__(self, command: str, cwd: Path) -> int:
         proc = subprocess.run(
-            ["bash", "-c", command], cwd=cwd, capture_output=True, text=True, check=False
+            ["bash", "-c", command],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
         )
         self.last_output = proc.stdout + proc.stderr
         return proc.returncode
@@ -94,7 +99,7 @@ def _clean(path: Path, ignore_beads: bool = True) -> bool:
         if ("R" in code or "C" in code) and i < len(tokens):
             paths.append(tokens[i])
             i += 1
-        if ignore_beads and all(p == ".beads" or p.startswith(".beads/") for p in paths):
+        if ignore_beads and all(p.startswith(".beads/") for p in paths):
             continue
         return False
     return True
@@ -164,6 +169,45 @@ def _remove_worktree(hub: Path, path: Path, branch: str) -> None:
         proc = _git(hub, "branch", "-d", branch)
         if proc.returncode:
             raise MergeError(proc.stderr.strip() or "branch removal failed", 4)
+
+
+def _non_merge_patch_ids(cwd: Path, base: str, tip: str) -> list[str] | None:
+    """`git patch-id --stable` of each non-merge commit in `base..tip`, oldest first.
+
+    `None` when a merge commit sits in that range: a verified commit or its rebase
+    never contains one (SPEC 12 item 8).
+    """
+    if _git_output(cwd, "rev-list", "--min-parents=2", f"{base}..{tip}"):
+        return None
+    commits = _git_output(cwd, "rev-list", "--reverse", f"{base}..{tip}")
+    ids = []
+    for commit in commits.splitlines() if commits else []:
+        patch = _git(cwd, "show", commit)
+        if patch.returncode:
+            raise MergeError(patch.stderr.strip() or f"git show {commit} failed", 4)
+        patch_id = subprocess.run(
+            ["git", "patch-id", "--stable"],
+            cwd=cwd,
+            input=patch.stdout,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+        )
+        if patch_id.returncode:
+            raise MergeError(patch_id.stderr.strip() or "git patch-id failed", 4)
+        ids.append(patch_id.stdout.split()[0] if patch_id.stdout.split() else "")
+    return ids
+
+
+def _is_verified_commit(hub: Path, head: str, output_commit: str) -> bool:
+    """True when `head` is `output_commit` rebased: the same non-merge commits, in
+    order, by patch-id, since diverging from main (SPEC 12 item 8)."""
+    head_base = _git_output(hub, "merge-base", head, "main")
+    output_base = _git_output(hub, "merge-base", output_commit, "main")
+    head_ids = _non_merge_patch_ids(hub, head_base, head)
+    output_ids = _non_merge_patch_ids(hub, output_base, output_commit)
+    return head_ids is not None and head_ids == output_ids
 
 
 def _finish_step7(
@@ -255,35 +299,28 @@ def merge_bead(
         if not worktree_exists:
             raise MergeError(f"worktree missing for {bead_id}")
 
-        # Step 3's own main_before, computed fresh every call. When it matches the
-        # stored value from an earlier, not-yet-merge_commit-completed call, this is
-        # a rerun continuing that same attempt after a crash: its rebase may already
-        # have replayed the worktree onto main, changing its HEAD, so the checks
-        # below (which only make sense before the first rebase of an attempt) do
-        # not re-run against the now-superseded output_commit.
-        main_before = _git_output(hub, "rev-parse", "main")
-        continuing = not merge_commit_completed and str(bead.metadata.get("merge_main_before", "")) == main_before
-
-        if not continuing:
-            # Only a verified commit merges: the worktree must sit on its own
-            # branch, at exactly the commit the verify evidence covers.
-            current_branch = _git(worktree, "symbolic-ref", "--short", "HEAD")
-            if current_branch.returncode or current_branch.stdout.strip() != branch:
-                raise MergeError(f"worktree is not on branch {branch}")
-            head = _git_output(worktree, "rev-parse", "HEAD")
-            output_commit = bead.metadata.get("output_commit")
-            if head != output_commit:
-                raise MergeError(f"worktree HEAD {head} is not the verified output_commit {output_commit}")
-            # Diff against the merge base, falling back to git's well-known empty
-            # tree hash when the branch shares no history with main (an orphan
-            # branch), so this still lists every path the branch introduces.
-            merge_base = _git(hub, "merge-base", "main", branch)
-            base_ref = merge_base.stdout.strip() if merge_base.returncode == 0 else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-            diff_paths = _git_output(hub, "diff", "--name-only", base_ref, branch).splitlines()
-            if any(p == ".beads" or p.startswith(".beads/") for p in diff_paths):
-                raise MergeError("branch changes .beads/")
+        # Only a verified commit merges: the worktree must sit on its own branch,
+        # at exactly the commit the verify evidence covers, or that commit rebased
+        # (same non-merge commits, in order, by patch-id). Runs on every attempt.
+        current_branch = _git(worktree, "symbolic-ref", "--short", "HEAD")
+        if current_branch.returncode or current_branch.stdout.strip() != branch:
+            raise MergeError(f"worktree is not on branch {branch}")
+        head = _git_output(worktree, "rev-parse", "HEAD")
+        output_commit = str(bead.metadata.get("output_commit"))
+        if head != output_commit and not _is_verified_commit(hub, head, output_commit):
+            raise MergeError(f"worktree HEAD {head} is not the verified output_commit {output_commit}")
+        # Diff against the merge base, falling back to git's well-known empty tree
+        # hash when the branch shares no history with main (an orphan branch), so
+        # this still lists every path the branch introduces. --no-renames so a
+        # rename out of .beads/ still lists its old, .beads/ path.
+        merge_base = _git(hub, "merge-base", "main", branch)
+        base_ref = merge_base.stdout.strip() if merge_base.returncode == 0 else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        diff_paths = _git_output(hub, "diff", "--no-renames", "--name-only", base_ref, branch).splitlines()
+        if any(p == ".beads" or p.startswith(".beads/") for p in diff_paths):
+            raise MergeError("branch changes .beads/")
 
         # Step 3: record main_before, then rebase.
+        main_before = _git_output(hub, "rev-parse", "main")
         marker = f"[{bead_id}@{main_before}:"
         if dry_run:
             return 0, "would rebase, test, merge, push, and remove"
