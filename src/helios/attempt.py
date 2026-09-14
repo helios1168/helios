@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -310,18 +309,14 @@ def is_pid_alive(pid: int | None, pid_start: str | None = None) -> bool:
     (``os.killpg(pid, 0)`` succeeds or raises ``PermissionError``). A leader
     pid whose start time differs from ``pid_start`` is a reused pid: never
     live, and helios never signals it. A null ``pid_start`` falls back to
-    the process-group test alone. When the leader exists, ``ps`` is on
-    ``PATH``, but the read comes back null anyway (a 5 s timeout, or the
-    leader exits between the two checks so ``ps`` finds nothing), fall back
-    to the process-group test too, instead of reading the attempt as dead.
-    ``ps`` missing from ``PATH`` entirely is not covered by that fallback
-    (a follow-up): the attempt reads as not live.
+    the process-group test alone. When the leader exists but the read comes
+    back null anyway (``ps`` is missing, times out, or the leader exits
+    between the two checks so ``ps`` finds nothing), fall back to the
+    process-group test too, instead of reading the attempt as dead.
     """
     if pid is None:
         return False
     if pid_start is not None and _leader_exists(pid):
-        if shutil.which("ps") is None:
-            return False
         current = read_pid_start(pid)
         if current is not None:
             return current == pid_start

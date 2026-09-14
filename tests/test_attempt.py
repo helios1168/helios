@@ -279,14 +279,16 @@ def test_is_pid_alive_falls_through_when_leader_vanishes_before_ps_reports(
             time.sleep(0.1)
 
 
-def test_is_pid_alive_ps_missing_from_path_reads_not_live(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`ps` entirely missing from PATH is not covered by the item-3
-    fallback (a documented follow-up): the attempt reads as not live even
-    though the process group is genuinely alive."""
-    monkeypatch.setattr(att.shutil, "which", lambda name: None)
+def test_is_pid_alive_ps_missing_from_path_falls_through_to_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ps` entirely missing from PATH is still a null read: fall through
+    to the process-group test the same as a timeout or a vanished leader
+    (decision wins over the attack file's pre-fix follow-up note)."""
+    monkeypatch.setattr(att, "read_pid_start", lambda pid: None)
     proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
     try:
-        assert att.is_pid_alive(proc.pid, "whatever-start-time") is False
+        assert att.is_pid_alive(proc.pid, "whatever-start-time") is True
     finally:
         proc.kill()
         proc.wait()
