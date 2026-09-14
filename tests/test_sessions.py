@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -86,6 +88,41 @@ def test_say_cli_unexecutable_bd_is_failed_comment_exit_1(
     assert not (tmp_path / ".helios" / "events.jsonl").exists()
 
 
+@pytest.mark.parametrize("payload", [
+    '{"a": 1}',
+    "null",
+    "[1]",
+    '"str"',
+    '[{"text": "x"}]',
+    '[{"id": "c1", "issue_id": "b1", "author": "orchestrator", "text": "x", "extra": "z"}]',
+    '[{"id": "c1", "issue_id": "b1", "author": "orchestrator", "text": 5}]',
+])
+def test_say_cli_shape_wrong_bd_comments_json_is_failed_comment_exit_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, payload: str
+) -> None:
+    _attempt(tmp_path)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    payload_file = bin_dir / "comments.json"
+    payload_file.write_text(payload)
+    fake_bd = bin_dir / "bd"
+    fake_bd.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = comments ]; then /bin/cat "{payload_file}"; exit 0; fi\n'
+        "exit 0\n"
+    )
+    fake_bd.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["say", "b1", "hi"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("helios: ") and "Traceback" not in err
+    assert len(err.splitlines()) == 1
+    inbox = list((tmp_path / ".helios" / "runs" / "b1" / "inbox").glob("*.json"))
+    assert len(inbox) == 1
+    assert not (tmp_path / ".helios" / "events.jsonl").exists()
+
+
 def test_ps_rows_sort_filter_dead_state_events_and_unknowns(tmp_path: Path) -> None:
     first = _attempt(tmp_path, "b2", state="finalized", updated=None)
     _input(first, harness="fake", worktree="/wt")
@@ -157,6 +194,93 @@ def test_ps_text_shows_dash_for_non_string_harness_and_session(
     header, row = capsys.readouterr().out.splitlines()
     columns = dict(zip(header.split("\t"), row.split("\t")))
     assert columns["harness"] == "-" and columns["session"] == "-"
+
+
+def _expected_cell(value: str) -> str:
+    """The SPEC §9.2 text-output escaping, restated independently of `commands/ps.py`."""
+    text = value.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def test_ps_text_escapes_backslash_control_and_surrogate_exactly(tmp_path: Path) -> None:
+    _attempt(tmp_path, attempt_id="b1#\ud800", session_id="s\t1\n2")
+    _input(tmp_path / ".helios" / "runs" / "b1" / "attempt-1", harness="back\\slash", worktree="/wt")
+    proc = subprocess.run(
+        [sys.executable, "-c", "import sys; from helios.cli import main; sys.exit(main(['ps']))"],
+        cwd=tmp_path, capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.decode("utf-8").splitlines()
+    assert len(lines) == 2
+    columns = lines[1].split("\t")
+    assert len(columns) == 9
+    assert columns[3] == _expected_cell("back\\slash")
+    assert columns[5] == _expected_cell("b1#\ud800")
+    assert columns[8] == _expected_cell("back\\slash:s\t1\n2")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission bits")
+def test_ps_unreadable_runs_directory_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    runs = tmp_path / ".helios" / "runs"
+    runs.mkdir(parents=True)
+    runs.chmod(0o000)
+    try:
+        monkeypatch.chdir(tmp_path)
+        assert cli.main(["ps"]) == 1
+        err = capsys.readouterr().err
+        assert err.startswith("helios: ") and "Traceback" not in err
+    finally:
+        runs.chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission bits")
+def test_ps_unreadable_bead_directory_is_skipped_others_still_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _attempt(tmp_path, "b1")
+    bad = tmp_path / ".helios" / "runs" / "b2"
+    bad.mkdir()
+    bad.chmod(0o000)
+    try:
+        rows = sessions.rows(tmp_path, ".helios/runs", bead_store=FakeBeads([Bead(id="b1")]))
+        assert [row["bead"] for row in rows] == ["b1"]
+        monkeypatch.chdir(tmp_path)
+        assert cli.main(["ps"]) == 0
+    finally:
+        bad.chmod(0o755)
+
+
+def test_ps_reads_events_file_once_per_invocation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for i in range(5):
+        _attempt(tmp_path, f"b{i}")
+    events.append(tmp_path, source="helios", type="launched", bead="b0", attempt="b0#1")
+    store = FakeBeads([Bead(id=f"b{i}") for i in range(5)])
+    calls: list[Path] = []
+    original = Path.read_bytes
+
+    def counting(self: Path) -> bytes:
+        if self.name == "events.jsonl":
+            calls.append(self)
+        return original(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting)
+    rows = sessions.rows(tmp_path, ".helios/runs", bead_store=store)
+    assert len(rows) == 5
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("bad_id", ["..", "a/b", "", "a\nb", "x" * 201])
+@pytest.mark.parametrize("command", ["attach", "say", "stop"])
+def test_invalid_bead_id_rejected_before_any_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, command: str, bad_id: str
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    args = [command, bad_id, "hi"] if command == "say" else [command, bad_id]
+    assert cli.main(args) == 2
+    assert capsys.readouterr().err == f"helios: invalid bead id {bad_id}\n"
+    assert not (tmp_path / ".helios").exists()
 
 
 def test_ps_naive_and_future_age_are_safe_and_json_null(

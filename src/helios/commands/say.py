@@ -16,6 +16,9 @@ def add_arguments(parser) -> None:
 
 
 def run(args) -> int:
+    if not sessions.BEAD_ID_RE.fullmatch(args.bead):
+        print(f"helios: invalid bead id {args.bead}", file=sys.stderr)
+        return 2
     try:
         cfg = config.load(Path.cwd())
     except (OSError, TypeError, ValueError, RecursionError) as exc:
@@ -28,8 +31,8 @@ def run(args) -> int:
     try:
         msg_id, queued = messages.say(cfg.hub, cfg.project.runs, args.bead,
                                       args.text, kind=args.kind)
-    except (OSError, ValueError, RuntimeError) as exc:
-        print(f"helios: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"helios: {str(exc) or type(exc).__name__}", file=sys.stderr)
         return 1
     if queued:
         print(f"helios: queued {msg_id}", file=sys.stderr)

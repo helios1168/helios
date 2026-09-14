@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import tempfile
 from datetime import datetime, timezone
@@ -12,6 +13,8 @@ from typing import Any, Callable, cast
 
 from helios import attempt, beads, config, events
 from helios.harness.base import LaunchSpec
+
+BEAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 
 
 def _utc_seconds() -> str:
@@ -76,14 +79,16 @@ def _age(updated: Any, now: datetime | None = None) -> str | None:
     return f"{seconds // 86400}d"
 
 
-def _last_event(hub: Path, bead: str, attempt_id: str | None) -> str | None:
-    if not attempt_id:
-        return None
+def _event_index(hub: Path) -> dict[tuple[str, str], str] | None:
+    """Read the events file once, keeping the last string-typed line per (bead, attempt)
+    (SPEC §9.3). Reading and indexing once per `ps` invocation avoids re-scanning the file
+    for every row.
+    """
     try:
         lines = (hub / events.EVENT_PATH).read_bytes().split(b"\n")
     except OSError:
         return None
-    result = None
+    index: dict[tuple[str, str], str] = {}
     for raw_line in lines:
         try:
             line = raw_line.decode("utf-8")
@@ -95,10 +100,10 @@ def _last_event(hub: Path, bead: str, attempt_id: str | None) -> str | None:
             continue
         if not isinstance(value, dict):
             continue
-        if (value.get("bead") == bead and value.get("attempt") == attempt_id
-                and isinstance(value.get("type"), str)):
-            result = value.get("type")
-    return result
+        bead, attempt_id, kind = value.get("bead"), value.get("attempt"), value.get("type")
+        if isinstance(bead, str) and isinstance(attempt_id, str) and isinstance(kind, str):
+            index[(bead, attempt_id)] = kind
+    return index
 
 
 def _reject_constant(value: str) -> None:
@@ -114,8 +119,12 @@ def rows(hub: Path, runs_rel: str, *, bead_store: beads.BeadsLike | None = None,
     out: list[dict[str, Any]] = []
     store = bead_store or beads.Beads(hub)
     worktree_root = hub / config.load(hub).project.worktrees
+    event_index = _event_index(hub)
     for bead_dir in sorted((p for p in runs.iterdir() if p.is_dir()), key=lambda p: p.name):
-        directory = latest(runs, bead_dir.name)
+        try:
+            directory = latest(runs, bead_dir.name)
+        except PermissionError:
+            continue
         if directory is None:
             continue
         state = safe_state(directory)
@@ -140,7 +149,7 @@ def rows(hub: Path, runs_rel: str, *, bead_store: beads.BeadsLike | None = None,
                "age": _age(state.get("updated"), now),
                "worktree": str(worktree_root / bead_dir.name) if (worktree_root / bead_dir.name).is_dir() else None,
                "session": session, "alive": alive,
-               "last_event": _last_event(hub, bead_dir.name, attempt_id)}
+               "last_event": None if event_index is None else event_index.get((bead_dir.name, attempt_id))}
         out.append(row)
     return out
 

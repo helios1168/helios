@@ -14,6 +14,9 @@ def add_arguments(parser) -> None:
 
 
 def run(args) -> int:
+    if not sessions.BEAD_ID_RE.fullmatch(args.bead):
+        print(f"helios: invalid bead id {args.bead}", file=sys.stderr)
+        return 2
     try:
         cfg = config.load(Path.cwd())
         sessions.stop(cfg.hub, cfg.project.runs, args.bead)
