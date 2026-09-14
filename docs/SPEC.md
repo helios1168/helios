@@ -213,10 +213,13 @@ errors naming the dotted key. `templates/workflow.toml` is the commented templat
 | `memory.inject_cap_bytes` | `32000` | cap on injected memories and docs |
 | `tolerance.<tier>` | none | named numeric tolerances for skills and claims |
 
-Agent spec syntax: `harness` or `harness:profile`, or `other`. `other` resolves to the first
+Agent spec syntax: `harness` or `harness:profile`, or `other`. `other` is valid only for verify
+stages; `other` configured for a non-verify stage is a refusal. `other` resolves to the first
 harness in `agents.verify_order` that differs from the author's harness. The author is the
 `author` metadata of the parent bead, an agent spec; its harness is the part before any `:`, so
-author `claude:opus` excludes `claude`. The resolved harness is recorded on the bead.
+author `claude:opus` excludes `claude`. When no harness in `agents.verify_order` differs, the
+stage is refused with `helios: no harness in agents.verify_order differs from <harness>`. The
+resolved harness is recorded on the bead.
 
 ## 6. Harness adapters
 
@@ -733,25 +736,39 @@ line, `Status:` (`open`, `in-progress`, `done`, `dropped`), `Stages:`, and secti
 
 ### 10.2 `helios unit new <unit> "<title>" --stages s1,s2,... [--files glob,...] [--test CMD]`
 
-1. Validate. Every failure exits 2 with a message on stderr before anything is written:
-   - `<unit>` matches `^[A-Za-z0-9][A-Za-z0-9._-]*$`;
+`unit new` holds an exclusive, non-blocking `fcntl.flock` on
+`<hub>/<project.runs>/unit-<unit>.lock` from before step 1 until it exits. A held lock exits 2
+with `helios: unit <unit> is being created by another process`.
+
+1. Validate. Every failure exits 2 with a message on stderr before anything is written, the
+   lock file aside:
+   - `<unit>` matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` with `re.fullmatch`;
    - `--stages` split on `,` has no empty or duplicate items, every item is a stage id of §3
      except `remember` (it never blocks, so it gets no bead), and the items are strictly
      increasing in the row order of the §3 table;
    - a verify stage (`verify-math`, `verify-code`, `verify-validate`) has an earlier non-verify
      stage in the list, else `<stage> has no earlier stage to verify`;
-   - when `impl` or `validate` is present, `--files` (split on `,`, no empty items) and `--test`
-     are given;
-   - the unit file `<hub>/<project.units>/<unit>.md` does not exist.
+   - when `impl` or `validate` is present, `--files` (split on `,`, no empty items) and a
+     non-empty `--test` are given;
+   - every existing component of `<hub>/<project.units>` is a directory;
+   - the unit file `<hub>/<project.units>/<unit>.md` does not exist;
+   - every stage's author resolves (step 3).
 2. For each stage in order, reuse the bead that is not closed and carries labels `unit:<unit>`
    and `kind:<stage>`; else create one titled `<unit> <stage>: <title>` with those labels and
    metadata `unit`, `kind`, `author`, and for `impl` and `validate` `files` and `test`. Metadata
-   is passed as one JSON object so every value keeps its JSON type.
+   is passed as one JSON object so every value keeps its JSON type. When more than one bead that
+   is not closed carries both labels for a stage, exit 2 naming the stage and the bead ids,
+   before any bead is created.
 3. `author` is the resolved agent spec of §5 for the stage: `model` takes `agents.model`, `impl`
    and `validate` take `agents.implement`, each verify stage takes its `agents.verify_*` key, and
-   `frame`, `survey` and `report` take `agents.orchestrate`. `other` resolves against the author
-   of the stage's `parent` (the nearest earlier non-verify stage in the list), and the recorded
-   author is the harness name.
+   `frame`, `survey` and `report` take `agents.orchestrate`. `other` is valid only for verify
+   stages; `other` configured for a non-verify stage is a refusal. For a verify stage, `other`
+   resolves against the author of the stage's `parent` (the nearest earlier non-verify stage in
+   the list): the `author` metadata of the parent bead when step 2 reuses it, else the
+   configured author of the parent stage. When no harness in `agents.verify_order` differs from
+   the parent author's harness, the stage is refused with
+   `helios: no harness in agents.verify_order differs from <harness>`. The recorded author is
+   the harness name. Every refusal of steps 1 and 3 happens before any bd write.
 4. Chain in list order: `bd dep add <later> <earlier>` for each adjacent pair, skipping a
    dependency that already exists. A verify stage also records metadata `parent` = the bead of
    its parent stage.
@@ -760,7 +777,8 @@ line, `Status:` (`open`, `in-progress`, `done`, `dropped`), `Stages:`, and secti
    replaced in one `re.sub` pass, never `str.format`; `{stages}` is the stage ids joined with
    `,`. A crash before this step leaves no unit file, so a rerun reuses the beads made so far.
 6. Print to stdout a tab-separated table with the header line `bead`, `stage`, `author`,
-   `blocked-by` and one row per stage, `-` for none. Exit 0.
+   `blocked-by` and one row per stage, `-` for none. A reused bead shows its recorded `author`.
+   Exit 0.
 
 Exact `bd` flags are read from `bd <command> --help` and used only inside `helios.beads`.
 Tests run against a real `bd init` in a temporary repository when `bd` is on PATH, else skip.
