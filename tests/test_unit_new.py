@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import fcntl
+import os
 import re
 import shutil
 import subprocess
+import threading
 from argparse import Namespace
 from pathlib import Path
 from typing import Any, cast
@@ -17,7 +19,14 @@ from helios import cli
 from helios.beads import Bead, FakeBeads
 from helios.commands import unit_new
 from helios.config import AgentsConfig, Config
-from helios.units import StageRow, UnitNewError, create_unit, format_table
+from helios.units import (
+    StageRow,
+    UnitNewError,
+    UnitWriteError,
+    create_unit,
+    format_table,
+    unit_lock,
+)
 
 
 def _config(hub: Path, **agents: Any) -> Config:
@@ -675,7 +684,10 @@ def _symlink_hub(tmp_path: Path, kind: str) -> tuple[Path, Config]:
     elif kind == "symlink_file":
         notes.symlink_to(tmp_path / "afile")
     elif kind == "symlink_dir":
-        notes.symlink_to(tmp_path / "adir")
+        # Inside the hub: a symlink resolving outside the hub is its own
+        # refusal (round 3 decision), tested separately.
+        (hub / "realdir").mkdir()
+        notes.symlink_to(hub / "realdir")
     elif kind == "dangling":
         notes.symlink_to(tmp_path / "missing")
     elif kind == "loop":
@@ -707,7 +719,7 @@ def test_units_parent_valid_symlink_dir_accepted(tmp_path: Path) -> None:
         files=None, test=None,
     )
     assert len(rows) == 1
-    assert (tmp_path / "adir" / "units" / "U1.md").is_file()
+    assert (hub / "realdir" / "units" / "U1.md").is_file()
 
 
 def test_dangling_unit_file_refuses(tmp_path: Path) -> None:
@@ -791,14 +803,10 @@ def test_reused_parent_author_unusable_refuses(
     assert fake.argv_log == []
 
 
-# Round 3: a recorded non-blank author still resolves, and an explicit
-# profiled spec is recorded verbatim (only other resolves to a bare harness).
-@pytest.mark.parametrize(
-    "author,order,expect",
-    [("bogus", ("codex",), "codex"), ("opencode", ("opencode", "codex"), "codex")],
-)
-def test_reused_parent_author_records_and_resolves(
-    tmp_path: Path, author: str, order: tuple[str, ...], expect: str
+# Round 3: a known harness name is usable even when it is not in
+# agents.verify_order (round 3 decision item 1).
+def test_reused_parent_known_harness_resolves_without_verify_order(
+    tmp_path: Path,
 ) -> None:
     hub = _hub(tmp_path)
     fake = FakeBeads(
@@ -808,21 +816,55 @@ def test_reused_parent_author_records_and_resolves(
                     "id": "imp",
                     "labels": ["unit:U1", "kind:impl"],
                     "status": "open",
-                    "metadata": {"unit": "U1", "kind": "impl", "author": author},
+                    "metadata": {"unit": "U1", "kind": "impl", "author": "opencode"},
                 }
             )
         ]
     )
     rows = create_unit(
         beads=fake,
-        config=_config(hub, verify_order=order),
+        config=_config(hub, verify_order=("opencode", "codex")),
         unit="U1",
         title="T",
         stages="impl,verify-code",
         files="a",
         test="t",
     )
-    assert [(row.bead, row.author) for row in rows] == [("imp", author), ("fake-1", expect)]
+    assert [(row.bead, row.author) for row in rows] == [
+        ("imp", "opencode"),
+        ("fake-1", "codex"),
+    ]
+
+
+# Round 3: "bogus" no longer resolves (round 2 let it); it fails the item 1
+# usable-author regex, so a verify stage resolving `other` against it refuses.
+def test_reused_parent_bogus_author_now_refuses(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    fake = FakeBeads(
+        [
+            Bead.from_show(
+                {
+                    "id": "imp",
+                    "labels": ["unit:U1", "kind:impl"],
+                    "status": "open",
+                    "metadata": {"unit": "U1", "kind": "impl", "author": "bogus"},
+                }
+            )
+        ]
+    )
+    with pytest.raises(
+        UnitNewError, match=r"^parent bead imp has no usable author$"
+    ):
+        create_unit(
+            beads=fake,
+            config=_config(hub, verify_order=("codex",)),
+            unit="U1",
+            title="T",
+            stages="impl,verify-code",
+            files="a",
+            test="t",
+        )
+    assert fake.argv_log == []
 
 
 def test_explicit_profiled_spec_recorded_verbatim(tmp_path: Path) -> None:
@@ -864,3 +906,342 @@ def test_title_with_carriage_return_byte_exact(tmp_path: Path) -> None:
     assert raw == re.sub(
         rb"\{(unit|title|stages)\}", lambda match: values[match.group(1)], template
     )
+
+
+# ============================================================
+# Round 3 fix 3.
+# ============================================================
+
+# Item 1: usable author is `^(claude|codex|opencode|agy)(:[^\s]+)?$`,
+# independent of agents.verify_order; only required when a verify stage
+# resolves `other` against the parent.
+GRID_AUTHORS: list[tuple[Any, bool]] = [
+    (None, False),
+    ("", False),
+    ("   ", False),
+    ("bogus", False),
+    (" claude", False),
+    ("claude ", False),
+    (5, False),
+    (":opus", False),
+    ("opencode", True),
+    ("claude", True),
+    ("claude:opus", True),
+    ("codex", True),
+    ("agy:x", True),
+]
+
+
+@pytest.mark.parametrize("verify_spec", ["other", "agy"])
+@pytest.mark.parametrize("author,usable", GRID_AUTHORS, ids=[repr(a) for a, _ in GRID_AUTHORS])
+def test_usable_author_grid(
+    tmp_path: Path, verify_spec: str, author: Any, usable: bool
+) -> None:
+    hub = _hub(tmp_path)
+    meta: dict[str, Any] = {"unit": "U1", "kind": "impl"}
+    if author is not None:
+        meta["author"] = author
+    fake = FakeBeads(
+        [
+            Bead.from_show(
+                {
+                    "id": "imp",
+                    "labels": ["unit:U1", "kind:impl"],
+                    "status": "open",
+                    "metadata": meta,
+                }
+            )
+        ]
+    )
+    config = _config(
+        hub, verify_code=verify_spec, verify_order=("claude", "codex", "opencode", "agy")
+    )
+    kwargs: dict[str, Any] = dict(
+        beads=fake,
+        config=config,
+        unit="U1",
+        title="T",
+        stages="impl,verify-code",
+        files="a",
+        test="t",
+    )
+    if verify_spec == "agy":
+        # An explicit spec never needs the parent's author.
+        rows = create_unit(**kwargs)
+        assert rows[1].author == "agy"
+        return
+    if not usable:
+        with pytest.raises(
+            UnitNewError, match=r"^parent bead imp has no usable author$"
+        ):
+            create_unit(**kwargs)
+        assert fake.argv_log == []
+        return
+    rows = create_unit(**kwargs)
+    harness = str(author).split(":", 1)[0]
+    expect = next(h for h in config.agents.verify_order if h != harness)
+    assert rows[1].author == expect
+
+
+@pytest.mark.skipif(shutil.which("bd") is None, reason="bd is not on PATH")
+@pytest.mark.parametrize("author", ["bogus", ":opus"])
+def test_real_bd_unusable_author_refuses(tmp_path: Path, author: str) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["bd", "init", "--non-interactive"], cwd=tmp_path, check=True, capture_output=True
+    )
+    from helios.beads import Beads
+    from helios.config import load
+
+    config = load(tmp_path)
+    real_beads = Beads(tmp_path)
+    imp_id = real_beads.create(
+        "U8 impl: T",
+        labels=["unit:U8", "kind:impl"],
+        metadata={"unit": "U8", "kind": "impl", "author": author},
+        type="task",
+        description="",
+    )
+    with pytest.raises(
+        UnitNewError, match=rf"^parent bead {imp_id} has no usable author$"
+    ):
+        create_unit(
+            beads=real_beads,
+            config=config,
+            unit="U8",
+            title="T",
+            stages="impl,verify-code",
+            files="a",
+            test="t",
+        )
+
+
+# Item 2: the units path can change between step 1 and step 5 (TOCTOU); step
+# 5 repeats the step 1 path checks (including hub containment) right before
+# writing, and any failure there is `cannot write unit file <path>: <message>`
+# at exit 1, with the beads already created left in place.
+class _SwapOnFirstCreate(FakeBeads):
+    """Mutates the filesystem once, on the first `create`, then behaves."""
+
+    def __init__(self, swap: Any) -> None:
+        super().__init__()
+        self._swap = swap
+        self._done = False
+
+    def create(
+        self,
+        title: str,
+        *,
+        labels: list[str],
+        metadata: dict[str, Any],
+        type: str = "task",
+        description: str = "",
+    ) -> str:
+        if not self._done:
+            self._done = True
+            self._swap()
+        return super().create(
+            title, labels=labels, metadata=metadata, type=type, description=description
+        )
+
+
+def test_toctou_units_dir_swapped_to_dangling_symlink(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    fake = _SwapOnFirstCreate(
+        lambda: (hub / "docs").symlink_to(hub / "missing-target")
+    )
+    with pytest.raises(UnitWriteError) as excinfo:
+        create_unit(
+            beads=fake, config=_config(hub), unit="U1", title="T", stages="model",
+            files=None, test=None,
+        )
+    unit_path = _unit_path(hub)
+    assert str(excinfo.value) == (
+        f"cannot write unit file {unit_path}: "
+        f"units directory component is a broken symlink: {hub / 'docs'}"
+    )
+    assert not unit_path.exists()
+    assert len(fake.beads) == 1  # the bead created before the swap stays
+
+
+def test_toctou_units_dir_swapped_to_file(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    fake = _SwapOnFirstCreate(lambda: (hub / "docs").write_text("x", encoding="utf-8"))
+    with pytest.raises(UnitWriteError) as excinfo:
+        create_unit(
+            beads=fake, config=_config(hub), unit="U1", title="T", stages="model",
+            files=None, test=None,
+        )
+    unit_path = _unit_path(hub)
+    assert str(excinfo.value) == (
+        f"cannot write unit file {unit_path}: "
+        f"units directory component is not a directory: {hub / 'docs'}"
+    )
+    assert not unit_path.exists()
+    assert len(fake.beads) == 1
+
+
+def test_toctou_units_dir_swapped_outside_hub(tmp_path: Path) -> None:
+    # `_hub` makes tmp_path itself the hub, so a sibling of tmp_path is used
+    # here instead, to keep "outside" genuinely outside the hub.
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    (hub / ".git").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    fake = _SwapOnFirstCreate(lambda: (hub / "docs").symlink_to(outside))
+    with pytest.raises(UnitWriteError) as excinfo:
+        create_unit(
+            beads=fake, config=_config(hub), unit="U1", title="T", stages="model",
+            files=None, test=None,
+        )
+    unit_path = _unit_path(hub)
+    assert str(excinfo.value) == (
+        f"cannot write unit file {unit_path}: "
+        f"units directory resolves outside the hub: {hub / 'docs' / 'units'}"
+    )
+    assert not unit_path.exists()
+    assert not (outside / "units" / "U1.md").exists()
+    assert len(fake.beads) == 1
+
+
+def test_toctou_command_exits_1_not_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hub = _hub(tmp_path)
+    monkeypatch.chdir(hub)
+    fake = _SwapOnFirstCreate(lambda: (hub / "docs").write_text("x", encoding="utf-8"))
+    monkeypatch.setattr(beads_mod, "Beads", lambda cwd: fake)
+    args = Namespace(unit="U1", title="T", stages="model", files=None, test=None)
+    assert unit_new.run(args) == 1
+    err = capsys.readouterr().err
+    assert err == (
+        f"helios: cannot write unit file {_unit_path(hub)}: "
+        f"units directory component is not a directory: {hub / 'docs'}\n"
+    )
+
+
+# Item 3: the units directory must be writable (checked on its deepest
+# existing component), refused before any bd write.
+@pytest.mark.skipif(os.geteuid() == 0, reason="running as root")
+def test_units_dir_not_writable_refuses(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    docs = hub / "docs"
+    docs.mkdir()
+    docs.chmod(0o555)
+    try:
+        fake = FakeBeads()
+        with pytest.raises(
+            UnitNewError, match=rf"^units directory is not writable: {re.escape(str(docs))}$"
+        ):
+            _run_ok(fake=fake, hub=hub, stages="model", files=None, test=None)
+        assert fake.argv_log == []
+    finally:
+        docs.chmod(0o755)
+
+
+# Item 4: the lock file must be a regular file; a FIFO, a symlink (dangling
+# or to a real file), or anything else O_NOFOLLOW rejects all refuse quickly
+# instead of hanging or accepting a bogus lock.
+def _lock_attempt(hub: Path, unit: str, out: list[BaseException | None]) -> None:
+    try:
+        with unit_lock(hub, ".helios/runs", unit):
+            pass
+        out.append(None)
+    except BaseException as exc:  # noqa: BLE001 - captured across a thread
+        out.append(exc)
+
+
+def test_lock_fifo_refuses_within_two_seconds(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    runs = hub / ".helios" / "runs"
+    runs.mkdir(parents=True)
+    os.mkfifo(runs / "unit-U1.lock")
+    result: list[BaseException | None] = []
+    thread = threading.Thread(target=_lock_attempt, args=(hub, "U1", result))
+    thread.start()
+    thread.join(timeout=2)
+    assert not thread.is_alive(), "lock attempt on a FIFO hung"
+    assert isinstance(result[0], UnitNewError)
+    assert str(result[0]) == f"cannot lock {runs / 'unit-U1.lock'}: not a regular file"
+
+
+def test_lock_dangling_symlink_refuses(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    runs = hub / ".helios" / "runs"
+    runs.mkdir(parents=True)
+    lock = runs / "unit-U1.lock"
+    lock.symlink_to(runs / "missing")
+    with pytest.raises(
+        UnitNewError, match=rf"^cannot lock {re.escape(str(lock))}: not a regular file$"
+    ):
+        with unit_lock(hub, ".helios/runs", "U1"):
+            pass
+
+
+def test_lock_symlink_to_regular_file_refuses(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    runs = hub / ".helios" / "runs"
+    runs.mkdir(parents=True)
+    target = runs / "target"
+    target.write_text("", encoding="utf-8")
+    lock = runs / "unit-U1.lock"
+    lock.symlink_to(target)
+    with pytest.raises(
+        UnitNewError, match=rf"^cannot lock {re.escape(str(lock))}: not a regular file$"
+    ):
+        with unit_lock(hub, ".helios/runs", "U1"):
+            pass
+
+
+def test_lock_directory_refuses(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    runs = hub / ".helios" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "unit-U1.lock").mkdir()
+    with pytest.raises(UnitNewError, match=r"^cannot lock "):
+        with unit_lock(hub, ".helios/runs", "U1"):
+            pass
+
+
+# Item 5: a reused bead's row shows its recorded author, or `-` when it has
+# none, for any stage kind, not only a verify stage resolving `other`.
+def test_reused_bead_with_no_author_shows_dash(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    fake = FakeBeads(
+        [
+            Bead(
+                id="b-frame",
+                labels=["unit:U1", "kind:frame"],
+                status="open",
+                metadata={"unit": "U1", "kind": "frame"},
+            )
+        ]
+    )
+    rows = create_unit(
+        beads=fake, config=_config(hub), unit="U1", title="T", stages="frame",
+        files=None, test=None,
+    )
+    assert [(row.bead, row.author) for row in rows] == [("b-frame", "-")]
+
+
+@pytest.mark.parametrize("author", ["", "   "])
+def test_reused_bead_with_blank_author_shows_dash(tmp_path: Path, author: str) -> None:
+    hub = _hub(tmp_path)
+    fake = FakeBeads(
+        [
+            Bead.from_show(
+                {
+                    "id": "b-frame",
+                    "labels": ["unit:U1", "kind:frame"],
+                    "status": "open",
+                    "metadata": {"unit": "U1", "kind": "frame", "author": author},
+                }
+            )
+        ]
+    )
+    rows = create_unit(
+        beads=fake, config=_config(hub), unit="U1", title="T", stages="frame",
+        files=None, test=None,
+    )
+    assert [(row.bead, row.author) for row in rows] == [("b-frame", "-")]

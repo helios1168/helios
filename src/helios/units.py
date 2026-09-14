@@ -53,10 +53,18 @@ _VERIFY_AGENT_KEY: dict[str, str] = {
 
 _UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _PLACEHOLDER_RE = re.compile(r"\{(unit|title|stages)\}")
+_USABLE_AUTHOR_RE = re.compile(r"^(claude|codex|opencode|agy)(:[^\s]+)?$")
 
 
 class UnitNewError(Exception):
     """A SPEC §10.2 refusal; the command prints it with ``helios: `` and exits 2."""
+
+
+class UnitWriteError(Exception):
+    """A step 5 failure after beads exist (round 3 decision); the command
+    prints it with ``helios: `` and exits 1. The beads already created stay;
+    a rerun follows the normal step 5 rerun rule.
+    """
 
 
 class UnitBeads(Protocol):
@@ -92,14 +100,26 @@ def unit_lock(hub: Path, runs_dir: str, unit: str) -> Iterator[None]:
 
     The caller validates the unit id first, so the lock path never uses an
     unvalidated id. A lock file that cannot be created or locked for any
-    reason other than "held" refuses; the lock is never skipped.
+    reason other than "held" refuses; the lock is never skipped. The path is
+    opened with ``O_NOFOLLOW`` (round 3 decision: a symlink, including a
+    dangling one, refuses rather than opening its target) and the open file
+    must be a regular file, so a FIFO does not hang the open and a directory
+    or device does not pass as a lock.
     """
     path = hub / runs_dir / f"unit-{unit}.lock"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(path, "a")
+        fd = os.open(
+            path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644
+        )
     except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise UnitNewError(f"cannot lock {path}: not a regular file") from None
         raise UnitNewError(f"cannot lock {path}: {_error_text(exc)}") from None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise UnitNewError(f"cannot lock {path}: not a regular file")
+    handle = os.fdopen(fd, "r+")
     with handle:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -168,9 +188,68 @@ def _resolve_author(
 
 
 def _recorded_author(bead: Bead) -> str | None:
-    """The bead's recorded author metadata, None when missing or empty."""
-    author = bead.author or bead.metadata.get("author")
-    return author if isinstance(author, str) and author else None
+    """The bead's recorded ``author``, from ``.author`` or the raw metadata.
+
+    ``Bead.author`` already carries a from-JSON bead's author as text; a bead
+    built directly with only ``metadata`` set (as tests do) falls back to the
+    metadata dict. Only a string value counts as recorded.
+    """
+    if bead.author:
+        return bead.author
+    value = bead.metadata.get("author")
+    return value if isinstance(value, str) else None
+
+
+def _display_author(bead: Bead) -> str:
+    """A reused bead's row author: its recorded author, or ``-`` when it has
+    none (round 3 decision: missing, empty or whitespace-only counts as none;
+    a recorded but unusable value such as ``bogus`` still displays as is).
+    """
+    recorded = _recorded_author(bead)
+    return "-" if recorded is None or recorded.strip() == "" else recorded
+
+
+def _check_units_writable(*, hub: Path, units: str) -> None:
+    """Refuse when the deepest existing units-dir component is not writable.
+
+    Round 3 decision: ``os.access(<deepest existing component>, os.W_OK |
+    os.X_OK)``, checked before any bd write.
+    """
+    node = hub
+    for part in Path(units).parts:
+        candidate = node / part
+        if not os.path.lexists(candidate):
+            break
+        node = candidate
+    if not os.access(node, os.W_OK | os.X_OK):
+        raise UnitNewError(f"units directory is not writable: {node}")
+
+
+def _check_hub_containment(*, hub: Path, units: str) -> None:
+    """Refuse when the units directory resolves outside the hub.
+
+    Round 3 decision: symlinks are followed with ``os.path.realpath``; the
+    resolved path must lie inside the resolved hub. Checked in step 1 and
+    again in step 5, immediately before writing, to close the TOCTOU window
+    where the units path changes while beads are created.
+    """
+    hub_real = os.path.realpath(hub)
+    units_real = os.path.realpath(hub / units)
+    if units_real != hub_real and not units_real.startswith(hub_real + os.sep):
+        raise UnitNewError(f"units directory resolves outside the hub: {hub / units}")
+
+
+def _check_paths(*, hub: Path, units: str, unit_path: Path) -> None:
+    """All SPEC §10.2 step 1 path checks; step 5 repeats these before writing
+    (round 3 decision), so the units directory and unit file are re-checked
+    against the filesystem as it is right before the write, not as it was at
+    step 1.
+    """
+    _check_units_dir(hub=hub, units=units)
+    _check_units_writable(hub=hub, units=units)
+    _check_hub_containment(hub=hub, units=units)
+    if os.path.lexists(unit_path):
+        raise UnitNewError(f"unit file already exists: {unit_path}")
 
 
 def _check_units_dir(*, hub: Path, units: str) -> None:
@@ -250,9 +329,7 @@ def _validate(
             raise UnitNewError("--files has an empty item")
         if test is None or test.strip() == "":
             raise UnitNewError("--test is required when impl or validate is present")
-    _check_units_dir(hub=hub, units=units)
-    if os.path.lexists(unit_path):
-        raise UnitNewError(f"unit file already exists: {unit_path}")
+    _check_paths(hub=hub, units=units, unit_path=unit_path)
     return stages, files
 
 
@@ -312,7 +389,7 @@ def create_unit(
                 parent_bead = reused[parent]
                 if parent_bead is not None:
                     recorded = _recorded_author(parent_bead)
-                    if recorded is None or recorded.strip() == "":
+                    if recorded is None or _USABLE_AUTHOR_RE.fullmatch(recorded) is None:
                         raise UnitNewError(
                             f"parent bead {parent_bead.id} has no usable author"
                         )
@@ -366,21 +443,26 @@ def create_unit(
         # loop adds each edge once in effect.
         beads.dep_add(later, earlier)
     text = _render_template(unit=unit, title=title, stages=stage_ids)
-    unit_path.parent.mkdir(parents=True, exist_ok=True)
     try:
+        _check_paths(hub=config.hub, units=units_dir, unit_path=unit_path)
+        unit_path.parent.mkdir(parents=True, exist_ok=True)
         with open(unit_path, "x", encoding="utf-8") as handle:
             handle.write(text)
-    except FileExistsError:
-        raise UnitNewError(f"unit file already exists: {unit_path}") from None
+    except UnitNewError as exc:
+        raise UnitWriteError(f"cannot write unit file {unit_path}: {exc}") from None
+    except OSError as exc:
+        raise UnitWriteError(
+            f"cannot write unit file {unit_path}: {_error_text(exc)}"
+        ) from None
     rows: list[StageRow] = []
     for i, (bead_id, stage) in enumerate(zip(bead_ids, stage_ids)):
         hit = reused[i]
-        recorded = _recorded_author(hit) if hit is not None else None
+        author_display = _display_author(hit) if hit is not None else authors[i]
         rows.append(
             StageRow(
                 bead=bead_id,
                 stage=stage,
-                author=recorded or authors[i],
+                author=author_display,
                 blocked_by=bead_ids[i - 1] if i else None,
             )
         )

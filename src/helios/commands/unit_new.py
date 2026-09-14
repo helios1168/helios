@@ -55,5 +55,8 @@ def run(args: argparse.Namespace) -> int:
     except units.UnitNewError as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2
+    except units.UnitWriteError as exc:
+        print(f"helios: {exc}", file=sys.stderr)
+        return 1
     sys.stdout.write(units.format_table(rows))
     return 0
