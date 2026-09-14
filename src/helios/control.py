@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from helios.beads import Bead, BeadsLike
-from helios.envelope import Envelope
+from helios.envelope import Envelope, ExecutionStatus, Verdict, WorkStatus, overall_verdict
 from helios.stages import STAGES, VERIFY_STAGES
 
 
@@ -28,29 +28,46 @@ def candidates(beads: BeadsLike, unit: str | None = None) -> list[Bead]:
     ]
 
 
-def envelope_line(envelope: Envelope | dict[str, Any]) -> str:
-    """Render the exact one-line envelope summary used by ``next``."""
-    data = envelope if isinstance(envelope, dict) else envelope.model_dump(mode="json")
-    report = data.get("report") or {}
+def envelope_line(envelope: Envelope) -> str:
+    """Render the exact one-line envelope summary used by ``next``.
+
+    The verdict column is ``overall_verdict(report.findings)`` (SPEC section 4.2), never a
+    field read off the report directly, since ``AgentReport`` carries no ``verdict`` of its
+    own.
+    """
+    report = envelope.report
+    verdict = overall_verdict(report.findings) if report is not None else None
     return "\t".join(
         [
-            str(data.get("attempt_id", "")),
-            str(data.get("execution_status", "")),
-            str(report.get("status") or "-"),
-            str(report.get("verdict") or "-"),
-            str(report.get("summary") or "-"),
+            envelope.attempt_id,
+            str(envelope.execution_status),
+            str(report.status) if report is not None else "-",
+            str(verdict) if verdict is not None else "-",
+            (report.summary if report is not None and report.summary else "-"),
         ]
     )
 
 
-def _run_one(
+def _execute(
     bead: Bead,
     run: Callable[[Bead], int],
-    read_envelope: Callable[[Bead], Envelope | dict[str, Any]],
-) -> tuple[int, Envelope | dict[str, Any], str]:
-    code = int(run(bead))
-    envelope = read_envelope(bead)
-    return code, envelope, envelope_line(envelope)
+    read_envelope: Callable[[Bead], Envelope | None],
+) -> tuple[int, Envelope | None]:
+    """Run ``bead`` and read its envelope, converting either callable's exception.
+
+    A raising ``run`` or ``read_envelope`` is an execution failure (SPEC section 7.1 exit
+    code 4), reported as ``execution failure for <bead>: <exception type>: <message>``.
+    """
+    try:
+        code = int(run(bead))
+        envelope = read_envelope(bead)
+    except Exception as exc:
+        raise ExecutionFailure(f"execution failure for {bead.id}: {type(exc).__name__}: {exc}") from exc
+    return code, envelope
+
+
+class ExecutionFailure(Exception):
+    """A run or its envelope could not be produced; carries the SPEC section 7.1 reason."""
 
 
 def next_bead(
@@ -59,15 +76,20 @@ def next_bead(
     unit: str | None,
     stop_at: tuple[str, ...],
     run: Callable[[Bead], int],
-    read_envelope: Callable[[Bead], Envelope | dict[str, Any]],
+    read_envelope: Callable[[Bead], Envelope | None],
 ) -> int:
     """Run the first candidate not covered by ``stop_at`` (SPEC section 11)."""
     bead = next((b for b in candidates(beads, unit) if b.kind not in stop_at), None)
     if bead is None:
         print("helios: no ready bead", file=sys.stderr)
         return 3
-    code, _envelope, line = _run_one(bead, run, read_envelope)
-    print(line)
+    try:
+        code, envelope = _execute(bead, run, read_envelope)
+    except ExecutionFailure as exc:
+        print(f"helios: {exc}", file=sys.stderr)
+        return 4
+    if envelope is not None:
+        print(envelope_line(envelope))
     return code
 
 
@@ -98,9 +120,19 @@ def unit_run(
     stop_at: tuple[str, ...],
     until: str | None,
     run: Callable[[Bead], int],
-    read_envelope: Callable[[Bead], Envelope | dict[str, Any]],
+    read_envelope: Callable[[Bead], Envelope | None],
 ) -> UnitResult:
-    """Run a unit until a SPEC section 11 stopping condition."""
+    """Run a unit until a SPEC section 11 stopping condition.
+
+    After a run, the stop checks apply in this fixed order (Decided, binding):
+    1. execution failure: no envelope, or ``execution_status`` is not ``completed``.
+    2. ``impl`` and ``validate`` kinds: report status other than ``done``.
+    3. verify kinds (``helios.stages.VERIFY_STAGES``): verdict other than ``verified``,
+       judged on the report's findings, never on its status.
+    4. any other nonzero run code (a failed helios check).
+    5. the bead's kind is the ``until`` stage.
+    Kinds that are neither ``impl``, ``validate`` nor a verify kind skip checks 2 and 3.
+    """
     if default not in {"manual", "until", "auto"}:
         raise ControlError(f"unknown control.default {default}")
     effective_until = validate_until(beads, unit, until)
@@ -130,34 +162,37 @@ def unit_run(
             return UnitResult(3, reason)
         seen.add(bead.id)
         try:
-            code, envelope, line = _run_one(bead, run, read_envelope)
-        except Exception as exc:
-            reason = f"execution failure for {bead.id}: {exc}"
+            code, envelope = _execute(bead, run, read_envelope)
+        except ExecutionFailure as exc:
+            reason = str(exc)
             print(f"stopped: {reason}")
-            return UnitResult(1, reason)
-        print(line)
+            return UnitResult(4, reason)
         last_code = code
-        data = envelope if isinstance(envelope, dict) else envelope.model_dump(mode="json")
-        report = data.get("report") or {}
-        # Report content decides the stop reason before the run's own exit code
-        # does, so a report of "done" with a nonzero code (a failed helios check)
-        # still reads as an execution failure rather than a false report mismatch.
-        if report.get("status") != "done":
-            reason = f"bead {bead.id} report status {report.get('status') or '-'}"
+        if envelope is not None:
+            print(envelope_line(envelope))
+
+        if envelope is None or envelope.execution_status != ExecutionStatus.COMPLETED:
+            detail = envelope.execution_status if envelope is not None else "missing envelope"
+            reason = f"execution failure for {bead.id}: {detail}"
+            print(f"stopped: {reason}")
+            return UnitResult(4, reason)
+
+        report = envelope.report  # completed always carries a report (Envelope's own rule)
+        assert report is not None
+        if bead.kind in ("impl", "validate") and report.status != WorkStatus.DONE:
+            reason = f"bead {bead.id} report status {report.status}"
             print(f"stopped: {reason}")
             return UnitResult(code, reason)
-        if bead.kind in VERIFY_STAGES and report.get("verdict") != "verified":
-            reason = f"bead {bead.id} verdict {report.get('verdict') or '-'}"
-            print(f"stopped: {reason}")
-            return UnitResult(code, reason)
+        if bead.kind in VERIFY_STAGES:
+            verdict = overall_verdict(report.findings)
+            if verdict != Verdict.VERIFIED:
+                reason = f"bead {bead.id} verdict {verdict if verdict is not None else '-'}"
+                print(f"stopped: {reason}")
+                return UnitResult(code, reason)
         if code != 0:
-            reason = f"execution failure for {bead.id}"
+            reason = f"bead {bead.id} run exited {code}"
             print(f"stopped: {reason}")
             return UnitResult(code, reason)
         if effective_until == bead.kind:
             print("stopped: until stage reached")
             return UnitResult(0, "until stage reached")
-        if default == "auto" and until is None and bead.kind in stop_at:
-            reason = f"stop_at stage {bead.kind}"
-            print(f"stopped: {reason}")
-            return UnitResult(3, reason)

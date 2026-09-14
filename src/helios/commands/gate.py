@@ -7,7 +7,7 @@ from pathlib import Path
 
 from helios.beads import Beads
 from helios.config import load
-from helios.gates import open_gates
+from helios.gates import GateError, open_gates
 
 NAME = "gate"
 HELP = "list open gates"
@@ -19,10 +19,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run(args: argparse.Namespace) -> int:
     try:
-        gates = open_gates(Beads(load(Path.cwd()).hub))
+        config = load(Path.cwd())
     except (ValueError, TypeError, RecursionError) as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2
+    try:
+        gates = open_gates(Beads(config.hub))
+    except GateError:
+        print("helios: unexpected bd gate output", file=sys.stderr)
+        return 1
     if args.json:
         print(json.dumps(gates))
     else:

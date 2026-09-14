@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
 from pathlib import Path
-from typing import Any
 
 from helios import control
+from helios.attempt import existing_attempts, runs_dir
 from helios.beads import Beads, Bead
 from helios.config import load
+from helios.envelope import Envelope
 
 NAME = "unit run"
 HELP = "run a unit"
@@ -34,8 +36,25 @@ def run(args: argparse.Namespace) -> int:
 
 
 def run_bead(bead: Bead) -> int:
-    raise NotImplementedError("helios run is supplied by the run command")
+    """Dispatch through ``helios.run`` (SPEC section 7.1).
+
+    Imported lazily: hel-6ks, which adds that module, is not on main yet. A missing
+    module surfaces as a normal execution failure (control.py).
+    """
+    config = load(Path.cwd())
+    beads = Beads(config.hub)
+    run_many = importlib.import_module("helios.run").run_many
+    return int(run_many([bead.id], hub=config.hub, beads=beads, config=config))
 
 
-def read_envelope(bead: Bead) -> dict[str, Any]:
-    raise NotImplementedError("helios run is supplied by the run command")
+def read_envelope(bead: Bead) -> Envelope | None:
+    """The envelope of the bead's highest attempt, or None (SPEC section 8.3)."""
+    config = load(Path.cwd())
+    bead_runs = runs_dir(config.hub, config.project.runs, bead.id)
+    numbers = existing_attempts(bead_runs)
+    if not numbers:
+        return None
+    path = bead_runs / f"attempt-{numbers[-1]}" / "envelope.json"
+    if not path.is_file():
+        return None
+    return Envelope.model_validate_json(path.read_text())
