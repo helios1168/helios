@@ -234,7 +234,12 @@ processes. `helios.harness.get(name) -> Harness` returns the adapter.
 
 ### 6.2 Report capture, same for every harness
 
-1. The prompt names `report_path` and embeds the report schema (§7.2).
+1. The prompt names `report_path` and embeds the report schema (§7.2). The schema,
+   `schemas/agent-report.schema.json`, is generated in the strict form OpenAI structured outputs
+   require: every object lists all its properties in `required`, sets `additionalProperties:
+   false`, drops `default`, makes each formerly optional property nullable, and a `$ref` carries
+   no sibling keys. A null for a property whose model type forbids null is treated as absent
+   during validation.
 2. Where the harness has a native schema channel, the adapter passes the schema and returns the
    structured result in `NativeResult.structured`.
 3. helios takes the native structured result when present, else the report file. When both
@@ -283,7 +288,8 @@ never resolved. `[extra_args]` is `spec.extra_args`, one element each.
   `item.type` of `error` is a warning, not a failure), then `turn.completed` or, on failure,
   `error` (`message`) and `turn.failed` (`error.message`) with exit code 1. The structured
   result is the JSON in the `-o` file, which is not written when the turn fails. Never
-  `--last`. Attach: `codex resume <session_id>`.
+  `--last`. Attach: `codex resume <session_id>`. codex enforces OpenAI strict structured outputs,
+  so `<schema path>` is the strict-form schema of §6.2.
 - **opencode**: `opencode run --format json --dir <worktree> --title <bead>#<attempt> [-m M]
   [--variant E] [--attach <server_url>] [-s <session_id>] --auto [extra_args] <prompt>`, with
   `<server_url>` from `spec.server_url`. The title is the same on a resume, and a resume keeps
@@ -400,7 +406,8 @@ These apply to claude, codex, opencode and agy.
    - `skills/<kind>/SKILL.md` exists in the hub for the bead kind;
    - the bead is not closed;
    - the latest attempt of the bead is finalized, unless recovery (§8.4) applies.
-3. Resolve the harness (§5). `--harness` overrides.
+3. Resolve the harness (§5). `--harness` overrides. Then, unless the bead is already closed
+   (which helios never reopens), set its status to `in_progress`.
 4. Prepare the worktree (§7.3).
 5. Allocate the attempt (§8).
 6. Assemble the prompt (§7.2); write `prompt.md` and `input.json`. `input.json` is a JSON
@@ -491,7 +498,7 @@ recovery (§8.4) and prints the recovery action instead. The attempt path is the
 would use: the existing attempt when recovery resumes it, else the next `n`. For a resumed
 attempt the prompt size is that of its stored `prompt.md`. When the bead lock is held or the latest
 attempt is live, it prints the refusal and exits 2. It creates, moves or writes nothing,
-including bead updates and events.
+including bead updates (the status change of step 3 included) and events.
 Several beads run in parallel up to `--max-parallel` (default 3).
 
 ### 7.2 Prompt assembly
@@ -696,9 +703,12 @@ exit 2, before any filesystem or `bd` access.
   (`<harness>:<session_id>` when `harness` is a string, else `-`).
   Text output is tab-separated with that header line; `state` shows the stored state, plus
   ` (dead)` when the state is `launched` and the pid is not alive. Each field of a text row is
-  rendered by replacing `\` with `\\`, tab with `\t`, LF with `\n`, CR with `\r`, then encoding
-  as UTF-8 with `backslashreplace` and decoding back, so a row is always exactly one line with
-  the header's column count; `--json` is unaffected, since `json.dumps` already escapes. The
+  rendered by replacing `\` with `\\`, tab with `\t`, LF with `\n`, CR with `\r`, `\x0b` with
+  `\\x0b`, `\x0c` with `\\x0c`, `\x1c` with `\\x1c`, `\x1d` with `\\x1d`, `\x1e` with `\\x1e`,
+  `\x85` with `\\x85`, U+2028 with `\\u2028` and U+2029 with `\\u2029`, then encoding as
+  `sys.stdout.encoding` (utf-8 when unset) with `backslashreplace` and decoding back, so a row is
+  always exactly one line with the header's column count; `--json` is unaffected, since
+  `json.dumps` already escapes. The
   events file is read and indexed once per `ps` invocation, not once per row, by the exact
   selection rules below. Age is now minus `updated`:
   under 60 s `<n>s`, under 60 min `<n>m`, under 24 h `<n>h`, else `<n>d`, whole units rounded
@@ -728,11 +738,13 @@ exit 2, before any filesystem or `bd` access.
   function are parameters of the library function, so tests inject them.
 - `helios say <bead> "<text>" [--kind steer|answer]`: `--kind` defaults to `steer`. Text that
   starts with `-` must follow `--` on the command line (`helios say <bead> -- "-text"`). A bead
-  with no directory under `<runs>`, or with no attempt directory, exits 2. Otherwise `say`
-  always writes the message first (§9.4), then adds the comment `<kind>: [<msg_id>] <text>`
-  with the replay rule of §7.5, then appends the event with type `<kind>`, source
-  `orchestrator` and detail `<msg_id>`. The event's `attempt` field is the attempt id of the
-  highest attempt as §8.3 reads it; the comment keeps the format `<kind>: [<msg_id>] <text>`
+  with no directory under `<runs>`, or with no attempt directory, exits 2. An `OSError` while
+  reading the latest attempt's session state prints `helios: <message>` to stderr and exits 1.
+  Otherwise `say` always writes the message first (§9.4), then adds the comment
+  `<kind>: [<msg_id>] <text>` with the replay rule of §7.5, then appends the event with type
+  `<kind>`, source `orchestrator` and detail `<msg_id>`. The event's `attempt` field is the
+  attempt id of the highest attempt as §8.3 reads it; the comment keeps the format
+  `<kind>: [<msg_id>] <text>`
   with no attempt id. Adding the comment can fail in the replay lookup, in `bd` output that is
   not JSON or not UTF-8, in `bd` itself, or in a comment payload of the wrong shape; `say`
   catches `Exception` around the whole comment step, and any such failure is a failed comment: it
@@ -772,8 +784,10 @@ exit 2, before any filesystem or `bd` access.
 
 ### 9.3 Events
 
-`<hub>/.helios/events.jsonl`, one JSON object per line, appended with a single `write`:
-`{"ts", "source", "type", "bead", "attempt", "session", "detail"}`. The line, newline included,
+`<hub>/.helios/events.jsonl`, one JSON object per line, appended under an exclusive `fcntl.flock`
+on the file, with a single `write`: `{"ts", "source", "type", "bead", "attempt", "session",
+"detail"}`. When the file is non-empty and does not already end with a newline, the write starts
+with a newline before the JSON line. The line, newline included,
 is at most 4096 bytes: helios shortens `detail` first, and raises when the line is still too long. Types: `launched`,
 `completed`, `needs_input`, `needs_review`, `failed`, `finalized`, `steer`, `answer`, `idle`,
 `error`. Sources: `helios`, `opencode-plugin`, `orchestrator`. The orchestrator watches this
@@ -808,7 +822,8 @@ bad id exits 2 before the lock path is built. It then holds an exclusive, non-bl
 `fcntl.flock` on `<hub>/<project.runs>/unit-<unit>.lock` from before step 1 until it exits. The
 lock file is opened with `os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW |
 os.O_NONBLOCK, 0o644)` then `os.fstat`; anything that is not a regular file, an `ELOOP` from a
-symlink included, is `helios: cannot lock <path>: not a regular file`, exit 2. A lock that
+symlink or an `EISDIR` from a directory included, is `helios: cannot lock <path>: not a regular
+file`, exit 2. A lock that
 cannot be created otherwise exits 2 with `helios: cannot lock unit <unit>`. A held lock exits 2
 with `helios: unit <unit> is being created by another process`.
 
@@ -875,14 +890,26 @@ Tests run against a real `bd init` in a temporary repository when `bd` is on PAT
 
 Candidates are the beads from `bd ready --json` (through `helios.beads`) with status `open` that
 carry a `kind:<stage>` label naming a §3 stage, filtered by label `unit:<unit>` when a unit is
-given, in bd's order. The §3 stage order comes from `helios.stages.STAGES`.
+given, in bd's order. The §3 stage order comes from `helios.stages.STAGES`. A `bd` error while
+listing candidates prints `helios: <message>` and exits 1.
 
-`next` and `unit run` call `helios.run.run_many` and then read the envelope of the bead's
-highest attempt (`attempt-<n>/envelope.json`, `Envelope.model_validate_json`); no attempt or no
+`next` and `unit run` call `helios.run.run_many`, passing it `helios run`'s memory check
+(`memory_has_for`) so preflight (§7.1 step 2) sees the configured memory backend, and then read
+the envelope of the bead's highest attempt (`attempt-<n>/envelope.json`,
+`Envelope.model_validate_json`); no attempt or no
 envelope file gives none. A verdict is `helios.envelope.overall_verdict(envelope.report.findings)`
-when a report exists, else none. When the run or the envelope read raises, or the run leaves no
-new attempt, the result is an execution failure with reason `execution failure for <bead>:
-<exception type>: <message>` (or `... no new attempt`); its exit code is the run's code when
+when a report exists, else none.
+
+Before calling `run_many`, `next` and `unit run` snapshot the bead's highest attempt number and
+whether that attempt was finalized. A higher number after the run is a new attempt, and its
+envelope is read normally. An unchanged number whose attempt was not finalized before the run is
+§8.4 in-place recovery, and its envelope is read normally too. An unchanged number whose attempt
+was already finalized before the run, or no attempt before and after, is the stop reason
+`execution failure for <bead>: no new attempt`, with exit code the run's code when nonzero, else
+4.
+
+When the run or the envelope read raises, the result is an execution failure with reason
+`execution failure for <bead>: <exception type>: <message>`; its exit code is the run's code when
 nonzero, else 4.
 
 - `helios next [<unit>]` runs the first candidate whose kind is not in `control.stop_at`
@@ -936,12 +963,17 @@ the order 1, 2, 8, 3, 4, 5, 6, 7.
    starts with `.beads/` is dropped first (bd's own export, dirtied by any bd write), so in the
    worktree a change under `.beads/` is dirt like any other path. When the worktree directory is
    missing and step 8's recovery does not apply, refuse `helios: worktree missing for <bead>`.
-   Refuse also when `git diff --name-only <main>...worktree-<bead>` lists any path under
-   `.beads/` (`helios: branch changes .beads/`), or unless the worktree is on branch
-   `worktree-<bead>` (`git -C <worktree> symbolic-ref --short HEAD`, else
-   `helios: worktree is not on branch worktree-<bead>`) and its HEAD equals the impl bead's
-   `output_commit` metadata (else `helios: worktree HEAD <sha> is not the verified output_commit
-   <sha>`), so the commit step 6 merges, once rebased, is the verified commit.
+   Step 2 runs on every invocation, before recovery (step 8). Refuse unless the worktree is on
+   branch `worktree-<bead>` (`git -C <worktree> symbolic-ref --short HEAD`, else
+   `helios: worktree is not on branch worktree-<bead>`). Refuse also when
+   `git diff --no-renames --name-only <main>...worktree-<bead>` lists any path under `.beads/`
+   (`helios: branch changes .beads/`). The worktree HEAD passes when it equals the impl bead's
+   `output_commit` metadata, or when the ordered list of `git patch-id --stable` values of the
+   non-merge commits in `merge-base(HEAD, main)..HEAD` equals the ordered list for
+   `merge-base(output_commit, main)..output_commit` (the verified commits rebased). Otherwise, or
+   when either range contains a merge commit, refuse with `helios: worktree HEAD <sha> is not the
+   verified output_commit <sha>`, exit 2; so the commit step 6 merges, once rebased, is the
+   verified commit.
 3. Record `main_before` as metadata `merge_main_before`. Then in the worktree run
    `git rebase main`. A nonzero exit is a conflict, `git rebase --abort`, `run=conflict`, stop,
    only when a rebase is in progress (`git rev-parse --git-path rebase-merge` or `rebase-apply`
@@ -970,7 +1002,8 @@ rule of §7.5, where `<step>` is one of `rebased` or `conflict` (step 3), `teste
 of a recovery run use it too.
 
 Checks (`project.test`, `project.typecheck`) run with stdout and stderr captured, never
-inherited; their output is discarded on success. On failure it prints
+inherited; their output is discarded on success. Captured check output is decoded with
+`errors=replace`. On failure it prints
 `helios: <name> failed with exit <code>` then the last 50 lines of the combined captured output,
 each line prefixed `helios: `, and stops with exit 5. Every stderr line `helios merge` prints
 starts with `helios: `, `MergeError` messages included; stdout success and `--dry-run` text is
@@ -1085,7 +1118,9 @@ its trailing newline or lack of one.
   It reads beads of any status that carry a helios `kind:<stage>` label (§3), plus every bead
   named by a marker found on them, deduplicates lines by marker across beads (the first
   occurrence in bd order wins), and keeps only lines without a matching `curated:` comment,
-  which counts on any bead. `--unit U` keeps beads with label `unit:U`. Lines are sorted by unit
+  which counts on any bead. When checking a marker's bead for that comment, a named bead that
+  does not exist or whose bd read fails is skipped, and listing continues. `--unit U` keeps
+  beads with label `unit:U`. Lines are sorted by unit
   (`-` when none), bead, attempt number and k as numbers, then the marker text as a tiebreak.
   Text output groups by unit, then bead, then attempt. `--json` prints a list of
   `{"unit", "bead", "attempt", "kind", "k", "text"}`. A `RuntimeError` from `bd` prints
@@ -1136,8 +1171,9 @@ never walks the package directory). A claim name matches `^[A-Za-z0-9_][A-Za-z0-
 (`re.fullmatch`); `@claim` raises `ValueError` for any other name, which the command reports as
 an import failure (§2.3). A record's module is the `__name__` of the module-level frame that
 called `claim(...)` (walk outward from the call to the first frame whose code name is
-`<module>`; with none found, the direct caller's `f_globals["__name__"]`), never
-`func.__module__`, `__qualname__`, `co_firstlineno` or `repr`. A record is keyed by (module,
+`<module>` and whose globals hold a `__name__`, skipping a module-level frame without one; when
+none is found, `claim()` raises `ValueError` `claim <name>: cannot determine owning module`),
+never `func.__module__`, `__qualname__`, `co_firstlineno` or `repr`. A record is keyed by (module,
 claim name). Before importing the
 configured module, helios removes it and every module under its package prefix from
 `sys.modules` and clears the registry, so collection sees exactly one import pass; the runner
@@ -1190,7 +1226,8 @@ from `backends.toml` (the project's `.agents/backends.toml`, else `templates/bac
      without closing their streams from the main thread, and continues. helios keeps at most the
      last 64 KiB of the runner's stderr and at most 16 MiB of its stdout, draining both to the
      end of the bound either way; stdout past 16 MiB makes the result inconclusive with the note
-     `runner output over 16 MiB`.
+     `runner output over 16 MiB`. A pump thread reading an abandoned runner's output stops once
+     it reaches its bound (64 KiB for stderr, 16 MiB for stdout).
    - `import ctypes` for the best-effort C stdio flush sits inside the flush's own `try`, so a
      runner without `ctypes` still runs claims.
    - Apart from a timeout, the result counts only when the runner exits 0 and its stdout is
