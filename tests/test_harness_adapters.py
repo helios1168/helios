@@ -129,6 +129,23 @@ def test_claude_parse_malformed(tmp_path: Path):
     assert bad.structured is None
 
 
+@pytest.mark.parametrize(
+    "label,text",
+    [
+        ("top-level", '{"session_id":"s1","structured_output":1e999}'),
+        ("nested-object", '{"session_id":"s1","structured_output":{"a":-1e999}}'),
+        ("nested-array", '{"session_id":"s1","structured_output":{"a":[1e999]}}'),
+    ],
+)
+def test_claude_parse_overflow_number(tmp_path: Path, label: str, text: str):
+    spec = make_spec(tmp_path)
+    path = tmp_path / f"overflow-{label}.stdout"
+    path.write_text(text)
+    result = ClaudeAdapter().parse(spec, 0, path)
+    assert result.native_error == "invalid JSON", label
+    assert result.structured is None, label
+
+
 def test_claude_attach_and_stdin(tmp_path: Path):
     spec = make_spec(tmp_path)
     assert ClaudeAdapter().attach_command("sess-9", spec) == ["claude", "--resume", "sess-9"]
@@ -250,6 +267,31 @@ def test_codex_structured_notes_and_warnings(tmp_path: Path):
     assert lost.native_error == "turn did not complete"
 
 
+def test_codex_parse_overflow_number_in_line(tmp_path: Path):
+    spec = make_spec(tmp_path)
+    shutil.copy(FIX / "codex" / "fresh-last-message.json", spec.raw_dir / "last-message.json")
+    dirty = tmp_path / "dirty.stdout"
+    dirty.write_text(
+        '{"type":"thread.started","thread_id":"bad","huge":1e999}\n'
+        + (FIX / "codex" / "fresh.stdout").read_text()
+    )
+    ok = CodexAdapter().parse(spec, 0, dirty)
+    assert ok.native_error is None
+    assert ok.structured == {"status": "done", "summary": "pong"}
+    assert ok.notes == ("skipped 1 non-JSON lines",)
+    assert ok.session_id != "bad"
+
+
+def test_codex_last_message_overflow_number(tmp_path: Path):
+    bare = make_spec(tmp_path)
+    bare_stdout = tmp_path / "bare.stdout"
+    bare_stdout.write_text((FIX / "codex" / "fresh.stdout").read_text())
+    (bare.raw_dir / "last-message.json").write_text('{"a": -1e999}\n')
+    res = CodexAdapter().parse(bare, 0, bare_stdout)
+    assert res.structured is None
+    assert res.notes == ("structured result is not a JSON object",)
+
+
 def test_codex_attach_and_stdin(tmp_path: Path):
     spec = make_spec(tmp_path)
     assert CodexAdapter().attach_command("sess-9", spec) == ["codex", "resume", "sess-9"]
@@ -329,6 +371,19 @@ def test_opencode_parse_malformed(tmp_path: Path):
     assert ok.notes == ("skipped 1 non-JSON lines",)
 
 
+def test_opencode_parse_overflow_number_in_line(tmp_path: Path):
+    spec = make_spec(tmp_path)
+    dirty = tmp_path / "dirty.stdout"
+    dirty.write_text(
+        '{"type":"step_start","sessionID":"bad","huge":1e999}\n'
+        + (FIX / "opencode" / "fresh.stdout").read_text()
+    )
+    ok = OpencodeAdapter().parse(spec, 0, dirty)
+    assert ok.native_error is None
+    assert ok.notes == ("skipped 1 non-JSON lines",)
+    assert ok.session_id != "bad"
+
+
 def test_opencode_attach_and_stdin(tmp_path: Path):
     spec = make_spec(tmp_path, server_url="http://127.0.0.1:5678")
     assert OpencodeAdapter().attach_command("ses_9", spec) == [
@@ -401,6 +456,29 @@ def test_agy_parse_malformed(tmp_path: Path):
         bad = AgyAdapter().parse(spec, 0, tmp_path / name)
         assert bad.native_error == "invalid JSON", name
         assert bad.structured is None
+
+
+@pytest.mark.parametrize(
+    "label,text",
+    [
+        ("top-level", '{"conversation_id":"c1","status":"SUCCESS","structured_output":1e999}'),
+        (
+            "nested-object",
+            '{"conversation_id":"c1","status":"SUCCESS","structured_output":{"a":-1e999}}',
+        ),
+        (
+            "nested-array",
+            '{"conversation_id":"c1","status":"SUCCESS","structured_output":{"a":[1e999]}}',
+        ),
+    ],
+)
+def test_agy_parse_overflow_number(tmp_path: Path, label: str, text: str):
+    spec = make_spec(tmp_path)
+    path = tmp_path / f"overflow-{label}.stdout"
+    path.write_text(text)
+    result = AgyAdapter().parse(spec, 0, path)
+    assert result.native_error == "invalid JSON", label
+    assert result.structured is None, label
 
 
 def test_agy_attach_and_stdin(tmp_path: Path):

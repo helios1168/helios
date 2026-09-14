@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import secrets
 import tempfile
@@ -10,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from helios import attempt, beads, events, sessions
+from helios import attempt, beads, events, jsonio, sessions
 
 
 def _utc_seconds() -> str:
@@ -29,7 +28,7 @@ def write_message(runs: Path, bead: str, text: str, kind: str = "steer") -> str:
     fd, temporary = tempfile.mkstemp(dir=directory, prefix="message.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as handle:
-            json.dump(record, handle, sort_keys=True)
+            handle.write(jsonio.dumps(record, sort_keys=True))
             handle.write("\n")
         os.replace(temporary, directory / f"{msg_id}.json")
     except BaseException:

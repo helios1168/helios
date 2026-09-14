@@ -178,6 +178,24 @@ def test_b_invalid_output(tmp_path: Path, monkeypatch) -> None:
     assert "b1" not in beads.closed
 
 
+def test_b_report_file_overflow_number_is_invalid_output(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    script = write_script(
+        tmp_path,
+        {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s1",
+         "report": None, "report_text": '{"status": "done", "summary": 1e999}'},
+    )
+    set_fake(monkeypatch, script)
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    assert rc == 4
+    env = read_envelope(hub, "b1", 1)
+    assert env["execution_status"] == "invalid_output"
+    assert env["report"] is None and env["report_error"]
+    assert "b1" not in beads.closed
+
+
 def test_b_invalid_schema_report(tmp_path: Path, monkeypatch) -> None:
     hub = make_hub(tmp_path)
     beads = beads_mod.FakeBeads([make_bead("b1")])
@@ -1611,6 +1629,12 @@ def test_captured_bytes_identical(tmp_path: Path, monkeypatch) -> None:
                          config=config_mod.load(hub), harness_override="fake")
     cap = (hub / ".helios" / "runs" / "b1" / "attempt-1" / "report.json").read_bytes()
     assert rc == 0 and cap == text.encode()
+
+
+def test_capture_fresh_never_writes_infinity(tmp_path: Path) -> None:
+    report_path = tmp_path / "missing-report.json"
+    with pytest.raises(ValueError):
+        run_mod._capture_fresh({"status": "done", "summary": float("inf")}, report_path)
 
 
 def test_captured_native_choice_is_dumps(tmp_path: Path, monkeypatch) -> None:

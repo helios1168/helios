@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import os
 import stat
 from pathlib import Path
 from typing import Any
 
+from helios import jsonio
 from helios.harness.base import Harness, LaunchSpec, NativeResult
 
 STRIP_CHARS = " \t\r\n"
@@ -50,10 +50,7 @@ class AgyAdapter(Harness):
         if data is None:
             return NativeResult(session_id=None, structured=None, native_error="no stdout")
         try:
-            obj = json.loads(
-                data.decode("utf-8").strip(STRIP_CHARS),
-                parse_constant=_reject_constant,
-            )
+            obj = jsonio.loads(data.decode("utf-8").strip(STRIP_CHARS))
         except Exception:
             return NativeResult(session_id=None, structured=None, native_error="invalid JSON")
         if not isinstance(obj, dict):
@@ -96,11 +93,6 @@ def _read_bytes(path: Path) -> bytes | None:
         return path.read_bytes()
     except (OSError, ValueError):
         return None
-
-
-def _reject_constant(value: str) -> Any:
-    """Reject NaN, Infinity and -Infinity (SPEC §6.4)."""
-    raise ValueError(f"invalid constant {value!r}")
 
 
 def _exit_failed(exit_code: int | None) -> bool:

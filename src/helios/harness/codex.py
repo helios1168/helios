@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import os
 import stat
 from pathlib import Path
 from typing import Any
 
+from helios import jsonio
 from helios.harness.base import Harness, LaunchSpec, NativeResult
 
 LAST_MESSAGE = "last-message.json"
@@ -98,10 +98,7 @@ class CodexAdapter(Harness):
                 session_id=session_id, structured=None, notes=tuple(notes)
             )
         try:
-            structured: Any = json.loads(
-                raw.decode("utf-8").strip(STRIP_CHARS),
-                parse_constant=_reject_constant,
-            )
+            structured: Any = jsonio.loads(raw.decode("utf-8").strip(STRIP_CHARS))
         except Exception:
             notes.append("structured result is not a JSON object")
             return NativeResult(
@@ -140,7 +137,7 @@ def _parse_lines(data: bytes) -> tuple[list[dict[str, Any]], int]:
             skipped += 1
             continue
         try:
-            value = json.loads(stripped, parse_constant=_reject_constant)
+            value = jsonio.loads(stripped)
         except Exception:
             skipped += 1
             continue
@@ -159,11 +156,6 @@ def _read_bytes(path: Path) -> bytes | None:
         return path.read_bytes()
     except (OSError, ValueError):
         return None
-
-
-def _reject_constant(value: str) -> Any:
-    """Reject NaN, Infinity and -Infinity (SPEC §6.4)."""
-    raise ValueError(f"invalid constant {value!r}")
 
 
 def _exit_failed(exit_code: int | None) -> bool:

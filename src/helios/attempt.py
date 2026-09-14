@@ -13,7 +13,6 @@ compares input hashes and ancestry.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
@@ -22,6 +21,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+
+from helios import jsonio
 
 STATES = (
     "allocated",
@@ -97,7 +98,7 @@ def read_state(dir: Path) -> dict[str, Any]:
     reading never raises for these cases.
     """
     try:
-        data = json.loads((dir / "state.json").read_text())
+        data = jsonio.loads((dir / "state.json").read_text())
     except (OSError, ValueError):
         data = None
     if not isinstance(data, dict) or not isinstance(data.get("state"), str):
@@ -138,7 +139,7 @@ def write_state(
     fd, tmp = tempfile.mkstemp(dir=str(dir), prefix="state.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as fh:
-            json.dump(record, fh, indent=2, sort_keys=True)
+            fh.write(jsonio.dumps(record, indent=2, sort_keys=True))
             fh.write("\n")
         os.replace(tmp, dir / "state.json")
     except BaseException:
@@ -148,7 +149,7 @@ def write_state(
             pass
         raise
     with open(dir / "state.log", "a") as fh:
-        fh.write(json.dumps(record, sort_keys=True) + "\n")
+        fh.write(jsonio.dumps(record, sort_keys=True) + "\n")
     return record
 
 

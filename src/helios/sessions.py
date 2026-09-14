@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, cast
 
-from helios import attempt, beads, config, events
+from helios import attempt, beads, config, events, jsonio
 from helios.harness.base import LaunchSpec
 
 BEAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
@@ -54,7 +54,7 @@ def safe_state(directory: Path) -> dict[str, Any]:
 
 def _input(directory: Path) -> dict[str, Any]:
     try:
-        value = json.loads((directory / "input.json").read_text())
+        value = jsonio.loads((directory / "input.json").read_text())
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError, TypeError, json.JSONDecodeError, RecursionError):
         return {}
@@ -95,7 +95,7 @@ def _event_index(hub: Path) -> dict[tuple[str, str], str] | None:
         except UnicodeDecodeError:
             continue
         try:
-            value = json.loads(line, parse_constant=_reject_constant)
+            value = jsonio.loads(line)
         except (TypeError, ValueError, json.JSONDecodeError, RecursionError):
             continue
         if not isinstance(value, dict):
@@ -104,10 +104,6 @@ def _event_index(hub: Path) -> dict[tuple[str, str], str] | None:
         if isinstance(bead, str) and isinstance(attempt_id, str) and isinstance(kind, str):
             index[(bead, attempt_id)] = kind
     return index
-
-
-def _reject_constant(value: str) -> None:
-    raise ValueError(f"invalid JSON constant {value}")
 
 
 def rows(hub: Path, runs_rel: str, *, bead_store: beads.BeadsLike | None = None,

@@ -10,7 +10,6 @@ refuse while ``HELIOS_BEAD`` is set.
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import re
@@ -18,8 +17,9 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, NoReturn, Protocol, Sequence
+from typing import Any, Callable, Protocol, Sequence
 
+from helios import jsonio
 from helios.beads import Beads, BeadNotFound
 from helios.config import Config
 
@@ -71,13 +71,8 @@ def serialize(header: dict[str, Any], body: str) -> str:
     NaN and Infinity are refused anywhere in the header: they are not JSON,
     so no canonical line 2 could hold them.
     """
-    line2 = json.dumps(header, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    line2 = jsonio.dumps(header, sort_keys=True, ensure_ascii=False)
     return f"{MAGIC}\n{line2}\n\n{body}"
-
-
-def _reject_constant(value: str) -> NoReturn:
-    """``parse_constant`` for loads: NaN and Infinity are not JSON (SPEC §13)."""
-    raise ValueError(f"non-JSON constant {value}")
 
 
 def parse(key: str, text: str) -> Memory:
@@ -99,7 +94,7 @@ def parse(key: str, text: str) -> Memory:
     if not tail.startswith("\n"):
         raise ValueError(f"memory {key!r}: missing blank line after header")
     try:
-        header = json.loads(line2, parse_constant=_reject_constant)
+        header = jsonio.loads(line2)
     except RecursionError as exc:
         raise ValueError(f"memory {key!r}: header JSON is too deeply nested") from exc
     except ValueError as exc:
@@ -111,7 +106,7 @@ def parse(key: str, text: str) -> Memory:
     if header["status"] not in _STATUSES:
         raise ValueError(f"memory {key!r}: bad status {header['status']!r}")
     try:
-        canonical = json.dumps(header, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        canonical = jsonio.dumps(header, sort_keys=True, ensure_ascii=False)
     except (RecursionError, ValueError) as exc:
         raise ValueError(f"memory {key!r}: header is not canonical: {exc}") from exc
     if line2 != canonical:

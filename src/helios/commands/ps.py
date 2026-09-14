@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 
-from helios import config, sessions
+from helios import config, jsonio, sessions
 
 NAME = "ps"
 HELP = "List attempts."
@@ -54,7 +53,7 @@ def run(args) -> int:
         print(f"helios: {exc}", file=sys.stderr)
         return 1
     if args.as_json:
-        print(json.dumps(rows, sort_keys=True, allow_nan=False))
+        print(jsonio.dumps(rows, sort_keys=True))
         return 0
     columns = ("bead", "unit", "kind", "harness", "state", "attempt", "age", "worktree", "session")
     print("\t".join(columns))

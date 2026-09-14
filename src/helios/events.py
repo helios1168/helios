@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import fcntl
-import json
 import os
 from pathlib import Path
 from typing import Any
 
+from helios import jsonio
 from helios.attempt import utc_now
 
 TYPES = frozenset(
@@ -92,4 +92,4 @@ def append(
 
 
 def _encode(event: dict[str, Any]) -> bytes:
-    return (json.dumps(event, sort_keys=True) + "\n").encode("utf-8")
+    return (jsonio.dumps(event, sort_keys=True) + "\n").encode("utf-8")

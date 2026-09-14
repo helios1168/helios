@@ -70,6 +70,30 @@ def test_message_without_runs_fails_without_writing(tmp_path: Path) -> None:
     assert not (tmp_path / ".helios").exists()
 
 
+def test_state_json_overflow_number_reads_as_allocated(tmp_path: Path) -> None:
+    directory = _attempt(tmp_path, state="launched", pid=123, session_id="s1")
+    good = json.loads((directory / "state.json").read_text())
+    corrupted = json.dumps(good)[:-1] + ', "huge": 1e999}'
+    (directory / "state.json").write_text(corrupted)
+    state = attempt.read_state(directory)
+    assert state["state"] == "allocated"
+    assert sessions.safe_state(directory)["state"] == "allocated"
+
+
+def test_message_file_written_with_jsonio(tmp_path: Path) -> None:
+    from helios import jsonio
+
+    directory = _attempt(tmp_path)
+    store = FakeBeads([Bead(id="b1")])
+    msg_id, _ = messages.say(tmp_path, ".helios/runs", "b1", "hello", bead_store=store)
+    path = directory.parent / "inbox" / f"{msg_id}.json"
+    raw = path.read_text()
+    assert raw.endswith("\n")
+    payload = jsonio.loads(raw)
+    assert payload["text"] == "hello"
+    assert list(payload.keys()) == sorted(payload.keys())
+
+
 def test_say_cli_unexecutable_bd_is_failed_comment_exit_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:

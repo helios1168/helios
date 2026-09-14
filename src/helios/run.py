@@ -30,6 +30,7 @@ from helios import beads as beads_mod
 from helios import config as config_mod
 from helios import envelope as envelope_mod
 from helios import events as events_mod
+from helios import jsonio
 from helios import memory as memory_mod
 from helios import ownership as ownership_mod
 from helios import prompt as prompt_mod
@@ -295,7 +296,7 @@ def _write_input_json(path: Path, payload: dict[str, object]) -> None:
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="input.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as fh:
-            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write(jsonio.dumps(payload, indent=2, sort_keys=True))
             fh.write("\n")
         os.replace(tmp, path)
     except BaseException:
@@ -785,14 +786,14 @@ def _missing_skill(hub: Path, kind: str) -> str | None:
 def _stored_execution(attempt_dir: Path) -> envelope_mod.ExecutionStatus | None:
     """A stored step 8 status from state.json, else the envelope (SPEC §8.4)."""
     try:
-        data = json.loads((attempt_dir / "state.json").read_text())
+        data = jsonio.loads((attempt_dir / "state.json").read_text())
         value = data.get("execution_status")
         if value is not None:
             return envelope_mod.ExecutionStatus(value)
     except (OSError, json.JSONDecodeError, ValueError):
         pass
     try:
-        env = json.loads((attempt_dir / "envelope.json").read_text())
+        env = jsonio.loads((attempt_dir / "envelope.json").read_text())
         value = env.get("execution_status")
         if value is not None:
             return envelope_mod.ExecutionStatus(value)
@@ -812,7 +813,7 @@ def _read_report_bytes(path: Path) -> tuple[dict | None, str | None, bytes | Non
     except OSError:
         return None, None, None
     try:
-        parsed = json.loads(raw.decode("utf-8"))
+        parsed = jsonio.loads(raw.decode("utf-8"))
     except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as exc:
         return None, f"report is not valid JSON: {exc}", raw
     if not isinstance(parsed, dict):
@@ -848,7 +849,7 @@ def _capture_fresh(
         elif file_error is not None:
             notes.append(f"report file unreadable ({file_error}); using native")
         store = (
-            json.dumps(native_structured, ensure_ascii=False, indent=2, sort_keys=True)
+            jsonio.dumps(native_structured, ensure_ascii=False, indent=2, sort_keys=True)
             + "\n"
         ).encode("utf-8")
         return _Capture(native_structured, None, store, None, notes)
@@ -1540,7 +1541,7 @@ def _write_recovery_envelope(
     hashes: dict[str, str] = {}
     base_commit = ""
     try:
-        saved = json.loads((attempt_dir / "input.json").read_text())
+        saved = jsonio.loads((attempt_dir / "input.json").read_text())
         hashes = dict(saved.get("input_hashes") or {})
         base_commit = str(saved.get("base_commit") or "")
     except (OSError, json.JSONDecodeError, ValueError, AttributeError):
@@ -1924,7 +1925,7 @@ def _resume_latest(
     )
     input_path = attempt_dir / "input.json"
     try:
-        saved = json.loads(input_path.read_text())
+        saved = jsonio.loads(input_path.read_text())
         hashes = dict(saved.get("input_hashes") or {})
         base_commit = str(saved.get("base_commit") or info.base_commit)
     except (OSError, json.JSONDecodeError, ValueError, AttributeError):
@@ -1935,7 +1936,7 @@ def _resume_latest(
     session_id = state.get("session_id")
     if session_id is None:
         try:
-            session_id = json.loads((attempt_dir / "envelope.json").read_text()).get(
+            session_id = jsonio.loads((attempt_dir / "envelope.json").read_text()).get(
                 "session_id"
             )
         except (OSError, json.JSONDecodeError, ValueError, AttributeError):
@@ -1972,7 +1973,7 @@ def _resume_latest(
 def _envelope_execution_status(attempt_dir: Path) -> str:
     """The ``execution_status`` just written to ``envelope.json``, or ``""``."""
     try:
-        data = json.loads((attempt_dir / "envelope.json").read_text())
+        data = jsonio.loads((attempt_dir / "envelope.json").read_text())
         value = data.get("execution_status")
         return value if isinstance(value, str) else ""
     except (OSError, json.JSONDecodeError, ValueError):

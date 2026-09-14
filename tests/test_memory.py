@@ -67,7 +67,7 @@ def test_nonfinite_header_refused() -> None:
         mem.serialize({"source": "s", "n": float("nan")}, "b")
     with pytest.raises(ValueError):
         mem.serialize({"source": "s", "i": float("inf")}, "b")
-    for raw in ("NaN", "Infinity", "-Infinity"):
+    for raw in ("NaN", "Infinity", "-Infinity", "1e999", "-1e999"):
         with pytest.raises(ValueError) as excinfo:
             mem.parse("nan-key", f'helios-memory 1\n{{"n": {raw}, "source": "s"}}\n\nb')
         assert "nan-key" in str(excinfo.value)
