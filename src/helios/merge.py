@@ -6,7 +6,7 @@ import fcntl
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from typing import TextIO, cast
 
 from helios.beads import Bead, BeadsLike, comment_has
 from helios.config import ProjectConfig
@@ -55,7 +55,14 @@ def _comment(beads: BeadsLike, bead: str, marker: str, detail: str) -> None:
 
 
 def _clean(path: Path) -> bool:
-    return not _git_output(path, "status", "--porcelain", "--untracked-files=no")
+    status = _git_output(path, "status", "--porcelain", "--untracked-files=no")
+    for line in status.splitlines():
+        changed = line[2:].strip() if len(line) > 2 else ""
+        changed = changed.rsplit(" -> ", 1)[-1]
+        if changed == ".beads" or changed.startswith(".beads/"):
+            continue
+        return False
+    return True
 
 
 def _verify_evidence(hub: Path, runs: str, impl: Bead, beads: BeadsLike, hashes: HashFunction) -> None:
@@ -101,6 +108,9 @@ def _remove_worktree(hub: Path, path: Path, branch: str) -> None:
         if proc.returncode:
             raise MergeError(proc.stderr.strip() or "worktree removal failed", 4)
     if _git(hub, "show-ref", "--verify", f"refs/heads/{branch}").returncode == 0:
+        pruned = _git(hub, "worktree", "prune")
+        if pruned.returncode:
+            raise MergeError(pruned.stderr.strip() or "worktree prune failed", 4)
         proc = _git(hub, "branch", "-d", branch)
         if proc.returncode:
             raise MergeError(proc.stderr.strip() or "branch removal failed", 4)
@@ -137,19 +147,28 @@ def merge_bead(
     bead = beads.show(bead_id)
     runs_dir = hub / project.runs / bead_id
     lock_path = runs_dir / "lock"
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    lock = lock_path.open("a+")
-    try:
+    lock: TextIO | None = None
+    created_lock = False
+    wrote = False
+    if not dry_run:
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        created_lock = not lock_path.exists()
+        lock = lock_path.open("a+")
+    elif lock_path.exists():
+        lock = lock_path.open("r+")
+    if lock is not None:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
+            lock.close()
             raise MergeError("merge lock is held", 2) from exc
+    try:
         _verify_evidence(hub, project.runs, bead, beads, input_hashes)
         worktree = (hub / project.worktrees / bead_id).resolve()
         branch_check = _git(hub, "symbolic-ref", "--short", "HEAD")
         if branch_check.returncode or branch_check.stdout.strip() != "main":
             raise MergeError("hub is not on main")
-        if not _clean(hub) or (worktree.exists() and not _clean(worktree)):
+        if not _clean(hub):
             raise MergeError("hub or worktree is dirty")
         branch = f"worktree-{bead_id}"
         merge_commit = bead.metadata.get("merge_commit")
@@ -158,12 +177,19 @@ def merge_bead(
             marker = f"[{bead_id}@{main_before}:"
             if dry_run:
                 return 0, "would recover and remove worktree"
+            wrote = True
+            _comment(beads, bead_id, marker + "merged]", "merged")
             _finish_step7(hub, worktree, branch, beads, bead_id, marker)
             return 0, "recovered"
+        if not worktree.is_dir():
+            raise MergeError(f"worktree missing for {bead_id}")
+        if not _clean(worktree):
+            raise MergeError("hub or worktree is dirty")
         main_before = _git_output(hub, "rev-parse", "main")
         marker = f"[{bead_id}@{main_before}:"
         if dry_run:
             return 0, "would rebase, test, merge, push, and remove"
+        wrote = True
         beads.set_metadata(bead_id, {"merge_main_before": main_before})
         rebase = _git(worktree, "rebase", "main")
         if rebase.returncode:
@@ -184,10 +210,21 @@ def merge_bead(
         beads.set_metadata(bead_id, {"merge_commit": commit})
         merged = _git(hub, "merge", "--ff-only", branch)
         if merged.returncode:
+            if _git_output(hub, "rev-parse", "main") != main_before:
+                beads.set_metadata(bead_id, {"merge_commit": ""})
+                _comment(beads, bead_id, marker + "main-moved]", "main-moved")
+                raise MergeError("main moved during merge", 3)
             raise MergeError(merged.stderr.strip() or "fast-forward merge failed", 4)
         _comment(beads, bead_id, marker + "merged]", "merged")
         _finish_step7(hub, worktree, branch, beads, bead_id, marker)
         return 0, "merged"
     finally:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-        lock.close()
+        if lock is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+        if created_lock and not wrote and lock_path.exists():
+            lock_path.unlink()
+            try:
+                runs_dir.rmdir()
+            except OSError:
+                pass

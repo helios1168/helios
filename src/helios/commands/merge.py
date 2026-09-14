@@ -20,7 +20,11 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
-    config = load(Path.cwd())
+    try:
+        config = load(Path.cwd())
+    except (ValueError, TypeError, RecursionError) as exc:
+        print(f"helios: {exc}", file=sys.stderr)
+        return 2
     try:
         code, message = merge_bead(
             config.hub,
