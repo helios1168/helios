@@ -34,24 +34,25 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
-    """Create the unit chain and print the step 6 table."""
+    """Create the unit chain under the creation lock and print the step 6 table."""
     try:
         cfg = config.load(Path.cwd())
     except (ValueError, TypeError) as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2
     try:
-        rows = units.create_unit(
-            beads=beads.Beads(cfg.hub),
-            config=cfg,
-            unit=args.unit,
-            title=args.title,
-            stages=args.stages,
-            files=args.files,
-            test=args.test,
-        )
+        with units.unit_lock(cfg.hub, cfg.project.runs, args.unit):
+            rows = units.create_unit(
+                beads=beads.Beads(cfg.hub),
+                config=cfg,
+                unit=args.unit,
+                title=args.title,
+                stages=args.stages,
+                files=args.files,
+                test=args.test,
+            )
     except units.UnitNewError as exc:
-        print(exc, file=sys.stderr)
+        print(f"helios: {exc}", file=sys.stderr)
         return 2
     sys.stdout.write(units.format_table(rows))
     return 0

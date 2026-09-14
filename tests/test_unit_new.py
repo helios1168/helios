@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fcntl
+import re
 import shutil
 import subprocess
 from argparse import Namespace
@@ -68,8 +70,13 @@ REFUSALS: list[dict[str, Any]] = [
     {"unit": "U1", "stages": "verify-math,verify-code"},
     {"unit": "U1", "stages": "model,impl", "files": None, "test": "t"},
     {"unit": "U1", "stages": "model,impl", "files": "a.py", "test": None},
+    {"unit": "U1", "stages": "model,impl", "files": "a.py", "test": ""},
     {"unit": "U1", "stages": "model,validate", "files": "a.py", "test": None},
     {"unit": "U1", "stages": "impl", "files": "a,,b", "test": "t"},
+    {"unit": "U1\n", "stages": "model"},
+    {"unit": "a\n", "stages": "model"},
+    {"unit": "a" * 101, "stages": "model"},
+    {"unit": "a" * 300, "stages": "model"},
 ]
 
 
@@ -124,7 +131,9 @@ def test_command_refusal_exits_2_with_stderr(
         unit="bad name", title="T", stages="model", files=None, test=None
     )
     assert unit_new.run(args) == 2
-    assert capsys.readouterr().err.strip() != ""
+    err = capsys.readouterr().err
+    assert err.startswith("helios: ")
+    assert err.strip() != ""
     assert fake.argv_log == []
     assert not _unit_path(hub).exists()
 
@@ -485,3 +494,192 @@ def test_real_bd_unit_new(tmp_path: Path) -> None:
     verify = beads.show(rows[1].bead)
     assert verify.parent == rows[0].bead
     assert (tmp_path / "docs" / "units" / "U7.md").is_file()
+
+
+# Round 2: unit id length rule (SPEC §10.2 step 1).
+def test_hundred_char_unit_is_accepted(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    unit = "a" * 100
+    rows = _run_ok(
+        fake=FakeBeads(), hub=hub, unit=unit, stages="model", files=None, test=None
+    )
+    assert len(rows) == 1
+    assert _unit_path(hub, unit).is_file()
+
+
+# Round 2: unresolvable other is a refusal before any bd write.
+def test_unresolvable_other_refuses_without_writes(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    fake = FakeBeads()
+    with pytest.raises(
+        UnitNewError,
+        match=r"^no harness in agents\.verify_order differs from codex$",
+    ):
+        create_unit(
+            beads=fake,
+            config=_config(hub, verify_order=("codex",)),
+            unit="U1",
+            title="T",
+            stages="impl,verify-code",
+            files="a",
+            test="t",
+        )
+    assert fake.argv_log == []
+
+
+def test_cli_unresolvable_other(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hub = _hub(tmp_path)
+    (hub / ".agents").mkdir()
+    (hub / ".agents/workflow.toml").write_text('[agents]\nverify_order = ["codex"]\n')
+    monkeypatch.chdir(hub)
+    fake = FakeBeads()
+    monkeypatch.setattr(beads_mod, "Beads", lambda cwd: fake)
+    code = cli.main(
+        [
+            "unit", "new", "U1", "T", "--stages", "impl,verify-code",
+            "--files", "a", "--test", "t",
+        ]
+    )
+    err = capsys.readouterr().err
+    assert code == 2
+    assert err == "helios: no harness in agents.verify_order differs from codex\n"
+    assert fake.argv_log == []
+
+
+# Round 2: creation lock (SPEC §10.2).
+def test_held_lock_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hub = _hub(tmp_path)
+    monkeypatch.chdir(hub)
+    fake = FakeBeads()
+    monkeypatch.setattr(beads_mod, "Beads", lambda cwd: fake)
+    lock_path = hub / ".helios" / "runs" / "unit-U9.lock"
+    lock_path.parent.mkdir(parents=True)
+    with open(lock_path, "a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        args = Namespace(unit="U9", title="T", stages="model", files=None, test=None)
+        assert unit_new.run(args) == 2
+        err = capsys.readouterr().err
+        assert err == "helios: unit U9 is being created by another process\n"
+    assert fake.argv_log == []
+    assert not _unit_path(hub, "U9").exists()
+
+
+def test_lock_released_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hub = _hub(tmp_path)
+    monkeypatch.chdir(hub)
+    fake = FakeBeads()
+    monkeypatch.setattr(beads_mod, "Beads", lambda cwd: fake)
+    args = Namespace(unit="U9", title="T", stages="model", files=None, test=None)
+    assert unit_new.run(args) == 0
+    lock_path = hub / ".helios" / "runs" / "unit-U9.lock"
+    assert lock_path.is_file()
+    with open(lock_path, "a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+# Round 2: ambiguous reuse refuses before any create (SPEC §10.2 step 2).
+def test_two_open_beads_refuse(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    fake = FakeBeads(
+        [
+            Bead(id="open-a", labels=["unit:U1", "kind:impl"], status="in_progress"),
+            Bead(id="open-b", labels=["unit:U1", "kind:impl"], status="open"),
+        ]
+    )
+    with pytest.raises(UnitNewError) as excinfo:
+        _run_ok(fake=fake, hub=hub, stages="model,impl")
+    message = str(excinfo.value)
+    assert "impl" in message
+    assert "open-a" in message and "open-b" in message
+    assert [entry for entry in fake.argv_log if entry[0] == "create"] == []
+    assert not _unit_path(hub).exists()
+
+
+# Round 2: other on a non-verify stage is a refusal (SPEC §5, §10.2 step 3).
+def test_other_on_non_verify_stage_refuses(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    fake = FakeBeads()
+    with pytest.raises(UnitNewError):
+        create_unit(
+            beads=fake,
+            config=_config(hub, model="other"),
+            unit="U1",
+            title="T",
+            stages="frame,model",
+            files=None,
+            test=None,
+        )
+    assert fake.argv_log == []
+
+
+# Round 2: a reused parent bead's recorded author drives other (SPEC §10.2 step 3).
+def test_reused_parent_author_drives_other(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    fake = FakeBeads(
+        [
+            Bead(
+                id="b-impl",
+                labels=["unit:U1", "kind:impl"],
+                status="open",
+                author="opencode",
+                metadata={"unit": "U1", "kind": "impl", "author": "opencode"},
+            )
+        ]
+    )
+    config = _config(hub, verify_order=("opencode", "codex", "claude"))
+    rows = create_unit(
+        beads=fake,
+        config=config,
+        unit="U1",
+        title="T",
+        stages="impl,verify-code",
+        files="a",
+        test="t",
+    )
+    assert [(row.bead, row.author) for row in rows] == [
+        ("b-impl", "opencode"),
+        ("fake-1", "codex"),
+    ]
+    assert fake.show("fake-1").metadata["parent"] == "b-impl"
+    assert ["dep", "add", "fake-1", "b-impl"] in fake.argv_log
+
+
+# Round 2: a units directory component that is a file refuses (SPEC §10.2 step 1).
+def test_units_dir_component_is_file(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    (hub / "docs").write_text("x", encoding="utf-8")
+    fake = FakeBeads()
+    with pytest.raises(UnitNewError):
+        _run_ok(fake=fake, hub=hub, stages="model", files=None, test=None)
+    assert fake.argv_log == []
+    assert not (hub / "docs" / "units" / "U1.md").exists()
+
+
+# Round 2: file bytes are the one-pass substitution even for a \r title.
+# (read_text would normalize \r\n, so compare bytes.)
+def test_title_with_carriage_return_byte_exact(tmp_path: Path) -> None:
+    from helios.templates import path as template_path
+
+    hub = _hub(tmp_path)
+    _run_ok(
+        fake=FakeBeads(),
+        hub=hub,
+        unit="U1",
+        title="\r",
+        stages="frame",
+        files=None,
+        test=None,
+    )
+    raw = (hub / "docs" / "units" / "U1.md").read_bytes()
+    template = template_path("unit.md").read_bytes()
+    values = {b"unit": b"U1", b"title": b"\r", b"stages": b"frame"}
+    assert raw == re.sub(
+        rb"\{(unit|title|stages)\}", lambda match: values[match.group(1)], template
+    )

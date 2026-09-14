@@ -1,16 +1,23 @@
-"""Unit chains: ``helios unit new`` (SPEC §10).
+"""Unit chains: ``helios unit new`` (SPEC §10.2).
 
-Validation (step 1) runs before anything is written: every failure raises
-``UnitNewError``. Beads are created or reused (step 2) with the author of
-step 3, chained with ``dep_add`` plus the verify ``parent`` metadata
+Validation (steps 1 and 3) runs before any bd write: every failure raises
+``UnitNewError``, which the command prints with a ``helios: `` prefix and
+exits 2. Beads are looked up for every stage first, so an ambiguous reuse
+refuses before any bead is created; missing beads are then created with the
+step 3 author, chained with ``dep_add`` plus the verify ``parent`` metadata
 (step 4), and the unit file is written last with ``open(path, "x")`` so a
 crash leaves no unit file and a rerun reuses the beads (step 5). The caller
-prints ``format_table`` (step 6).
+prints ``format_table`` (step 6). The command holds ``unit_lock`` from before
+step 1 until it exits.
 """
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -42,12 +49,12 @@ _VERIFY_AGENT_KEY: dict[str, str] = {
     "verify-validate": "verify_validate",
 }
 
-_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _PLACEHOLDER_RE = re.compile(r"\{(unit|title|stages)\}")
 
 
 class UnitNewError(Exception):
-    """A SPEC §10.2 step 1 validation refusal; the command exits 2."""
+    """A SPEC §10.2 refusal; the command prints it with ``helios: `` and exits 2."""
 
 
 class UnitBeads(Protocol):
@@ -77,6 +84,38 @@ class StageRow:
     blocked_by: str | None
 
 
+@contextlib.contextmanager
+def unit_lock(hub: Path, runs_dir: str, unit: str) -> Iterator[None]:
+    """Hold the exclusive non-blocking creation lock (SPEC §10.2).
+
+    The lock file is ``<hub>/<project.runs>/unit-<unit>.lock``. A held lock
+    raises ``UnitNewError`` naming the unit. When the lock file itself cannot
+    be created, validation (which runs next and writes nothing) decides.
+    """
+    path = hub / runs_dir / f"unit-{unit}.lock"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a")
+    except OSError:
+        handle = None
+    if handle is None:
+        yield
+        return
+    with handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EACCES):
+                raise UnitNewError(
+                    f"unit {unit} is being created by another process"
+                ) from None
+            raise
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def _parent_index(stages: list[str], index: int) -> int | None:
     """Index of the nearest earlier non-verify stage (SPEC §10.2 step 4)."""
     for j in range(index - 1, -1, -1):
@@ -98,18 +137,35 @@ def _spec_for_stage(config: Config, stage: str) -> str:
 
 
 def _resolve_author(
-    *, spec: str, parent_author: str | None, config: Config
+    *, spec: str, parent_author: str, config: Config
 ) -> str:
-    """Resolve an agent spec to the recorded author (SPEC §5, §10.2 step 3).
+    """Resolve an ``other`` spec against the parent author (SPEC §5, §10.2 step 3).
 
-    A plain spec is recorded as is. ``other`` resolves against the parent
-    stage author, and the recorded author is the harness name.
+    The recorded author is the harness name. An unresolvable ``other`` is a
+    refusal with the SPEC step 3 message.
     """
-    if split_spec(spec)[0] != "other":
-        return spec
-    return resolve_harness(
-        spec, author=parent_author, verify_order=config.agents.verify_order
-    )
+    try:
+        return resolve_harness(
+            spec, author=parent_author, verify_order=config.agents.verify_order
+        )
+    except ValueError:
+        harness = parent_author.partition(":")[0]
+        raise UnitNewError(
+            f"no harness in agents.verify_order differs from {harness}"
+        ) from None
+
+
+def _check_units_dir(*, hub: Path, units: str) -> None:
+    """Refuse when an existing component of the units directory is not one.
+
+    SPEC §10.2 step 1: every existing component of ``<hub>/<project.units>``
+    is a directory, checked before anything is written.
+    """
+    node: Path | None = None
+    for part in (hub / units).parts:
+        node = Path(part) if node is None else node / part
+        if node.exists() and not node.is_dir():
+            raise UnitNewError(f"units directory component is not a directory: {node}")
 
 
 def _validate(
@@ -118,12 +174,14 @@ def _validate(
     stages_raw: str,
     files_raw: str | None,
     test: str | None,
+    hub: Path,
+    units: str,
     unit_path: Path,
 ) -> tuple[list[str], list[str] | None]:
     """Check every SPEC §10.2 step 1 rule before anything is written."""
-    if not _UNIT_RE.match(unit):
+    if re.fullmatch(_UNIT_RE, unit) is None:
         raise UnitNewError(
-            f"invalid unit name {unit!r}: must match ^[A-Za-z0-9][A-Za-z0-9._-]*$"
+            f"invalid unit name {unit!r}: must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,99}}$"
         )
     stages = stages_raw.split(",")
     if any(item == "" for item in stages):
@@ -155,6 +213,7 @@ def _validate(
             raise UnitNewError("--files has an empty item")
         if not test:
             raise UnitNewError("--test is required when impl or validate is present")
+    _check_units_dir(hub=hub, units=units)
     if unit_path.exists():
         raise UnitNewError(f"unit file already exists: {unit_path}")
     return stages, files
@@ -179,35 +238,69 @@ def create_unit(
 ) -> list[StageRow]:
     """Run ``helios unit new`` (SPEC §10.2); return one row per stage.
 
-    Raises ``UnitNewError`` before writing anything when step 1 refuses.
+    Raises ``UnitNewError`` before any bd write when steps 1 to 3 refuse. The
+    caller holds ``unit_lock``.
     """
-    unit_path = config.hub / config.project.units / f"{unit}.md"
+    units_dir = config.project.units
+    unit_path = config.hub / units_dir / f"{unit}.md"
     stage_ids, file_list = _validate(
         unit=unit,
         stages_raw=stages,
         files_raw=files,
         test=test,
+        hub=config.hub,
+        units=units_dir,
         unit_path=unit_path,
     )
+    reused: list[Bead | None] = []
+    for stage in stage_ids:
+        candidates = [
+            bead
+            for bead in beads.list(labels=[f"unit:{unit}", f"kind:{stage}"])
+            if bead.status != "closed"
+        ]
+        if len(candidates) > 1:
+            names = ", ".join(bead.id for bead in candidates)
+            raise UnitNewError(
+                f"more than one open bead for stage {stage}: {names}"
+            )
+        reused.append(candidates[0] if candidates else None)
     authors: list[str] = []
     for index, stage in enumerate(stage_ids):
-        parent_author: str | None = None
+        spec = _spec_for_stage(config, stage)
         if stage in _VERIFY_STAGES:
             parent = _parent_index(stage_ids, index)
             assert parent is not None  # refused by _validate
-            parent_author = authors[parent]
-        authors.append(
-            _resolve_author(
-                spec=_spec_for_stage(config, stage),
-                parent_author=parent_author,
-                config=config,
-            )
-        )
+            parent_bead = reused[parent]
+            if parent_bead is not None and parent_bead.author:
+                parent_author = parent_bead.author
+            else:
+                parent_author = authors[parent]
+            if split_spec(spec)[0] == "other":
+                authors.append(
+                    _resolve_author(
+                        spec=spec, parent_author=parent_author, config=config
+                    )
+                )
+            else:
+                authors.append(spec)
+        else:
+            if split_spec(spec)[0] == "other":
+                raise UnitNewError(
+                    f"agent spec other is valid only for verify stages, not {stage}"
+                )
+            authors.append(spec)
     bead_ids: list[str] = []
     for index, (stage, author) in enumerate(zip(stage_ids, authors)):
-        candidates = beads.list(labels=[f"unit:{unit}", f"kind:{stage}"])
-        reused = next((b for b in candidates if b.status != "closed"), None)
-        if reused is None:
+        hit = reused[index]
+        if hit is not None:
+            bead_id = hit.id
+            if stage in _VERIFY_STAGES:
+                parent = _parent_index(stage_ids, index)
+                assert parent is not None  # refused by _validate
+                if hit.parent != bead_ids[parent]:
+                    beads.set_metadata(bead_id, {"parent": bead_ids[parent]})
+        else:
             metadata: dict[str, Any] = {"unit": unit, "kind": stage, "author": author}
             if stage in _NEEDS_FILES:
                 assert file_list is not None  # required by _validate
@@ -224,13 +317,6 @@ def create_unit(
                 type="task",
                 description="",
             )
-        else:
-            bead_id = reused.id
-            if stage in _VERIFY_STAGES:
-                parent = _parent_index(stage_ids, index)
-                assert parent is not None  # refused by _validate
-                if reused.parent != bead_ids[parent]:
-                    beads.set_metadata(bead_id, {"parent": bead_ids[parent]})
         bead_ids.append(bead_id)
     for later, earlier in zip(bead_ids[1:], bead_ids[:-1]):
         # bd treats adding an existing dependency as a no-op (see
@@ -244,15 +330,22 @@ def create_unit(
             handle.write(text)
     except FileExistsError:
         raise UnitNewError(f"unit file already exists: {unit_path}") from None
-    return [
-        StageRow(
-            bead=bead_id,
-            stage=stage,
-            author=author,
-            blocked_by=bead_ids[i - 1] if i else None,
+    rows: list[StageRow] = []
+    for i, (bead_id, stage) in enumerate(zip(bead_ids, stage_ids)):
+        hit = reused[i]
+        if hit is not None and hit.author:
+            row_author = hit.author
+        else:
+            row_author = authors[i]
+        rows.append(
+            StageRow(
+                bead=bead_id,
+                stage=stage,
+                author=row_author,
+                blocked_by=bead_ids[i - 1] if i else None,
+            )
         )
-        for i, (bead_id, stage, author) in enumerate(zip(bead_ids, stage_ids, authors))
-    ]
+    return rows
 
 
 def format_table(rows: list[StageRow]) -> str:
