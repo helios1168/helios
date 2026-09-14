@@ -8,10 +8,14 @@ import signal
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from helios import attempt, beads, config, events
 from helios.harness.base import LaunchSpec
+
+
+def _utc_seconds() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _attempt_dirs(runs: Path, bead: str) -> list[Path]:
@@ -92,21 +96,21 @@ def rows(hub: Path, runs_rel: str, *, bead_store: beads.BeadsLike | None = None,
         state = safe_state(directory)
         try:
             bead = store.show(bead_dir.name)
-            unit, kind, in_progress = bead.unit or "-", bead.kind or "-", bead.status == "in_progress"
+            unit, kind, in_progress = bead.unit, bead.kind, bead.status == "in_progress"
         except Exception:
-            unit, kind, in_progress = "-", "-", False
+            unit, kind, in_progress = None, None, False
         if state["state"] == "finalized" and not in_progress:
             continue
         inp = _input(directory)
-        harness = inp.get("harness") or "-"
+        harness = inp.get("harness") or None
         session_id = state.get("session_id")
-        session = f"{harness}:{session_id}" if session_id is not None else "-"
+        session = f"{harness}:{session_id}" if harness is not None and session_id is not None else None
         alive = attempt.is_pid_alive(state.get("pid"))
         stored = state["state"]
         shown_state = f"{stored} (dead)" if stored == "launched" and not alive else stored
         row = {"bead": bead_dir.name, "unit": unit, "kind": kind, "harness": harness,
                "state": shown_state, "attempt": state.get("attempt_id"),
-               "age": _age(state.get("updated"), now), "worktree": inp.get("worktree") or "-",
+               "age": _age(state.get("updated"), now), "worktree": inp.get("worktree") or None,
                "session": session, "alive": alive,
                "last_event": _last_event(hub, bead_dir.name, state.get("attempt_id"))}
         out.append(row)
@@ -129,7 +133,10 @@ def attach(hub: Path, runs_rel: str, bead: str, *, harness_lookup: Callable[[str
     session_id = state.get("session_id")
     if session_id is None:
         raise ValueError(f"no session recorded for {state.get('attempt_id')}")
-    n = int(directory.name.removeprefix("attempt-"))
+    attempt_number = directory.name.removeprefix("attempt-")
+    if not attempt_number.isdigit():
+        raise ValueError(f"invalid attempt directory {directory.name}")
+    n = int(attempt_number)
     spec = LaunchSpec(bead=bead, attempt=n, worktree=worktree, prompt="",
                       report_path=directory / "report.json", report_schema_path=hub / "schemas/agent-report.schema.json",
                       raw_dir=directory / "raw", model=inp.get("model"), effort=inp.get("effort"),
@@ -156,7 +163,7 @@ def stop(hub: Path, runs_rel: str, bead: str) -> None:
     fd, temporary = tempfile.mkstemp(dir=directory, prefix="stop.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as handle:
-            handle.write(attempt.utc_now() + "\n")
+            handle.write(_utc_seconds() + "\n")
         os.replace(temporary, path)
     except BaseException:
         try:
@@ -164,7 +171,10 @@ def stop(hub: Path, runs_rel: str, bead: str) -> None:
         except OSError:
             pass
         raise
+    if not isinstance(pid, int):
+        raise ValueError(f"no running attempt for {bead}")
+    process_id = cast(int, pid)
     try:
-        os.killpg(int(pid), signal.SIGINT)
+        os.killpg(process_id, signal.SIGINT)
     except ProcessLookupError:
         pass

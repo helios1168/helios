@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from helios import config, messages
+from helios import config, messages, sessions
 
 NAME = "say"
 HELP = "Queue a message for an attempt."

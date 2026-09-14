@@ -17,7 +17,7 @@ def run(args) -> int:
     try:
         lookup = getattr(harness, "get", None)
         if lookup is None:
-            raise ValueError(f"unknown harness for {args.bead}")
+            lookup = lambda name: None
         sessions.attach(cfg.hub, cfg.project.runs, args.bead, harness_lookup=lookup)
     except (OSError, ValueError, KeyError) as exc:
         print(str(exc), file=__import__("sys").stderr)

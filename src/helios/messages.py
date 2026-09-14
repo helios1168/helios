@@ -6,16 +6,20 @@ import json
 import os
 import secrets
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from helios import attempt, beads, events
-from helios.attempt import utc_now
+
+
+def _utc_seconds() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def write_message(runs: Path, bead: str, text: str, kind: str = "steer") -> str:
     """Atomically write one inbox message and return its id (SPEC §9.4)."""
-    created = utc_now()
+    created = _utc_seconds()
     stamp = created.replace("-", "").replace(":", "")
     msg_id = f"{stamp}-{secrets.token_hex(4)}"
     directory = runs / bead / "inbox"
