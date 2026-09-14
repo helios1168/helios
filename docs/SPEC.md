@@ -60,6 +60,14 @@ and a group. Modules for nested commands are named with underscores: `commands/u
 defines `NAME = "unit new"`. Library code lives outside `commands/`; a command module only parses
 arguments and calls it.
 
+- A command module imports optional dependencies (for example `sympy`, `z3`) inside `run`, never
+  at module level, so a missing optional package breaks only that command.
+- A command that gets a configuration error (`ValueError` or `TypeError` from `helios.config`)
+  prints `helios: <message>` to stderr and exits 2.
+- `helios.templates.path(name)` returns `<repository>/templates/<name>` (the directory two levels
+  above the package) and raises `FileNotFoundError` naming the path. Shipping templates inside a
+  wheel is not in this wave.
+
 ## 3. Stages
 
 | id | input | output | author role | verifier | done when |
@@ -360,6 +368,7 @@ These apply to claude, codex, opencode and agy.
 4. Prepare the worktree (§7.3).
 5. Allocate the attempt (§8).
 6. Assemble the prompt (§7.2); write `prompt.md` and `input.json` with the input hashes.
+   `input.json` also holds `harness`, the resolved harness name.
 7. Launch with `subprocess.Popen(argv, cwd=worktree, stdin=<stdin_text, else DEVNULL>,
    stdout=stdout file, stderr=stderr.log, start_new_session=True)`, environment plus
    `HELIOS_BEAD`, `HELIOS_ATTEMPT`, `HELIOS_HARNESS`, `HELIOS_HUB`, `HELIOS_REPORT`. Record
@@ -600,17 +609,46 @@ the window runs the attach command and the attempt runs headless. Users attach w
 
 ### 9.2 Commands
 
-- `helios ps [--json]`: one row per bead with an attempt that is not finalized or whose bead is
-  in progress: bead, unit, kind, harness, state, attempt, age, worktree, session. State comes
-  from `state.json`, whether the pid is alive, and the last event.
-- `helios attach <bead>`: exec the adapter's attach command with cwd the worktree.
-- `helios say <bead> "<text>" [--kind steer|answer]`: write a message (§9.4), deliver it by
-  resuming the session when idle, log a `steer:` or `answer:` comment. Refuse when the pid is
-  alive and print that the message is queued in the inbox.
-- `helios stop <bead>`: SIGINT the attempt pid (or the opencode abort route), record
-  `interrupted`.
+- `helios ps [--json]`: rows come from the directories under `<runs>`, one per bead, using its
+  highest attempt (§8.3 reading rules apply), sorted by bead id. A bead gets a row when that
+  attempt is not finalized or the bead is `in_progress`. Each bead is read once with `bd show`
+  through `helios.beads`; when that fails, `unit`, `kind` and the in-progress test fall back to
+  `-` and false. Columns: `bead`, `unit`, `kind`, `harness` (key `harness` of the attempt's
+  `input.json`, else `-`), `state`, `attempt` (the attempt id), `age`, `worktree`, `session`
+  (`<harness>:<session_id>`, else `-`). Text output is tab-separated with that header line;
+  `state` shows the stored state, plus ` (dead)` when the state is `launched` and the pid is not
+  alive. Age is now minus `updated`: under 60 s `<n>s`, under 60 min `<n>m`, under 24 h `<n>h`,
+  else `<n>d`, whole units rounded down, `-` when unknown. `--json` prints a list of objects
+  with those keys (null for unknown) plus `alive` (bool) and `last_event` (the `type` of the
+  last parseable line of the events file (§9.3) whose `bead` equals the bead and whose `attempt`
+  equals the attempt id, else null). With no rows, text prints the header only and `--json`
+  prints `[]`. Exit 0.
+- `helios attach <bead>`: uses the highest attempt. It exits 2 with a message on stderr when
+  there is no attempt, when `input.json` has no `harness`, when the worktree is missing, or when
+  `session_id` is null (`no session recorded for <attempt_id>`; the session id is only known
+  after the adapter's parse, §7.1 step 8). Otherwise it builds the `LaunchSpec` from
+  configuration and the attempt paths with prompt `""`, calls the adapter's
+  `attach_command(session_id, spec)`, replaces element 0 with the configured binary (§6.4),
+  changes to the worktree directory and calls `os.execvp`. The harness lookup and the exec
+  function are parameters of the library function, so tests inject them.
+- `helios say <bead> "<text>" [--kind steer|answer]`: `--kind` defaults to `steer`. A bead with
+  no directory under `<runs>` exits 2. Otherwise `say` always writes the message first (§9.4),
+  then adds the comment `<kind>: [<msg_id>] <text>` with the replay rule of §7.5, then appends
+  the event with type `<kind>`, source `orchestrator` and detail `<msg_id>`. When the highest
+  attempt is `launched` with a live pid, it prints `queued <msg_id>` to stderr and exits 3.
+  Otherwise it prints `<msg_id>` to stdout and exits 0. `say` never delivers: delivery belongs
+  to `helios resume`.
+- `helios stop <bead>`: exits 2 with `no running attempt for <bead>` unless the highest attempt
+  is `launched` with a live pid. It writes `attempt-<n>/stop-requested` holding the UTC time
+  (`yyyy-mm-ddThh:mm:ssZ` and a newline) with a temp file and `os.replace`, then sends SIGINT
+  once to the attempt's process group with `os.killpg(pid, SIGINT)`, and exits 0 (also when the
+  group is already gone). It never escalates and never writes `state.json`. The running
+  `helios run` classifies an attempt whose `stop-requested` file exists as `interrupted` in
+  step 8. The opencode abort route is not used in this wave.
 - `helios resume <bead> ["<text>"]`: new turn on the same session and attempt; default text
-  `Continue.`; the turn writes `stdout-turn-<k>.jsonl`.
+  `Continue.`; the turn writes `stdout-turn-<k>.jsonl`. `resume` first delivers every message in
+  `inbox/` that has no ack, in `msg_id` order, one turn each (§9.4), then runs its own turn when
+  text was given or no message was pending.
 
 ### 9.3 Events
 
@@ -630,6 +668,10 @@ A message is `<runs>/<bead>/inbox/<msg_id>.json`: `{"id", "kind", "text", "creat
 delivery and ack can deliver twice; the marker lets the agent and the transcript audit
 recognise the duplicate. Workers never message workers.
 
+The message file is written to a temp name in `inbox/` and moved with `os.replace`. `created` is
+UTC `yyyy-mm-ddThh:mm:ssZ`; the 8 hex digits come from `secrets.token_hex(4)`; `from` is
+`orchestrator`; `to` is the bead id. `inbox/` and `acks/` are created on demand.
+
 ## 10. Units and chains
 
 ### 10.1 Unit file
@@ -640,14 +682,34 @@ line, `Status:` (`open`, `in-progress`, `done`, `dropped`), `Stages:`, and secti
 
 ### 10.2 `helios unit new <unit> "<title>" --stages s1,s2,... [--files glob,...] [--test CMD]`
 
-1. Refuse when the unit file exists or a stage id is not in §3.
-2. Write the unit file.
-3. For each stage create a bead titled `<unit> <stage>: <title>` with labels `unit:<unit>` and
-   `kind:<stage>`, metadata `unit`, `kind`, `author` (resolved agent spec, §5), and for `impl`
-   and `validate` the given `files` and `test`.
-4. Chain the beads in stage order: each stage is blocked by the previous one. A verify stage
-   records `parent` = the bead it verifies (the nearest earlier non-verify stage).
-5. Print a table: bead, stage, author, blocked-by.
+1. Validate. Every failure exits 2 with a message on stderr before anything is written:
+   - `<unit>` matches `^[A-Za-z0-9][A-Za-z0-9._-]*$`;
+   - `--stages` split on `,` has no empty or duplicate items, every item is a stage id of §3
+     except `remember` (it never blocks, so it gets no bead), and the items are strictly
+     increasing in the row order of the §3 table;
+   - a verify stage (`verify-math`, `verify-code`, `verify-validate`) has an earlier non-verify
+     stage in the list, else `<stage> has no earlier stage to verify`;
+   - when `impl` or `validate` is present, `--files` (split on `,`, no empty items) and `--test`
+     are given;
+   - the unit file `docs/units/<unit>.md` does not exist.
+2. For each stage in order, reuse the bead that is not closed and carries labels `unit:<unit>`
+   and `kind:<stage>`; else create one titled `<unit> <stage>: <title>` with those labels and
+   metadata `unit`, `kind`, `author`, and for `impl` and `validate` `files` and `test`. Metadata
+   is passed as one JSON object so every value keeps its JSON type.
+3. `author` is the resolved agent spec of §5 for the stage: `model` takes `agents.model`, `impl`
+   and `validate` take `agents.implement`, each verify stage takes its `agents.verify_*` key, and
+   `frame`, `survey` and `report` take `agents.orchestrate`. `other` resolves against the author
+   of the stage's `parent` (the nearest earlier non-verify stage in the list), and the recorded
+   author is the harness name.
+4. Chain in list order: `bd dep add <later> <earlier>` for each adjacent pair, skipping a
+   dependency that already exists. A verify stage also records metadata `parent` = the bead of
+   its parent stage.
+5. Write the unit file last, with `open(path, "x")`, creating missing parent directories. It is
+   `templates/unit.md` (through `helios.templates.path`) with `{unit}`, `{title}` and `{stages}`
+   replaced in one `re.sub` pass, never `str.format`; `{stages}` is the stage ids joined with
+   `,`. A crash before this step leaves no unit file, so a rerun reuses the beads made so far.
+6. Print to stdout a tab-separated table with the header line `bead`, `stage`, `author`,
+   `blocked-by` and one row per stage, `-` for none. Exit 0.
 
 Exact `bd` flags are read from `bd <command> --help` and used only inside `helios.beads`.
 Tests run against a real `bd init` in a temporary repository when `bd` is on PATH, else skip.
@@ -700,15 +762,36 @@ Line 1 is literal. Line 2 is one JSON object with sorted keys; `source` is requi
 `active`, `superseded` or `retracted`. Line 3 is empty. The body follows unchanged, including
 its trailing newline or lack of one.
 
+- `Memory(key, header, body)` is a frozen dataclass; `header` is the line 2 object as a dict.
+  `read` of a missing key raises `KeyError`.
+- Keys match `^[A-Za-z0-9][A-Za-z0-9._-]*$`, else `ValueError` naming the key.
+- Line 2 is `json.dumps(header, sort_keys=True, ensure_ascii=False)` with the default
+  separators. Parsing requires the text to start with `helios-memory 1\n`, then one line holding
+  a JSON object, then `\n`; anything else raises `ValueError` naming the key. The body may be
+  empty. Line endings are never normalized.
 - **beads backend**: `bd remember --key <key> "<value>"`, `bd recall <key>`, `bd memories`.
-  Every `write` also writes the export file.
+  `write` calls `bd` first (through `helios.beads`), then writes the export file under
+  `memory.export_dir` via a temp file and `os.replace`. The backend skips `bd memories` values
+  that do not start with line 1 and prints a note naming each skipped key to stderr. A memory
+  body must survive `bd remember` and `bd recall` unchanged. If bd changes it (for example a
+  trailing newline), the beads backend stores the whole value in a form bd keeps, and a test
+  round-trips bodies ending in no newline, `\n` and `\n\n`.
 - **files backend**: `<export_dir>/<key>.md` holding exactly the value format.
-- `export` writes each memory to `<directory>/<key>.md`; `import_` reads the same format;
+- `write` refuses: a header without `source` as a non-empty string (`ValueError`), a `status`
+  outside `active`, `superseded`, `retracted` (`ValueError`; a missing `status` is written as
+  `active`), and any call while the environment has `HELIOS_BEAD` set (`PermissionError`, since
+  workers never write memories). Other header keys are kept. `supersedes` never edits another
+  memory.
+- `export` writes each memory to `<directory>/<key>.md` and never deletes files; `import_` reads
+  the same format from only the `*.md` files directly in the directory, in sorted name order;
   export after import reproduces the tree byte for byte.
-- `stale()` lists active memories whose `source` bead carries the label `truth:wrong`.
-- A write without `source` is refused. Workers never write memories.
-- `inject(keys)` returns each value under a `### <key>` heading, in the given order; a missing
-  key raises.
+- `stale()` lists active memories whose `source` bead carries the label `truth:wrong`. The bead
+  id is `source` up to the first `#`; a bead that does not exist is not stale; the result is
+  sorted by key.
+- `inject(keys)` returns `### <key>\n\n<body>` for each key, joined with `\n\n`, in the given
+  order; a missing key raises `KeyError`.
+- `helios.memory.open_backend(config)` returns the backend for `memory.backend` and raises
+  `ValueError` `unknown memory backend '<value>'` for any other value.
 
 ## 14. Learned queue and gates
 
@@ -730,22 +813,41 @@ block to a solver model using `name=<id>` or `name=<id>[...]`. `Registry` holds 
 retired blocks; ids are unique and never reused. A project's program module
 (`project.program`) exposes `REGISTRY`.
 
+`Registry()` has `add(block)` (`ValueError` when the id was ever used, active or retired),
+`retire(id)` (moves an active block to retired; `KeyError` when not active), and `active()` and
+`retired()` in insertion order. `active()` leaves out every id listed in the environment
+variable `HELIOS_OMIT` (comma-separated). A program module may expose `DATA`;
+`build(model, data)` receives `getattr(module, "DATA", None)`.
+
 ### 15.2 Claims
 
 `helios.claims`: decorator `@claim(name, covers, backend, method, scope, bound=None,
 artifact=None, redundant=())` registers a zero-argument callable returning `True`, `False` or a
-`Finding`. `project.claims` names the module. Backends and their allowed methods and scopes come
-from `backends.toml` (the project's `.agents/backends.toml`, else `templates/backends.toml`).
+`Finding`. `bound` is `dict[str, str] | None`, the same type as `Finding.bound`. `project.claims`
+names the module. Backends and their allowed methods and scopes come from `backends.toml` (the
+project's `.agents/backends.toml`, else `templates/backends.toml`).
 
-`helios claims check [--backend B] [--covers ID]`:
+`helios claims check [--backend B] [--covers ID] [--timeout S]`:
 
-1. Every claim covers at least one active block id; unknown ids fail.
-2. The backend exists and allows the claim's method and scope.
-3. Run every non-`manual` claim in a subprocess with a timeout. `True` gives a verified finding
-   with the declared method and scope. `False` gives a refuted finding only when the backend
-   allows `counterexample`, else inconclusive. An exception gives inconclusive with the
-   traceback saved and its path in `artifact`.
-4. Print the findings; exit 0 only when every non-manual claim is verified.
+1. Every claim covers at least one active block id; unknown ids fail. An id matching
+   `^R[0-9]+$` is a requirement id and is not checked against the registry; a retired block id
+   counts as unknown.
+2. The backend exists and allows the claim's method and scope. Steps 1 and 2 run for every
+   selected claim before anything runs; any failure prints one line per problem to stderr and
+   exits 2.
+3. The claims module is imported with the hub and `<hub>/src` put in front of `sys.path`. Each
+   non-`manual` claim runs as `python -m helios.claims.runner <module> <name>` with cwd the hub
+   and a timeout from `--timeout S` (default 600). The runner prints one JSON line:
+   `{"result": true}`, `{"result": false}`, `{"finding": {...}}` or `{"error": "<traceback>"}`.
+   Only a JSON boolean or a `Finding` counts; any other return value is inconclusive with a
+   note. `True` gives a verified finding with `id` and `claim` set to the claim name and the
+   declared `covers`, `method`, `scope`, `bound` and `artifact`. `False` gives a refuted finding
+   with method `counterexample` when the backend allows it, else inconclusive. An error, a
+   timeout (note `timeout after <S> s`) or unparsable runner output gives inconclusive; an
+   error's traceback is saved to `<hub>/.helios/claims/<name>.traceback.txt` and that path goes
+   in `artifact`.
+4. Print one JSON finding per line to stdout. Exit 0 when every selected non-manual claim is
+   verified (also when none is selected), else 3.
 
 `helios claims attack <claim>`: for each covered block, rebuild the registry without it and
 rerun the claim. Each mutation has an expected effect: `must_fail` by default, `may_pass` for
@@ -753,16 +855,35 @@ blocks listed in the claim's `redundant`. A `must_fail` mutation that still pass
 as a surviving mutation. A surviving mutation is a finding to review, not proof of a defective
 claim.
 
+The claim first runs unchanged; unless that returns `True`, print `baseline did not pass` to
+stderr and exit 2. Then for each covered id that is an active block id (requirement ids are
+skipped), in `covers` order, rerun the claim with `HELIOS_OMIT=<id>` and print one line
+`<id> <must_fail|may_pass> <passed|failed|inconclusive>`. Exit 3 when a `must_fail` mutation
+passed, else 0.
+
 ### 15.3 Program commands
 
-- `helios program show [--output PATH]`: deterministic markdown: one section per kind in the
-  order of §15.1, one line per block `ID  expr  # satisfies R.. / relaxes R..`, then
-  `## Retired`. The same registry gives the same bytes.
+- `helios program show [--output PATH]`: deterministic markdown. Sections `## <kind>` follow
+  the kind order of §15.1, only for kinds with active blocks, with blocks sorted by id and one
+  line per block `<id>  <expr>  # satisfies <ids> / relaxes <ids>`, where `expr` is `str(expr)`
+  with newlines replaced by spaces and id lists are joined with `, `. A half with no ids is
+  dropped with its ` / ` separator, and the whole comment is dropped when both are empty.
+  `## Retired` follows only when there are retired blocks, in the same line format sorted by
+  id. Output ends with one newline. `--output PATH` writes the file instead of stdout. The same
+  registry gives the same bytes.
 - `helios program check`: call each active block's `build` on a recording model object and
   assert the set of recorded names, with any `[...]` suffix stripped, equals the active
-  constraint and objective ids that have a `build`. Report missing and unexpected names.
+  constraint and objective ids that have a `build`. Only names recorded while building
+  `constraint` and `objective` blocks are compared; blocks are built in insertion order. The
+  recording model returns a recorder for any attribute; calling a recorder records
+  `kwargs["name"]` when it is a string and returns a new recorder. The suffix stripped is
+  everything from the first `[`. Print `missing: <ids>` and `unexpected: <names>` lines (sorted,
+  comma-separated, only when non-empty) and exit 1 on a mismatch, else 0.
 - `helios program diff <rev1> <rev2>`: load the registry at two git revisions (`git show
-  <rev>:<path>` into a temporary module) and print `+ID` and `-ID` lines.
+  <rev>:<path>` into a temporary module). The registry module path at a revision is
+  `src/<module with dots as slashes>.py`, else `<module with dots as slashes>.py`; when neither
+  exists at that revision, exit 2. Only active ids are compared. Print every `+<id>` line (in
+  rev2, not rev1) sorted, then every `-<id>` line sorted. Exit 0.
 
 Semantic conformance beyond names (coefficients, bounds, domains, objective direction, feasible
 sets on small instances) is a verifier task in `verify-code`, not a `program check` result.
