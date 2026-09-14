@@ -51,6 +51,8 @@ class PreflightContext:
     memory_has: Callable[[str], bool]
     runs_rel: str = ".helios/runs"
     units_dir: str = "docs/units"
+    worktrees_rel: str = ".claude/worktrees"
+    bead_show: Callable[[str], Bead] | None = None
 
 
 def check(beads: list[Bead], ctx: PreflightContext) -> list[str]:
@@ -83,6 +85,8 @@ def _check_bead(bead: Bead, ctx: PreflightContext) -> list[str]:
             errors.append(f"{bead.id}: verify bead needs `unit`")
         if not bead.parent:
             errors.append(f"{bead.id}: verify bead needs `parent`")
+        elif ctx.bead_show is not None:
+            errors.extend(_check_verify_worktree_start(bead, ctx))
     for key in bead.memories:
         if not ctx.memory_has(key):
             errors.append(f"{bead.id}: memory {key!r} does not exist")
@@ -106,6 +110,26 @@ def _check_doc(bead_id: str, entry: str, ctx: PreflightContext) -> list[str]:
             find_section(path.read_text(), key)
         except KeyError:
             return [f"{bead_id}: docs key {key!r} does not resolve in {path_text!r}"]
+    return []
+
+
+def _check_verify_worktree_start(bead: Bead, ctx: PreflightContext) -> list[str]:
+    """A fresh verify worktree starts at the parent's ``output_commit`` (SPEC §7.1, §7.3).
+
+    An existing worktree is reused regardless (``worktree.prepare`` ignores
+    ``start`` then), so only a bead without one yet needs the metadata.
+    """
+    assert bead.parent is not None
+    assert ctx.bead_show is not None
+    if (ctx.hub / ctx.worktrees_rel / bead.id).exists():
+        return []
+    try:
+        parent = ctx.bead_show(bead.parent)
+        commit = parent.metadata.get("output_commit")
+    except Exception:
+        commit = None
+    if not isinstance(commit, str) or not commit:
+        return [f"{bead.id}: parent {bead.parent} has no output_commit metadata"]
     return []
 
 

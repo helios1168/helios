@@ -15,18 +15,21 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import FrameType
+from typing import Any, cast
 
 from helios import attempt as attempt_mod
 from helios import beads as beads_mod
 from helios import config as config_mod
 from helios import envelope as envelope_mod
 from helios import events as events_mod
+from helios import memory as memory_mod
 from helios import ownership as ownership_mod
 from helios import prompt as prompt_mod
 from helios import worktree as worktree_mod
@@ -38,7 +41,28 @@ class MemoryLookupError(RuntimeError):
 
 _RUNNING: dict[str, subprocess.Popen[str]] = {}
 _RUNNING_LOCK = threading.Lock()
-_INTERRUPT = threading.Event()
+
+
+class _InterruptFlag(threading.Event):
+    """``threading.Event`` whose ``clear()`` also resets the SIGINT reentry guard.
+
+    ``_handle_sigint`` sets ``_SIGINT_SETTING`` before calling ``set()`` on this
+    flag, so a nested SIGINT delivered while ``set()`` is still acquiring its
+    condition lock returns immediately instead of re-entering ``set()`` and
+    deadlocking on the non-reentrant lock (SPEC §7.1, round 7). The guard must
+    come back down wherever this flag is cleared, whoever clears it, so a
+    later, genuine SIGINT still fires; overriding ``clear()`` here does that
+    regardless of the caller.
+    """
+
+    def clear(self) -> None:
+        global _SIGINT_SETTING
+        _SIGINT_SETTING = False
+        super().clear()
+
+
+_INTERRUPT = _InterruptFlag()
+_SIGINT_SETTING = False
 _RUN_ACTIVE = threading.Event()
 _SEQ_THREADS: list[threading.Thread] = []
 _SEQ_DONE: set[int] = set()
@@ -92,14 +116,20 @@ _PREV_SIGINT: Callable[[int, FrameType | None], object] | int | None = None
 def _handle_sigint(signum: int, frame: FrameType | None) -> None:
     """Record a SIGINT and return immediately (SPEC §7.1 Interrupts).
 
-    The handler never blocks and takes no lock: a stopper thread started
-    by the run waits on the flag and runs the stop sequences. Later
-    SIGINTs are ignored: the guard also keeps a signal that arrives while
-    ``set()`` is already in progress (a storm) from re-entering the same
-    call on this thread and recursing on the Event's internal lock.
+    The handler never blocks and takes no lock of its own. A module-level
+    plain bool, ``_SIGINT_SETTING``, is set before calling ``Event.set()``
+    and tested first: a SIGINT delivered while that call is still acquiring
+    the Event's internal lock (a nested call on this same thread, since
+    Python signal handlers only run on the main thread between bytecodes)
+    sees the guard already up and returns without touching ``set()`` again,
+    so it never blocks on the non-reentrant lock ``set()`` is holding one
+    frame up (SPEC §7.1, round 7 reentry). ``_InterruptFlag.clear()`` brings
+    the guard back down, so later, genuine SIGINTs still fire.
     """
-    if _INTERRUPT.is_set():
+    global _SIGINT_SETTING
+    if _SIGINT_SETTING:
         return
+    _SIGINT_SETTING = True
     _INTERRUPT.set()
 
 
@@ -184,6 +214,43 @@ def compute_input_hashes(
     return hashes
 
 
+def _write_input_json(path: Path, payload: dict[str, object]) -> None:
+    """Write ``input.json``: sorted, indented, to a temp file then ``os.replace`` (SPEC §7.1 step 6)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="input.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _memory_backend(beads: beads_mod.BeadsLike, config: config_mod.Config) -> memory_mod.Backend:
+    """The memory backend for prompt assembly, over the run's own injected beads (SPEC §13).
+
+    Unlike ``helios.memory.open_backend``, which always talks to a real
+    ``bd``, this reuses whichever ``beads`` object the run was given (a real
+    ``Beads`` or a test's ``FakeBeads``), so memory injection is testable the
+    same way bead metadata already is (see ``memory_has_for``). Both concrete
+    types satisfy ``BeadsBackend``'s narrower ``remember``/``recall``/
+    ``memories`` interface even though the general ``BeadsLike`` protocol
+    used across ``run.py`` does not name it.
+    """
+    if config.memory.backend == "files":
+        return memory_mod.FilesBackend(config.hub / config.memory.export_dir)
+    if config.memory.backend == "beads":
+        return memory_mod.BeadsBackend(
+            cast(Any, beads), config.hub / config.memory.export_dir
+        )
+    raise ValueError(f"unknown memory backend '{config.memory.backend}'")
+
+
 def classify_execution(
     *,
     interrupted: bool,
@@ -262,6 +329,34 @@ def _stop_sequence(proc: subprocess.Popen[str], pgid: int) -> int | None:
     return proc.poll()
 
 
+def _tee_pump(pipe: object, out_fh: object) -> None:
+    """Copy child stdout bytes to the attempt log and this process's stdout.
+
+    ``--in-window`` mirrors the child's stdout bytes to its own stdout as
+    well as ``stdout.jsonl`` (SPEC §9.1).
+    """
+    try:
+        while True:
+            # read1, not read: a plain read(n) on a BufferedReader can block
+            # collecting up to n bytes instead of returning what is already
+            # there, so a short write followed by a long silence would never
+            # reach this process's own stdout until the child exits.
+            chunk = pipe.read1(4096)  # type: ignore[attr-defined]
+            if not chunk:
+                break
+            out_fh.write(chunk)  # type: ignore[attr-defined]
+            out_fh.flush()  # type: ignore[attr-defined]
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            pipe.close()  # type: ignore[attr-defined]
+        except OSError:
+            pass
+
+
 def _launch_and_wait(
     argv: list[str],
     *,
@@ -273,6 +368,8 @@ def _launch_and_wait(
     timeout_s: int,
     run_key: str,
     on_launched: Callable[[int], None] | None = None,
+    stop_path: Path | None = None,
+    tee_stdout: bool = False,
 ) -> tuple[int | None, bool, bool, bool, int | None]:
     """Run one attempt; return (exit, timed_out, interrupted, launch_failed, pid).
 
@@ -280,12 +377,17 @@ def _launch_and_wait(
     group (SPEC §7.1 step 7). ``launched`` with the child pid is recorded
     through ``on_launched`` as soon as ``Popen`` returns, before waiting
     (SPEC §8.2). A set interrupt flag skips the launch and records
-    ``interrupted`` without starting a child.
+    ``interrupted`` without starting a child. While waiting, ``stop_path``
+    (when given) is checked for existence about once a second; its
+    appearance runs the stop sequence early (SPEC §7.1 step 7, §9.2). The
+    caller does the SPEC §4.4 point 2 classification test of that same file,
+    once, after this returns and before parse. ``tee_stdout`` additionally
+    copies the child's stdout bytes to this process's own stdout (SPEC §9.1).
     """
     if _INTERRUPT.is_set():
         return None, False, True, False, None
     try:
-        out_fh = open(stdout_path, "w")
+        out_fh = open(stdout_path, "wb" if tee_stdout else "w")
     except OSError:
         return None, False, False, True, None
     try:
@@ -298,33 +400,54 @@ def _launch_and_wait(
             proc = subprocess.Popen(
                 argv,
                 cwd=cwd,
-                stdout=out_fh,
+                stdout=subprocess.PIPE if tee_stdout else out_fh,
                 stderr=err_fh,
                 stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                 env=env,
-                text=True,
+                text=not tee_stdout,
                 start_new_session=True,
             )
         except OSError:
             return None, False, False, True, None
         child_pid: int | None = proc.pid
         pgid = child_pid
+        tee_thread: threading.Thread | None = None
+        if tee_stdout and proc.stdout is not None:
+            tee_thread = threading.Thread(
+                target=_tee_pump, args=(proc.stdout, out_fh), name="tee-stdout", daemon=True
+            )
+            tee_thread.start()
         if stdin_text is not None and proc.stdin is not None:
             try:
-                proc.stdin.write(stdin_text)
+                data = stdin_text.encode() if tee_stdout else stdin_text
+                proc.stdin.write(data)  # type: ignore[arg-type]
                 proc.stdin.close()
             except (BrokenPipeError, OSError, ValueError):
                 pass
         if on_launched is not None:
             on_launched(child_pid)
         _reg_add(run_key, proc)
+
+        def _done(
+            exit_code: int | None, *, timed_out: bool, interrupted: bool
+        ) -> tuple[int | None, bool, bool, bool, int | None]:
+            if tee_thread is not None:
+                tee_thread.join(timeout=5)
+            return exit_code, timed_out, interrupted, False, child_pid
+
         try:
             start = time.monotonic()
+            last_stop_check = start
             while True:
                 if _INTERRUPT.is_set():
                     exit_code = proc.wait()
                     _wait_group_gone(proc, pgid, 30)
-                    return exit_code, False, True, False, child_pid
+                    return _done(exit_code, timed_out=False, interrupted=True)
+                if stop_path is not None and time.monotonic() - last_stop_check >= 1.0:
+                    last_stop_check = time.monotonic()
+                    if stop_path.exists():
+                        exit_code = _stop_sequence(proc, pgid)
+                        return _done(exit_code, timed_out=False, interrupted=False)
                 try:
                     exit_code = proc.wait(timeout=0.05)
                 except subprocess.TimeoutExpired:
@@ -332,14 +455,14 @@ def _launch_and_wait(
                 else:
                     if _INTERRUPT.is_set():
                         _wait_group_gone(proc, pgid, 30)
-                        return exit_code, False, True, False, child_pid
-                    return exit_code, False, False, False, child_pid
+                        return _done(exit_code, timed_out=False, interrupted=True)
+                    return _done(exit_code, timed_out=False, interrupted=False)
                 if time.monotonic() - start >= timeout_s:
                     exit_code = _stop_sequence(proc, pgid)
-                    return exit_code, True, False, False, child_pid
+                    return _done(exit_code, timed_out=True, interrupted=False)
         except KeyboardInterrupt:
             exit_code = _stop_sequence(proc, pgid)
-            return exit_code, False, True, False, child_pid
+            return _done(exit_code, timed_out=False, interrupted=True)
         finally:
             _reg_remove(run_key)
 
@@ -693,6 +816,7 @@ class _FinishArgs:
     input_hashes: dict[str, str]
     started_at: str
     notes: list[str]
+    steered: list[str] = field(default_factory=list)
 
 
 def _apply_writeback_once(
@@ -938,7 +1062,7 @@ def _finish_attempt(
             report_error=report_error,
             checks=checks,
             artifacts=[],
-            steered=[],
+            steered=list(args.steered),
             notes=notes,
         )
     else:
@@ -960,6 +1084,7 @@ def _finish_attempt(
             report=report,
             report_error=report_error,
             checks=checks,
+            steered=list(args.steered),
             notes=notes,
         )
     (attempt_dir / "envelope.json").write_text(
@@ -1033,13 +1158,21 @@ def _assemble_inputs(
     *,
     hub: Path,
     config: config_mod.Config,
+    beads: beads_mod.BeadsLike,
     bead: beads_mod.Bead,
     worktree_path: Path,
     branch: str,
     attempt_id: str,
     report_path: Path,
 ) -> tuple[str, dict[str, str], str, list[tuple[str, str]], dict[str, str], str | None]:
-    """Assemble the prompt and its hashed inputs (SPEC §7.2, §8.3)."""
+    """Assemble the prompt and its hashed inputs (SPEC §7.2, §8.3).
+
+    Each memory's body is read through the memory backend keyed by
+    ``config.memory.backend`` (SPEC §13 ``inject``); ``prompt.assemble``
+    renders its own ``### <key>`` heading per value, so passing raw bodies
+    here produces the same bytes as ``inject(bead.memories)`` would, item by
+    item, before any inject-cap truncation (SPEC §7.2 item 5).
+    """
     skills_dir = hub / "skills"
     agents_path = hub / "AGENTS.md"
     bead_map = {
@@ -1053,6 +1186,17 @@ def _assemble_inputs(
         "test": bead.test,
     }
     memories: dict[str, str] = {}
+    if bead.memories:
+        backend = _memory_backend(beads, config)
+        for key in bead.memories:
+            try:
+                memories[key] = backend.read(key).body
+            except (KeyError, ValueError, RuntimeError, OSError):
+                # Preflight's own lookup (SPEC §13) is the gate; a test or a
+                # caller running without it (SPEC §8.4 resume, dry-run) never
+                # crashes assembly over a key it cannot actually read, same
+                # as a missing docs entry just above.
+                memories[key] = ""
     report_schema = envelope_mod.schema_text("agent-report")
     prompt = prompt_mod.assemble(
         kind=bead.kind,
@@ -1143,6 +1287,23 @@ class _BeadLock:
                 pass
 
 
+def _verify_start_kwargs(
+    beads: beads_mod.BeadsLike, bead: beads_mod.Bead
+) -> dict[str, str]:
+    """``start=`` for ``worktree.prepare``: a verify kind starts at its parent's
+    ``output_commit`` metadata (SPEC §7.3); preflight already refused a fresh
+    verify worktree with none. An existing worktree ignores ``start``, and any
+    other kind keeps ``worktree.prepare``'s own ``main`` default.
+    """
+    if not bead.kind.startswith("verify") or not bead.parent:
+        return {}
+    try:
+        commit = beads.show(bead.parent).metadata.get("output_commit")
+    except Exception:
+        return {}
+    return {"start": commit} if isinstance(commit, str) and commit else {}
+
+
 def _refuse_live(bead_id: str, attempt_id: str | None) -> int:
     """Print the attach and stop commands and refuse with exit 2 (SPEC §8.4)."""
     print(
@@ -1157,6 +1318,7 @@ def _dry_run_one(
     bead_id: str,
     *,
     hub: Path,
+    beads: beads_mod.BeadsLike,
     bead: beads_mod.Bead,
     config: config_mod.Config,
     harness_name: str,
@@ -1197,6 +1359,7 @@ def _dry_run_one(
     prompt, _, _, _, _, _ = _assemble_inputs(
         hub=hub,
         config=config,
+        beads=beads,
         bead=bead,
         worktree_path=worktree_path,
         branch=branch,
@@ -1289,6 +1452,7 @@ def run_one(
     timeout_s: int | None = None,
     again: bool = False,
     dry_run: bool = False,
+    tee_stdout: bool = False,
 ) -> int:
     """Run one bead through launch, checks, commit and write-back (SPEC §7.1)."""
     if not _RUN_ACTIVE.is_set():
@@ -1302,6 +1466,7 @@ def run_one(
         timeout_s=timeout_s,
         again=again,
         dry_run=dry_run,
+        tee_stdout=tee_stdout,
     )
 
 
@@ -1315,6 +1480,7 @@ def _run_one_inner(
     timeout_s: int | None,
     again: bool,
     dry_run: bool,
+    tee_stdout: bool = False,
 ) -> int:
     """The body of :func:`run_one` under the run guard."""
     if _INTERRUPT.is_set():
@@ -1354,6 +1520,7 @@ def _run_one_inner(
             return _dry_run_one(
                 bead_id,
                 hub=hub,
+                beads=beads,
                 bead=bead,
                 config=cfg,
                 harness_name=harness_name,
@@ -1379,10 +1546,17 @@ def _run_one_inner(
                 if old_dir.is_dir():
                     try:
                         if action == "crash_and_new":
+                            # A stop was requested but helios died before it
+                            # classified the attempt: recovery reads the same
+                            # marker file so the outcome is interrupted, not
+                            # crashed (SPEC §4.4 point 2, §8.4).
+                            fallback = (
+                                envelope_mod.ExecutionStatus.INTERRUPTED
+                                if (old_dir / "stop-requested").exists()
+                                else envelope_mod.ExecutionStatus.CRASHED
+                            )
                             attempt_mod.transition(
-                                old_dir,
-                                "crashed",
-                                execution_status=envelope_mod.ExecutionStatus.CRASHED.value,
+                                old_dir, fallback.value, execution_status=fallback.value
                             )
                             stored = _stored_execution(old_dir)
                             _write_recovery_envelope(
@@ -1390,7 +1564,7 @@ def _run_one_inner(
                                 harness_name=harness_name, attempt_dir=old_dir,
                                 n=old_n,
                                 attempt_id=str(latest.get("attempt_id") or f"{bead_id}#{old_n}"),
-                                execution=stored or envelope_mod.ExecutionStatus.CRASHED,
+                                execution=stored or fallback,
                                 note="recovery: allocated with no live process",
                             )
                         else:
@@ -1418,6 +1592,7 @@ def _run_one_inner(
             worktrees=cfg.project.worktrees,
             link_into_worktrees=cfg.project.link_into_worktrees,
             again=again,
+            **_verify_start_kwargs(beads, bead),
         )
         if _INTERRUPT.is_set():
             return 4
@@ -1430,6 +1605,7 @@ def _run_one_inner(
         prompt, hashes, _, _, _, _ = _assemble_inputs(
             hub=hub,
             config=cfg,
+            beads=beads,
             bead=bead,
             worktree_path=worktree_path,
             branch=info.branch,
@@ -1440,13 +1616,14 @@ def _run_one_inner(
         (attempt_obj.dir / "report-schema.json").write_text(
             envelope_mod.schema_text("agent-report")
         )
-        (attempt_obj.dir / "input.json").write_text(
-            json.dumps(
-                {"input_hashes": hashes, "base_commit": base_commit, "bead": bead_id},
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n"
+        _write_input_json(
+            attempt_obj.dir / "input.json",
+            {
+                "harness": harness_name,
+                "input_hashes": hashes,
+                "base_commit": base_commit,
+                "bead": bead_id,
+            },
         )
         raw_dir = attempt_obj.dir / "raw"
         raw_dir.mkdir(parents=True, exist_ok=True)
@@ -1496,6 +1673,7 @@ def _run_one_inner(
                 detail=f"harness {harness_name}",
             )
 
+        stop_path = attempt_obj.dir / "stop-requested"
         proc_exit, timed_out, interrupted, launch_failed, _child = _launch_and_wait(
             argv,
             cwd=worktree_path,
@@ -1506,7 +1684,12 @@ def _run_one_inner(
             timeout_s=effective_timeout,
             run_key=run_key,
             on_launched=_record_launched,
+            stop_path=stop_path,
+            tee_stdout=tee_stdout,
         )
+        # SPEC §4.4 point 2: tested once, after the group is gone, before parse.
+        if not launch_failed and stop_path.exists():
+            interrupted = True
         native = harness.parse(spec, proc_exit, stdout_path)
         if launch_failed:
             attempt_mod.transition(
@@ -1617,17 +1800,218 @@ def _resume_latest(
         started_at=str(state.get("updated") or attempt_mod.utc_now()),
         notes=["resumed without a new attempt"],
     )
+    # An attempt never classified (no stored execution_status) is classified
+    # again here; the stop-requested marker counts then too (SPEC §4.4 point 2).
+    stopped = stored is None and (attempt_dir / "stop-requested").exists()
     return _finish_attempt(
         finish_args,
         capture=capture,
         native_session=session_id,
         native_error=None,
         proc_exit=None if stored is envelope_mod.ExecutionStatus.LAUNCH_FAILED else 0,
-        interrupted=stored is envelope_mod.ExecutionStatus.INTERRUPTED,
+        interrupted=stored is envelope_mod.ExecutionStatus.INTERRUPTED or stopped,
         timed_out=stored is envelope_mod.ExecutionStatus.TIMED_OUT,
         launch_failed=stored is envelope_mod.ExecutionStatus.LAUNCH_FAILED,
         transition_from=None,
     )
+
+
+def _envelope_execution_status(attempt_dir: Path) -> str:
+    """The ``execution_status`` just written to ``envelope.json``, or ``""``."""
+    try:
+        data = json.loads((attempt_dir / "envelope.json").read_text())
+        value = data.get("execution_status")
+        return value if isinstance(value, str) else ""
+    except (OSError, json.JSONDecodeError, ValueError):
+        return ""
+
+
+def run_turn(
+    bead_id: str,
+    *,
+    hub: Path,
+    beads: beads_mod.BeadsLike,
+    config: config_mod.Config,
+    bead: beads_mod.Bead,
+    harness_name: str,
+    worktree_path: Path,
+    resume_session: str,
+    text: str,
+    msg_id: str | None,
+    resumed_from: str,
+    timeout_s: int | None = None,
+) -> tuple[int, str]:
+    """Run one resumed turn: SPEC §7.1 steps 5-11 with a plain-text prompt (SPEC §9.2).
+
+    Used only by ``helios resume``: the prompt is ``<text>`` plus the report
+    path, not the full §7.2 assembly, and the harness is asked to continue
+    ``resume_session`` instead of starting fresh. Returns the SPEC §7.1 exit
+    code and the execution status just recorded, so the caller can decide
+    whether to ack a delivered message.
+    """
+    if not _RUN_ACTIVE.is_set():
+        _INTERRUPT.clear()
+    from helios.harness import get as harness_get
+
+    harness = harness_get(harness_name)
+    harness_cfg = config.harness.get(harness_name)
+    effective_timeout = (
+        timeout_s if timeout_s is not None else (harness_cfg.timeout_s if harness_cfg else 3600)
+    )
+    attempt_obj, alloc_notes = attempt_mod.allocate(
+        hub=hub, runs_rel=config.project.runs, bead=bead_id, worktree=worktree_path
+    )
+    report_path = attempt_mod.worktree_report_path(worktree_path, attempt_obj.n)
+    prompt_text = f"{text}\n\nReport path: {report_path}\n"
+    (attempt_obj.dir / "prompt.md").write_text(prompt_text)
+    (attempt_obj.dir / "report-schema.json").write_text(
+        envelope_mod.schema_text("agent-report")
+    )
+    base_commit = _head_commit(worktree_path)
+    hashes = {"prompt": sha256_text(prompt_text)}
+    input_payload: dict[str, object] = {
+        "harness": harness_name,
+        "input_hashes": hashes,
+        "base_commit": base_commit,
+        "bead": bead_id,
+        "resumed_from": resumed_from,
+    }
+    if msg_id is not None:
+        input_payload["msg_id"] = msg_id
+    _write_input_json(attempt_obj.dir / "input.json", input_payload)
+    raw_dir = attempt_obj.dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    spec = LaunchSpec(
+        bead=bead_id,
+        attempt=attempt_obj.n,
+        worktree=worktree_path,
+        prompt=prompt_text,
+        report_path=report_path,
+        report_schema_path=attempt_obj.dir / "report-schema.json",
+        raw_dir=raw_dir,
+        model=harness_cfg.model if harness_cfg else None,
+        effort=harness_cfg.effort if harness_cfg else None,
+        timeout_s=effective_timeout,
+        resume_session=resume_session,
+        server_url=harness_cfg.server_url if harness_cfg else None,
+        extra_args=tuple(harness_cfg.extra_args) if harness_cfg else (),
+        env=dict(os.environ),
+    )
+    argv = harness.argv(spec)
+    stdin_text = harness.stdin_text(spec)
+    stdout_path = attempt_obj.dir / "stdout.jsonl"
+    stderr_path = attempt_obj.dir / "stderr.log"
+    started_at = attempt_mod.utc_now()
+    env = dict(os.environ)
+    env.update(
+        {
+            "HELIOS_BEAD": bead_id,
+            "HELIOS_ATTEMPT": attempt_obj.attempt_id,
+            "HELIOS_HARNESS": harness_name,
+            "HELIOS_HUB": str(hub),
+            "HELIOS_REPORT": str(report_path),
+        }
+    )
+    run_key = str(attempt_obj.dir)
+    launched_box = {"fired": False}
+
+    def _record_launched(pid: int) -> None:
+        launched_box["fired"] = True
+        attempt_mod.transition(attempt_obj.dir, "launched", pid=pid)
+        events_mod.append(
+            hub,
+            source="helios",
+            type="launched",
+            bead=bead_id,
+            attempt=attempt_obj.attempt_id,
+            session=None,
+            detail=f"harness {harness_name}",
+        )
+
+    stop_path = attempt_obj.dir / "stop-requested"
+    proc_exit, timed_out, interrupted, launch_failed, _child = _launch_and_wait(
+        argv,
+        cwd=worktree_path,
+        env=env,
+        stdin_text=stdin_text,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        timeout_s=effective_timeout,
+        run_key=run_key,
+        on_launched=_record_launched,
+        stop_path=stop_path,
+    )
+    if not launch_failed and stop_path.exists():
+        interrupted = True
+    native = harness.parse(spec, proc_exit, stdout_path)
+    if launch_failed:
+        attempt_mod.transition(
+            attempt_obj.dir,
+            "launch_failed",
+            execution_status=envelope_mod.ExecutionStatus.LAUNCH_FAILED.value,
+            session_id=native.session_id,
+        )
+    finish_args = _FinishArgs(
+        hub=hub,
+        config=config,
+        beads=beads,
+        bead=bead,
+        harness_name=harness_name,
+        attempt=attempt_obj,
+        worktree_path=worktree_path,
+        base_commit=base_commit,
+        input_hashes=hashes,
+        started_at=started_at,
+        notes=list(alloc_notes),
+        steered=[msg_id] if msg_id is not None else [],
+    )
+    exit_code = _finish_attempt(
+        finish_args,
+        capture=_capture_fresh(native.structured, report_path),
+        native_session=native.session_id,
+        native_error=native.native_error,
+        proc_exit=proc_exit,
+        interrupted=interrupted,
+        timed_out=timed_out,
+        launch_failed=launch_failed,
+        transition_from=None if launch_failed else "launched",
+        launched=launched_box["fired"],
+    )
+    return exit_code, _envelope_execution_status(attempt_obj.dir)
+
+
+def preflight_errors(
+    bead_ids: list[str],
+    *,
+    hub: Path,
+    beads: beads_mod.BeadsLike,
+    config: config_mod.Config,
+    memory_has: Callable[[str], bool] | None = None,
+) -> list[str]:
+    """Preflight (SPEC §7.1 step 2) for a batch of beads; empty means go.
+
+    Raises :class:`MemoryLookupError` on a backend failure rather than a
+    missing key (SPEC §7.1, §13); the caller prints it as is, with no
+    ``preflight:`` prefix (SPEC §7.1, round 7).
+    """
+    from helios import preflight as preflight_mod
+
+    hub = hub.resolve()
+    loaded = [beads.show(bid) for bid in bead_ids]
+    ctx = preflight_mod.PreflightContext(
+        hub=hub,
+        memory_has=memory_has if memory_has is not None else (lambda key: False),
+        runs_rel=config.project.runs,
+        units_dir=config.project.units,
+        worktrees_rel=config.project.worktrees,
+        bead_show=beads.show,
+    )
+    errors = preflight_mod.check(loaded, ctx)
+    for bead in loaded:
+        missing = _missing_skill(hub, bead.kind)
+        if missing is not None:
+            errors.append(f"{bead.id}: {missing}")
+    return errors
 
 
 def run_many(
@@ -1644,8 +2028,6 @@ def run_many(
     memory_has: Callable[[str], bool] | None = None,
 ) -> int:
     """Run beads, up to ``max_parallel`` at once; preflight first (SPEC §7.1)."""
-    from helios import preflight as preflight_mod
-
     depth = _run_depth_enter()
     outermost = depth == 1
     stopper: threading.Thread | None = None
@@ -1663,22 +2045,13 @@ def run_many(
     try:
         hub = hub.resolve()
         cfg = config if config is not None else config_mod.load(hub)
-        loaded = [beads.show(bid) for bid in bead_ids]
-        ctx = preflight_mod.PreflightContext(
-            hub=hub,
-            memory_has=memory_has if memory_has is not None else (lambda key: False),
-            runs_rel=cfg.project.runs,
-            units_dir=cfg.project.units,
-        )
         try:
-            errors = preflight_mod.check(loaded, ctx)
+            errors = preflight_errors(
+                bead_ids, hub=hub, beads=beads, config=cfg, memory_has=memory_has
+            )
         except MemoryLookupError as exc:
-            print(f"preflight: {exc}", file=sys.stderr)
+            print(str(exc), file=sys.stderr)
             return 2
-        for bead in loaded:
-            missing = _missing_skill(hub, bead.kind)
-            if missing is not None:
-                errors.append(f"{bead.id}: {missing}")
         if errors:
             for line in errors:
                 print(f"preflight: {line}", file=sys.stderr)
@@ -1758,5 +2131,78 @@ def run_many(
                     thread.join()
         finally:
             if outermost:
+                _restore_handler()
+            _run_depth_exit()
+
+
+def run_one_in_window(
+    bead_id: str,
+    *,
+    hub: Path,
+    beads: beads_mod.BeadsLike,
+    config: config_mod.Config | None = None,
+    harness_override: str | None = None,
+    timeout_s: int | None = None,
+    again: bool = False,
+) -> int:
+    """``helios run --in-window`` (SPEC §9.1).
+
+    Runs one bead through the normal pipeline, tee-ing the child's stdout to
+    this process's own stdout, and treats SIGHUP and SIGTERM exactly like
+    SIGINT (both delivered to ``_handle_sigint``), since closing a tmux
+    window sends SIGHUP.
+    """
+    depth = _run_depth_enter()
+    outermost = depth == 1
+    stopper: threading.Thread | None = None
+    extra_signals: list[int] = []
+    try:
+        if outermost:
+            _INTERRUPT.clear()
+            with _SEQ_LOCK:
+                _SEQ_THREADS.clear()
+                _SEQ_DONE.clear()
+            if _install_handler():
+                _RUN_ACTIVE.set()
+                for sig in (signal.SIGHUP, signal.SIGTERM):
+                    try:
+                        signal.signal(sig, _handle_sigint)
+                        extra_signals.append(sig)
+                    except (ValueError, OSError):
+                        pass
+                stopper = threading.Thread(
+                    target=_stopper_main, name="_stopper_main", daemon=True
+                )
+                stopper.start()
+        return run_one(
+            bead_id,
+            hub=hub,
+            beads=beads,
+            config=config,
+            harness_override=harness_override,
+            timeout_s=timeout_s,
+            again=again,
+            tee_stdout=True,
+        )
+    finally:
+        try:
+            if outermost:
+                _RUN_ACTIVE.clear()
+                if stopper is not None:
+                    waker = threading.Thread(
+                        target=_INTERRUPT.set, name="_interrupt_waker", daemon=True
+                    )
+                    waker.start()
+                    waker.join()
+                    stopper.join()
+                for thread in _seq_threads():
+                    thread.join()
+        finally:
+            if outermost:
+                for sig in extra_signals:
+                    try:
+                        signal.signal(sig, signal.SIG_DFL)
+                    except (ValueError, OSError):
+                        pass
                 _restore_handler()
             _run_depth_exit()

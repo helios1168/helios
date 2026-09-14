@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
 from helios import beads as beads_mod
 from helios import config as config_mod
 from helios import run as run_mod
+from helios import tmux as tmux_mod
 
 NAME = "run"
 HELP = "Run beads end to end through a harness (SPEC §7.1)."
@@ -32,6 +34,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", help="Print the plan; create nothing.")
     parser.add_argument(
         "--max-parallel", type=int, default=3, help="Beads to run at once."
+    )
+    window = parser.add_mutually_exclusive_group()
+    window.add_argument(
+        "--tmux", action="store_true", help="Open one tmux window per bead (SPEC §9.1)."
+    )
+    window.add_argument(
+        "--in-window", action="store_true", help="Run one bead in the current tmux window."
     )
 
 
@@ -74,10 +83,25 @@ def memory_has_for(
 
 
 def run(args: argparse.Namespace) -> int:
-    """Load config, read beads, and run the pipeline (SPEC §7.1)."""
+    """Load config, read beads, and run the pipeline (SPEC §7.1, §9.1)."""
     hub = config_mod.find_hub(Path.cwd())
     cfg = config_mod.load(hub)
     beads = beads_mod.Beads(hub)
+    if args.tmux:
+        return _run_tmux(list(args.beads), hub=hub, cfg=cfg, beads=beads, args=args)
+    if args.in_window:
+        if len(args.beads) != 1:
+            print("helios: --in-window accepts exactly one bead", file=sys.stderr)
+            return 2
+        return run_mod.run_one_in_window(
+            args.beads[0],
+            hub=hub,
+            beads=beads,
+            config=cfg,
+            harness_override=args.harness,
+            timeout_s=args.timeout,
+            again=args.again,
+        )
     return run_mod.run_many(
         list(args.beads),
         hub=hub,
@@ -90,3 +114,35 @@ def run(args: argparse.Namespace) -> int:
         max_parallel=args.max_parallel,
         memory_has=memory_has_for(beads, cfg),
     )
+
+
+def _run_tmux(
+    bead_ids: list[str],
+    *,
+    hub: Path,
+    cfg: config_mod.Config,
+    beads: beads_mod.Beads | beads_mod.FakeBeads,
+    args: argparse.Namespace,
+) -> int:
+    """``helios run --tmux``: preflight here, then one window per bead (SPEC §9.1)."""
+    try:
+        errors = run_mod.preflight_errors(
+            bead_ids, hub=hub, beads=beads, config=cfg, memory_has=memory_has_for(beads, cfg)
+        )
+    except run_mod.MemoryLookupError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if errors:
+        for line in errors:
+            print(f"preflight: {line}", file=sys.stderr)
+        return 2
+    try:
+        launches = tmux_mod.launch_windows(
+            bead_ids, harness=args.harness, again=args.again, timeout=args.timeout
+        )
+    except RuntimeError as exc:
+        print(f"helios: {exc}", file=sys.stderr)
+        return 2
+    for launch in launches:
+        print(f"{launch.bead}\t{launch.window}")
+    return 0
