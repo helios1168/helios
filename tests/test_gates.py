@@ -71,6 +71,24 @@ def test_open_gates_raises_gate_error_when_gate_list_is_not_a_list() -> None:
         open_gates(WeirdGates({"id": "g"}))  # type: ignore[arg-type]
 
 
+def test_open_gates_json_null_means_no_open_gates() -> None:
+    """bd 1.2.2 prints `null` for `bd gate list --json -n 0` when no gate is open."""
+    assert open_gates(WeirdGates(None)) == []
+
+
+def test_gate_command_json_null_prints_nothing_and_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from helios.commands import gate as command
+
+    monkeypatch.setattr(command, "Beads", lambda _hub: WeirdGates(None))
+    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path(".")))
+    assert command.run(Namespace(json=False)) == 0
+    assert capsys.readouterr() == ("", "")
+    assert command.run(Namespace(json=True)) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
 def test_gate_command_no_blocks_has_no_trailing_space(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """Decided: a gate that blocks nothing prints 'g2:' with no trailing space."""
     from helios.commands import gate as command
@@ -140,3 +158,11 @@ def test_real_bd_gate_blocks(tmp_path: Path) -> None:
     assert len(actual) == 1
     assert actual[0]["id"] == gate
     assert actual[0]["blocks"] == sorted([a, b])
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_no_open_gates_is_empty(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["bd", "init", "--non-interactive", "--prefix", "t", "--skip-agents", "--quiet"], cwd=tmp_path, check=True, capture_output=True)
+    from helios.beads import Beads
+    assert open_gates(Beads(tmp_path)) == []

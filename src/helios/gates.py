@@ -14,11 +14,14 @@ class GateError(Exception):
 def open_gates(beads: BeadsLike) -> list[dict[str, Any]]:
     """Return gates and their blocked bead ids in bd order (SPEC section 14).
 
+    JSON ``null`` means no open gates (bd 1.2.2 prints ``null`` for an empty list).
     Raises ``GateError`` on bd gate output that is not a list, or an entry without a
     string ``id``; the command layer turns that into ``helios: unexpected bd gate
     output`` and exit 1 (Decided: distinct from a config-loading error, exit 2).
     """
     gates = beads.gate_list()
+    if gates is None:
+        return []
     if not isinstance(gates, list):
         raise GateError("unexpected bd gate output")
     result: list[dict[str, Any]] = []

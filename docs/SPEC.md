@@ -1204,7 +1204,8 @@ its trailing newline or lack of one.
 - `helios gate [--json]` lists open gates from `bd gate list --json -n 0` with the beads each
   blocks, read from the gate's dependents in `bd show <gate> --json` (through `helios.beads`).
   Text output is one line per gate, `<gate>:` followed by a space then each blocking bead,
-  space-separated, with no trailing space when it blocks none. bd output that is not a list, or
+  space-separated, with no trailing space when it blocks none. JSON `null` from bd means no open
+  gates (bd 1.2.2 prints it for an empty list). Other bd output that is not a list, or
   an entry without a string `id`, prints `helios: unexpected bd gate output` and exits 1; only an
   exception from `helios.config` loading is a config error (exit 2), and any other
   `RuntimeError` from `bd` prints `helios: <message>` and exits 1.
