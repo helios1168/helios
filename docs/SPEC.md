@@ -98,6 +98,13 @@ The code is `src/helios/envelope.py`. `uv run python -m helios.envelope` regener
 `schemas/agent-report.schema.json` and `schemas/envelope.schema.json`; a test fails when they
 drift.
 
+Every JSON file helios reads or writes, harness output and helios's own artifacts alike, goes
+through `helios.jsonio`. Reading uses a `parse_constant` that raises and a `parse_float` that
+raises when `float(s)` is not finite, so `NaN`, `Infinity`, `-Infinity` and a number that
+overflows to infinity (for example `1e999` or `-1e999`) are never valid JSON; each such value
+takes the same not-JSON path the site already has for `NaN` and `Infinity`. Writing uses
+`allow_nan=False`.
+
 ### 4.1 AgentReport (written by the agent)
 
 Fields: `schema_version`, `status`, `summary`, `files_changed`, `tests`, `findings`,
@@ -248,9 +255,9 @@ processes. `helios.harness.get(name) -> Harness` returns the adapter.
 5. The chosen report is written to `attempt-<n>/report.json` (the captured report, §8.1)
    before `execution_status` is stored, and no captured report is written when none was found.
    When the file was chosen, the captured report is the file's bytes. When the native result
-   was chosen, it is `json.dumps(structured, ensure_ascii=False, indent=2, sort_keys=True)`
-   plus a newline, whatever the report file holds; the file's bytes are never captured in that
-   case. From then on validation, recovery and write-back read only the captured
+   was chosen, it is `json.dumps(structured, ensure_ascii=False, indent=2, sort_keys=True,
+   allow_nan=False)` plus a newline, whatever the report file holds; the file's bytes are never
+   captured in that case. From then on validation, recovery and write-back read only the captured
    report, never the worktree path again, so an agent or user deleting or editing the worktree
    report after step 8 changes nothing.
 
@@ -334,8 +341,10 @@ These apply to claude, codex, opencode and agy.
   - Strip and stripped mean removing only the JSON whitespace characters space, tab, CR and LF
     from both ends (`strip(" \t\r\n")`), never Python's default `str.strip`, which also removes
     U+2028, U+2029, U+0085, NBSP and others.
-  - `json.loads` is called with a `parse_constant` that raises, so `NaN`, `Infinity` and
-    `-Infinity` make a line or document not JSON.
+  - `json.loads` is called through `helios.jsonio`, with a `parse_constant` that raises and a
+    `parse_float` that raises when `float(s)` is not finite, so `NaN`, `Infinity`, `-Infinity`
+    and a number that overflows to infinity (for example `1e999` or `-1e999`) all make a line or
+    document not JSON.
   - A `stdout_path` that is missing or is not a regular file, or that cannot be read, gives
     session_id None and native_error `no stdout`.
   - claude and agy: decode the bytes as UTF-8, strip, `json.loads`. A decode failure (invalid
@@ -384,7 +393,8 @@ These apply to claude, codex, opencode and agy.
    module that calls `bd`). Metadata values may arrive JSON-encoded as strings; decode them.
 2. Preflight (`helios.preflight`), all failures exit 2 before anything is created:
    - `impl` and `validate` need `files` and `test`; verify kinds need `unit` and `parent`, and
-     a verify bead without a worktree needs `output_commit` metadata on its parent (§7.3).
+     a verify bead without a worktree needs `output_commit` metadata on its parent (§7.3), so a
+     verify worktree is never created from `main` in any run mode.
    - every name in `memories` exists (preflight takes the memory lookup as a required argument);
      a name failing the §13 key rule, or equal to `schema_version`, does not exist. The files
      backend matches the exact name via a directory listing; on the beads backend a failing `bd
@@ -420,8 +430,10 @@ These apply to claude, codex, opencode and agy.
 7. Launch with `subprocess.Popen(argv, cwd=worktree, stdin=<stdin_text, else DEVNULL>,
    stdout=stdout file, stderr=stderr.log, start_new_session=True)`, environment plus
    `HELIOS_BEAD`, `HELIOS_ATTEMPT`, `HELIOS_HARNESS`, `HELIOS_HUB`, `HELIOS_REPORT`. Record
-   `launched` with the child pid in `state.json` as soon as `Popen` returns, before waiting.
-   Every signal goes to the child's process group (`os.killpg`). The stop sequence is SIGINT,
+   `launched` with the child pid in `state.json` as soon as `Popen` returns, before waiting, and
+   read the leader's start time right after with `ps -o lstart= -p <pid>` stripped, stored as
+   `pid_start`; null when that read fails. Every signal goes to the child's process group
+   (`os.killpg`). The stop sequence is SIGINT,
    wait up to 10 s, SIGTERM, wait up to 5 s, SIGKILL. A wait ends early only when the whole
    group is gone (`os.killpg(pgid, 0)` raises `ProcessLookupError`), not when the leader exits.
    On timeout run the stop sequence and record `timed_out`. The session id comes only from the
@@ -454,6 +466,15 @@ These apply to claude, codex, opencode and agy.
     event (§9.3). The event append is best effort: a crash after finalize loses that line and
     nothing else. Write-back, the event and the exit code handle a missing report (report
     fields null, `report_error` set); no step assumes one exists.
+
+A memory read for step 6 can still fail after step 5 allocates the attempt, even though
+preflight's existence check of the same name already passed: the backend's `read(key)` can raise
+on a value it can now not read or parse. That failure stops the run with `helios: memory lookup
+failed for <key>: <message>`, exit 2, before launch; the value is never treated as empty. The
+attempt is finalized as a launch that never started: `execution_status` is `launch_failed`, no
+`launched` event is emitted, and steps 9 and 10 are skipped, with every check, ownership
+included, recorded as not run with detail `memory lookup failed`, and `output_commit` null. No
+bead close is written.
 
 Exit codes: 0 finalized with report `done` (impl, validate) or overall verdict `verified`
 (verify kinds); 3 report `partial`, `needs_input`, `needs_review` or `blocked`, or a verdict
@@ -519,8 +540,12 @@ heading:
    stripped. A fence opens with a line starting (after up to three spaces) with three
    or more backticks or tildes, and closes with a line of the same character at least as long
    as the opener; an unclosed fence runs to the end of the file. A key with no match is a
-   preflight error.
-5. `Memories`: each key's value from the memory backend (`helios.memory`, §13).
+   preflight error. The included text, whole file or section, has its leading and trailing
+   newlines removed (`strip("\n")`) before it goes in the prompt; no other whitespace is
+   touched, so indentation on the first line is kept.
+5. `Memories`: each key's value from the memory backend (`helios.memory`, §13), with leading and
+   trailing newlines removed (`strip("\n")`) the same way; no other whitespace is touched. A
+   read that raises is a memory lookup failure (§7.1).
 6. `Attempt`: worktree path, branch, attempt id, report path, and the report schema JSON.
 
 Sections 4 and 5 together are capped at `memory.inject_cap_bytes` UTF-8 bytes. The docs entries
@@ -602,10 +627,11 @@ attempt to stop (§9.2). The agent writes its report inside the worktree at
 
 `allocated`, then `launched`, then one of `native_completed`, `interrupted`, `timed_out`,
 `crashed`, `launch_failed`, then `validated` or `invalid`, then `finalized`. `state.json` is
-`{"state", "attempt_id", "pid", "session_id", "execution_status", "updated"}`, where
-`execution_status` is null until step 8 classifies the attempt and never changes after. Every
-write carries all six keys, and a transition keeps the stored `execution_status` (and `pid`
-and `session_id`) unless it sets a new value, so the key survives `validated`, `invalid`,
+`{"state", "attempt_id", "pid", "pid_start", "session_id", "execution_status", "updated"}`,
+where `execution_status` is null until step 8 classifies the attempt and never changes after,
+and `pid_start` is set once at launch (§7.1 step 7) and never changes after. Every write carries
+all seven keys, and a transition keeps the stored `execution_status`, `pid`, `pid_start` and
+`session_id` unless it sets a new value, so the key survives `validated`, `invalid`,
 `finalized` and every recovery write (§8.4). It is written to a temp file and
 moved with `os.replace`. Every transition appends one line to `state.log`. `launched` is
 recorded with the pid as soon as the process starts, so a running attempt is always `launched`
@@ -623,12 +649,13 @@ an exclusive `mkdir`; if it already exists (a concurrent run took `n`), helios t
 `state.json` is written right after the `mkdir`, but a process can die between the two. Every
 reader (preflight, recovery, `helios ps`) treats an attempt directory whose `state.json` is
 missing or unreadable (empty, not valid JSON, not an object, or without a string `state`) as
-state `allocated` with `pid` null, `session_id` null and `execution_status` null, and takes the
-attempt id `<bead>#<n>` from the directory name. In a readable file, a `pid` that is not an int
-with `0 < pid < 2**31` (a bool counts as not an int) reads as null, and a `session_id` or
-`execution_status` that is not a string reads as null. Parsing catches `RecursionError`, and
-uses a `parse_constant` that rejects `NaN`, `Infinity` and `-Infinity`, so either counts as not
-valid JSON. Reading it never raises. Preflight reads
+state `allocated` with `pid` null, `pid_start` null, `session_id` null and `execution_status`
+null, and takes the attempt id `<bead>#<n>` from the directory name. In a readable file, a `pid`
+that is not an int with `0 < pid < 2**31` (a bool counts as not an int) reads as null, and a
+`session_id`, `execution_status` or `pid_start` that is not a string reads as null. Parsing
+catches `RecursionError`, and uses a `parse_constant` that rejects `NaN`, `Infinity` and
+`-Infinity` and a `parse_float` that rejects a number that overflows to infinity, so any of
+these counts as not valid JSON. Reading it never raises. Preflight reads
 attempt state without the lock, so it must accept these cases and leave the decision to recovery
 under the lock. Before launch helios checks the worktree report path; if a file is there
 (stale), it moves it to `attempt-<n>/stale-report.json` and adds a note. A report is accepted
@@ -664,18 +691,26 @@ refuses stale evidence (§12).
 
 ### 9.1 Windows
 
-- `helios run --tmux <bead>...` runs preflight in the outer process (exit 2 on failure). It
-  ensures session `helios` on the tmux server `tmux -L helios`: it runs
-  `tmux -L helios new-session -d -s helios` when `tmux -L helios has-session -t =helios` fails,
-  and a failed `new-session` still succeeds when `has-session` then exits 0. For each bead it
-  runs `tmux -L helios new-window -d -t helios: -n <bead> helios run <bead> --in-window` plus
-  the forwarded `--harness`, `--again` and `--timeout`, then
-  `tmux -L helios set-option -w -t helios:<bead> remain-on-exit on`. It prints
-  `<bead>\t<window>` per bead to stdout, exits 0, and never waits. A missing `tmux` binary
-  exits 2.
-- `--in-window` accepts exactly one bead. It copies the child's stdout bytes to its own stdout
-  as well as to `stdout.jsonl`. Under `--in-window`, SIGHUP and SIGTERM are handled exactly like
-  SIGINT (§7.1 Interrupts), because closing a window sends SIGHUP.
+- `helios run --tmux <bead>...` runs the full §7.1 preflight in the outer process (exit 2 on
+  failure), before any attempt, worktree or status change. It ensures session `helios` on the
+  tmux server `tmux -L helios`: it runs `tmux -L helios new-session -d -s helios` when
+  `tmux -L helios has-session -t =helios` fails, and a failed `new-session` still succeeds when
+  `has-session` then exits 0. For each bead it runs `tmux -L helios new-window -d -t helios: -n
+  <bead> helios run <bead> --in-window` plus the forwarded `--harness`, `--again` and
+  `--timeout`, then `tmux -L helios set-option -w -t helios:<bead> remain-on-exit on`. It prints
+  `<bead>\t<window>` per bead to stdout, exits 0, and never waits. A missing `tmux` binary exits
+  2. Each window then runs the same preflight again on its own, since `--in-window` always does
+  (below).
+- `--in-window` accepts exactly one bead and runs the full §7.1 preflight itself, with the same
+  messages and exit 2, before any attempt, worktree or status change. It copies the child's
+  stdout bytes to its own stdout as well as to `stdout.jsonl`. Under `--in-window`, SIGHUP and
+  SIGTERM are handled exactly like SIGINT (§7.1 Interrupts), because closing a window sends
+  SIGHUP.
+- `--dry-run` combined with `--tmux` or `--in-window` prints `helios: --dry-run cannot be
+  combined with --tmux or --in-window` and exits 2 before any other work.
+- The `--in-window` CLI entry, after the run returns its code, sets SIGHUP, SIGTERM and SIGINT
+  to ignored, flushes stdout and stderr, and exits with `os._exit(<code>)`; called in process, it
+  restores the previous SIGHUP and SIGTERM handlers instead.
 - Every harness, opencode included, runs `helios run --in-window` in its window. The attach
   command is for users (`helios attach`, §9.2), since the session id is known only after §7.1
   step 8.
@@ -756,31 +791,47 @@ exit 2, before any filesystem or `bd` access.
   delivers: delivery belongs to `helios resume`.
 - `helios stop <bead>`: exits 2 with `helios: no running attempt for <bead>` unless the highest
   attempt is live. Live means state `launched`, a `pid` that reads as non-null under §8.3, and
-  `os.kill(pid, 0)` succeeding. It writes `attempt-<n>/stop-requested` holding the UTC time
-  (`yyyy-mm-ddThh:mm:ssZ` and a newline) with a temp file and `os.replace`, then sends SIGINT
-  once to the attempt's process group with `os.killpg(pid, SIGINT)`, and exits 0, also when the
-  group is already gone. A `PermissionError` from `os.killpg` counts like `ProcessLookupError`
-  (macOS gives EPERM for a zombie group leader): exit 0. It never escalates and never writes
-  `state.json`. The running
+  the process itself live: its leader pid exists and its current `ps -o lstart=` text equals the
+  attempt's `pid_start`, or, when the leader no longer exists, `os.killpg(pid, 0)` succeeds or
+  raises `PermissionError`. A leader pid whose start time differs from `pid_start` is a reused
+  pid: the attempt counts as not live, and helios never signals that pid. A null `pid_start`
+  falls back to the process-group test alone. It writes `attempt-<n>/stop-requested` holding the
+  UTC time (`yyyy-mm-ddThh:mm:ssZ` and a newline) with a temp file and `os.replace`, then
+  signals the process group (`os.killpg(pid, SIGINT)`) whenever the attempt is live by this
+  rule, including after the leader has exited, and exits 0, also when the group is already gone.
+  A `PermissionError` from `os.killpg` counts like `ProcessLookupError` (macOS gives EPERM for a
+  zombie group leader): exit 0. It never escalates and never writes `state.json`. The running
   `helios run` classifies an attempt whose `stop-requested` file exists as `interrupted` in
   step 8. The opencode abort route is not used in this wave.
-- `helios resume <bead> ["<text>"]`: exits 2 with a message on stderr when the bead has no
-  attempt, the bead is closed, the bead lock (§8.3) is held, the highest attempt is live or not
-  finalized, or its `session_id` is null. Otherwise it takes the bead lock and handles the
-  inbox, then its own turn.
+- `helios resume <bead> ["<text>"]`: before taking the bead lock, resume checks only that the
+  bead has an attempt, exiting 2 with a message on stderr when it does not. It then takes the
+  bead lock (§8.3), exiting 2 with a message on stderr when it is held; once taken, it re-reads
+  the highest attempt and applies the other refusals, exiting 2 with a message on stderr: the
+  bead is closed, the highest attempt is live or not finalized, or its `session_id` is null.
+  Still under the lock and before allocating, it also refuses when the
+  §7.3 worktree directory is missing (`helios: worktree <path> is missing`) or the worktree is
+  not usable, on another branch or detached (`helios: <message>`), exit 2. Otherwise it handles
+  the inbox, then its own turn.
   - Inbox: only file names matching `^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}\.json$` count, sorted as
     strings and listed once at start. A file that is not a valid §9.4 message is skipped with a
     note on stderr. An id with an ack is skipped.
   - Each message is one turn. Then the text (default `Continue.`) is one turn, run when text was
     given or no message was delivered.
-  - A turn allocates attempt n+1 with `resume_session` set to the `session_id` of the highest
-    attempt and the harness from that attempt's `input.json`, and runs §7.1 steps 5 to 11
-    (never `--again`). The turn prompt is `<text>` followed by `\n\nReport path: <report
-    path>\n`; for a message, `<text>` is `[helios-msg <msg_id>] <message text>`.
-  - After a message turn whose `execution_status` is `completed`, `missing_output` or
-    `invalid_output`, resume writes the ack. Any other status writes no ack and stops, and
-    resume exits with that turn's code. Otherwise the exit code is the highest §7.1 code over
-    the turns.
+  - Before each turn, resume reads the highest finalized attempt afresh: its `session_id` is
+    `resume_session` and its attempt id is `resumed_from`. The turn allocates attempt n+1 with
+    that `resume_session` and the harness from the read attempt's `input.json`, and runs §7.1
+    steps 5 to 11 (never `--again`). The turn prompt is `<text>` followed by `\n\nReport path:
+    <report path>\n`; for a message, `<text>` is `[helios-msg <msg_id>] <message text>`.
+  - Resume installs the same interrupt handling as `helios run` for its whole run. The interrupt
+    is checked before every turn and immediately before an attempt is allocated; once set,
+    nothing more is allocated and resume exits 4.
+  - After a message turn is finalized, the ack is written whenever its `execution_status` is
+    `completed`, `missing_output` or `invalid_output`, and only then is an interrupt honored.
+    Any other status writes no ack and stops, and resume exits with that turn's code. Otherwise
+    the exit code is the highest over the turns.
+  - A turn that records a null `session_id` ends resume after that turn (the ack rule above
+    still applies to it), with that turn's exit code and no refusal message. This is the one
+    exception to "the exit code is the highest over the turns".
   - The envelope `steered` field lists the delivered msg_ids.
 
 ### 9.3 Events
@@ -916,8 +967,10 @@ nonzero, else 4.
 - `helios next [<unit>]` runs the first candidate whose kind is not in `control.stop_at`
   (`helios run`, §7.1) and prints one line from its envelope:
   `<attempt_id>\t<execution_status>\t<status or ->\t<verdict or ->\t<summary or ->`. With no
-  such candidate it prints `helios: no ready bead` to stderr and exits 3. Otherwise it exits with the
-  run's code, or per the execution failure rule above.
+  such candidate it prints `helios: no ready bead` to stderr and exits 3. When the run returns
+  without an execution failure but no envelope exists, `next` prints `helios: execution failure
+  for <bead>: missing envelope` to stderr and exits with the run's code when nonzero, else 4.
+  Otherwise it exits with the run's code, or per the execution failure rule above.
 - `helios unit run <unit> [--until <stage>]` loops. Each round takes the first candidate,
   `stop_at` kinds included. It stops before running that candidate when its kind is in
   `control.stop_at`; otherwise it runs it and prints its line as `next` does. After a run it
@@ -968,13 +1021,20 @@ the order 1, 2, 8, 3, 4, 5, 6, 7.
    branch `worktree-<bead>` (`git -C <worktree> symbolic-ref --short HEAD`, else
    `helios: worktree is not on branch worktree-<bead>`). Refuse also when
    `git diff --no-renames --name-only <main>...worktree-<bead>` lists any path under `.beads/`
-   (`helios: branch changes .beads/`). The worktree HEAD passes when it equals the impl bead's
-   `output_commit` metadata, or when the ordered list of `git patch-id --stable` values of the
+   (`helios: branch changes .beads/`). Before any merge-base call, refuse when `output_commit`
+   names no commit (`git cat-file -e <sha>^{commit}` fails) with `helios: verified output_commit
+   <sha> is not a commit`, exit 2. The worktree HEAD passes when it equals the impl bead's
+   `output_commit` metadata, checked first, or when the ordered list of patch ids of the
    non-merge commits in `merge-base(HEAD, main)..HEAD` equals the ordered list for
-   `merge-base(output_commit, main)..output_commit` (the verified commits rebased). Otherwise, or
-   when either range contains a merge commit, refuse with `helios: worktree HEAD <sha> is not the
-   verified output_commit <sha>`, exit 2; so the commit step 6 merges, once rebased, is the
-   verified commit.
+   `merge-base(output_commit, main)..output_commit` (the verified commits rebased); an empty
+   list for the `output_commit` range never passes this check. A commit's patch id is computed
+   from bytes: `git show --binary --no-textconv --no-ext-diff --no-color --format= <commit>`
+   with stdout read as bytes, piped as bytes to `git patch-id --verbatim`, first field of its
+   output. Otherwise, or when either range contains a merge commit, refuse with `helios:
+   worktree HEAD <sha> is not the verified output_commit <sha>`, exit 2; so the commit step 6
+   merges, once rebased, is the verified commit. Git output that `helios merge` parses or passes
+   back to git is never decoded strictly: text is decoded with `surrogateescape` and printed
+   with `backslashreplace`.
 3. Record `main_before` as metadata `merge_main_before`. Then in the worktree run
    `git rebase main`. A nonzero exit is a conflict, `git rebase --abort`, `run=conflict`, stop,
    only when a rebase is in progress (`git rev-parse --git-path rebase-merge` or `rebase-apply`
@@ -1054,8 +1114,9 @@ its trailing newline or lack of one.
   naming the key too, before anything is written; an iterative walk is equally fine. Parsing
   requires the text to start with `helios-memory 1\n`, then one line holding a JSON object whose
   `status` key is `active`, `superseded` or `retracted`, parsed with
-  `json.loads` using a `parse_constant` that raises and with `RecursionError` caught, both
-  treated as invalid, then `\n`, and requires line 2 to equal exactly
+  `json.loads` using a `parse_constant` that raises and a `parse_float` that raises when
+  `float(s)` is not finite, with `RecursionError` caught, all treated as invalid, then `\n`, and
+  requires line 2 to equal exactly
   `json.dumps(header, sort_keys=True, ensure_ascii=False, allow_nan=False)` of the object it
   parses to; anything else raises `ValueError` naming the key. A file without a `status` key is
   a bad file, so export after import reproduces the tree byte for byte. The body may be empty.
@@ -1129,11 +1190,15 @@ its trailing newline or lack of one.
 - `helios learned --mark <kind>:<bead>#<attempt>#<k> memory|template|drop` accepts the marker
   only when its exact text is one of the markers of the current queue (curated ones included),
   compared as text, never as parsed numbers; otherwise it is `helios: unknown marker <marker>`,
-  exit 2, nothing written. It adds `curated: [<kind>:<bead>#<attempt>#<k>] -> <decision>` on the
-  bead named in the marker, under the replay rule of §7.5. An unknown decision word exits 2;
-  when that comment already exists, `--mark` still runs the label step; `--mark` with `--unit`
-  or `--json` exits 2. When no uncurated line of that bead remains, add label `curated`
-  (idempotent).
+  exit 2, nothing written. An unknown decision word exits 2; `--mark` with `--unit` or `--json`
+  exits 2. Before writing, `--mark` checks whether a `curated:` comment for that marker already
+  exists on the bead named in the marker; when that bead does not exist the check is skipped, as
+  not yet curated, but a `bd` failure there for any other reason prints `helios: <message>`,
+  exits 1, and writes nothing. It then adds `curated: [<kind>:<bead>#<attempt>#<k>] ->
+  <decision>` under the replay rule of §7.5, on the bead named in the marker, or, when that bead
+  does not exist, on the source bead, the bead whose comment carries the line, skipping the
+  label step in that case. When the comment already exists, `--mark` still runs the label step.
+  When no uncurated line of that bead remains, add label `curated` (idempotent).
 - `helios gate [--json]` lists open gates from `bd gate list --json -n 0` with the beads each
   blocks, read from the gate's dependents in `bd show <gate> --json` (through `helios.beads`).
   Text output is one line per gate, `<gate>:` followed by a space then each blocking bead,
