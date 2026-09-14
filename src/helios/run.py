@@ -189,15 +189,29 @@ def _install_handler() -> bool:
     return True
 
 
-def _restore_handler() -> None:
-    """Restore the previous SIGINT handler."""
+def _restore_handler(*, keep_if_interrupted: bool = False) -> None:
+    """Restore the previous SIGINT handler.
+
+    With ``keep_if_interrupted``, a run this process actually interrupted
+    leaves ``_handle_sigint`` installed instead of restoring ``prev``: SPEC
+    §7.1 "later SIGINTs are ignored" covers signals arriving after this
+    call decides to restore too, since a trailing signal from the same
+    storm can otherwise race the process's own exit and kill it by the
+    signal's raw disposition instead of the intended exit code (round-1-fix
+    item 7, ``run_one_in_window``). The bookkeeping (``_PREV_SIGINT``)
+    still clears either way, so a later, uninterrupted run in the same
+    process restores normally.
+    """
     global _PREV_SIGINT
     prev, _PREV_SIGINT = _PREV_SIGINT, None
-    if prev is not None:
-        try:
-            signal.signal(signal.SIGINT, prev)  # type: ignore[arg-type]
-        except ValueError:
-            pass
+    if prev is None:
+        return
+    if keep_if_interrupted and _SIGINT_SETTING:
+        return
+    try:
+        signal.signal(signal.SIGINT, prev)  # type: ignore[arg-type]
+    except ValueError:
+        pass
 
 
 @contextlib.contextmanager
@@ -2355,10 +2369,16 @@ def run_one_in_window(
                     thread.join()
         finally:
             if outermost:
-                for sig, prev in prev_signals.items():
-                    try:
-                        signal.signal(sig, prev)  # type: ignore[arg-type]
-                    except (ValueError, OSError):
-                        pass
-                _restore_handler()
+                # A run this process actually interrupted keeps the
+                # absorbing handler on SIGHUP/SIGTERM too: a trailing
+                # signal from the same storm must never fall through to
+                # whatever ran before helios all the way to process exit
+                # (round-1-fix item 7 continued; see _restore_handler).
+                if not _SIGINT_SETTING:
+                    for sig, prev in prev_signals.items():
+                        try:
+                            signal.signal(sig, prev)  # type: ignore[arg-type]
+                        except (ValueError, OSError):
+                            pass
+                _restore_handler(keep_if_interrupted=True)
             _run_depth_exit()

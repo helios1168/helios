@@ -712,9 +712,14 @@ def test_next_run_bead_with_present_memory_runs_through_real_preflight(
                                    "report": {"status": "done", "summary": "did it"}}))
     monkeypatch.setenv("HELIOS_FAKE_SCRIPT", str(script))
 
+    from helios import memory as memory_mod
+
     b1 = Bead("b1", kind="impl", files=["src/"], test="true", memories=["m1"])
     fake = FakeBeads([b1])
-    fake.remember("m1", "value")
+    # A real memory value (SPEC 13 format), not a bare string: helios.run's
+    # preflight-passed-but-unreadable path now refuses rather than falling
+    # back to "" (hel-dgl item 2), so the stored value must actually parse.
+    fake.remember("m1", memory_mod.serialize({"source": "x#1", "status": "active"}, "value"))
     monkeypatch.setattr(command, "Beads", lambda _hub: fake)
 
     assert command.run_bead(b1) == 0
