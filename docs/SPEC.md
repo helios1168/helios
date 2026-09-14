@@ -154,7 +154,8 @@ Fields: `schema_version`, `task_id`, `attempt`, `attempt_id` (`<bead>#<n>`), `ki
 
 helios takes the first value that applies, in this order:
 1. `launch_failed`: `Popen` raised.
-2. `interrupted`: helios received SIGINT or `helios stop` stopped the attempt. This holds whatever the child printed or wrote.
+2. `interrupted`: helios received SIGINT, or the attempt directory holds `stop-requested`
+   (written by `helios stop`, §9.2). This holds whatever the child printed or wrote.
 3. `timed_out`: helios hit the timeout.
 4. `completed`: a valid report was captured. A nonzero exit or a native error only adds a note.
 5. `invalid_output`: a report exists but fails validation.
@@ -283,7 +284,8 @@ never resolved. `[extra_args]` is `spec.extra_args`, one element each.
   channel: the report file is the only source. Attach:
   `opencode attach <server_url> --dir <worktree> -s <session_id>` when `spec.server_url` is set,
   else `opencode <worktree> -s <session_id>`. Stop with a server:
-  `POST <server_url>/session/<session_id>/abort`.
+  `POST <server_url>/session/<session_id>/abort` (recorded for later; `helios stop` does not use
+  it in this wave, §9.2).
 - **agy** (Antigravity CLI): the prompt is the value of `-p`, so `-p` comes last:
   `agy --output-format json --json-schema <schema path> --dangerously-skip-permissions
   [--model M] [--effort E] [--conversation <session_id>] [extra_args] -p <prompt>`, with cwd
@@ -307,19 +309,25 @@ These apply to claude, codex, opencode and agy.
   that is configured. `attach_command` adds no model, effort or permission flags and sets no
   cwd, because `helios attach` runs it in the worktree. Model and effort are passed verbatim
   and never validated.
-- `parse(spec, exit_code, stdout_path)` never raises and never reads stderr. Input handling:
-  - A missing `stdout_path` gives session_id None and native_error `no stdout`.
-  - claude and agy: `json.loads` of the stripped text. A decode failure or a value that is not
-    an object gives native_error `invalid JSON`.
-  - codex and opencode: every line is stripped. Blank lines and lines that are not JSON objects
-    are skipped, with one note `skipped <N> non-JSON lines` when N is not 0. No JSON object at
-    all gives native_error `no events`.
-- session_id is the first non-empty value of: claude `session_id`; codex `thread_id` of the
-  first `thread.started`; opencode the top-level `sessionID` of the first line that has one;
-  agy `conversation_id`. An empty string counts as None. session_id is returned even when
-  native_error is set.
+- `parse(spec, exit_code, stdout_path)` never raises and never reads stderr. It reads stdout as
+  bytes. Input handling:
+  - A `stdout_path` that is missing or is not a regular file, or that cannot be read, gives
+    session_id None and native_error `no stdout`.
+  - claude and agy: decode the bytes as UTF-8, strip, `json.loads`. A decode failure (invalid
+    UTF-8 included) or a value that is not an object gives native_error `invalid JSON`.
+  - codex and opencode: split the bytes on `\n` only (never `str.splitlines`, which also splits
+    on U+2028, U+2029 and U+0085 that JSON allows inside strings). A final piece after the last
+    `\n` is a line only when it is not empty. Each line is decoded as UTF-8 and stripped. A line
+    that is blank, is not valid UTF-8, or is not a JSON object is skipped; N counts every
+    skipped line, blank ones included, and one note `skipped <N> non-JSON lines` is added when N
+    is not 0. No JSON object at all gives native_error `no events`.
+- session_id is the first non-empty string among: claude `session_id`; codex `thread_id` of the
+  `thread.started` events, in line order; opencode the top-level `sessionID` of the lines, in
+  line order; agy `conversation_id`. A value that is empty or not a string is passed over, so a
+  later event can still supply the id. session_id is returned even when native_error is set.
 - When the input rules above set no native_error, it is set when `exit_code` is an int other
-  than 0, or when the output signals failure: claude `is_error` true; codex any `turn.failed`,
+  than 0, or when the output signals failure: claude `is_error` is JSON `true` (any other value
+  is not a failure); codex any `turn.failed`,
   or no `turn.completed`; opencode any `error` event, or a last event that is not
   `step_finish`; agy a `status` other than `SUCCESS`. `exit_code` None is not an error by
   itself. The text is a non-empty string, the first that applies: claude `result`; codex
@@ -328,9 +336,10 @@ These apply to claude, codex, opencode and agy.
   `exit code <N>` when the exit code is not 0, else `turn did not complete`.
 - structured is None whenever native_error is set, and always None for opencode. Otherwise it
   is claude or agy `structured_output`, or for codex the JSON in `<raw_dir>/last-message.json`.
-  Only a JSON object counts. A missing key or file gives None and the note
-  `no structured result`; invalid JSON or a value that is not an object gives None and the note
-  `structured result is not a JSON object`. Never fall back to claude `result` or agy
+  Only a JSON object counts. A missing key, or a `last-message.json` that is missing or not a
+  regular file, gives None and the note `no structured result`. A present key or file whose
+  value is not an object (JSON `null` included), whose bytes are not valid UTF-8, or that is not
+  valid JSON gives None and the note `structured result is not a JSON object`. Never fall back to claude `result` or agy
   `response`.
 - notes is empty unless a rule above adds one.
 - `helios.harness.get(name)` returns the adapter for `claude`, `codex`, `opencode`, `agy` and
@@ -537,7 +546,8 @@ later in the text does not count.
 
 `<hub>/<project.runs>/<bead>/attempt-<n>/` holds `state.json`, `state.log`, `input.json`,
 `prompt.md`, `stdout.jsonl`, `stderr.log`, `raw/` (adapter side files), `report.json` (the
-captured report), `checks/`, `envelope.json`. The agent writes its report inside the worktree at
+captured report), `checks/`, `envelope.json`, and `stop-requested` when `helios stop` asked the
+attempt to stop (§9.2). The agent writes its report inside the worktree at
 `<worktree>/.helios/attempt-<n>/report.json`, a path unique per attempt.
 
 ### 8.2 States
@@ -691,7 +701,7 @@ line, `Status:` (`open`, `in-progress`, `done`, `dropped`), `Stages:`, and secti
      stage in the list, else `<stage> has no earlier stage to verify`;
    - when `impl` or `validate` is present, `--files` (split on `,`, no empty items) and `--test`
      are given;
-   - the unit file `docs/units/<unit>.md` does not exist.
+   - the unit file `<hub>/<project.units>/<unit>.md` does not exist.
 2. For each stage in order, reuse the bead that is not closed and carries labels `unit:<unit>`
    and `kind:<stage>`; else create one titled `<unit> <stage>: <title>` with those labels and
    metadata `unit`, `kind`, `author`, and for `impl` and `validate` `files` and `test`. Metadata
@@ -829,7 +839,8 @@ project's `.agents/backends.toml`, else `templates/backends.toml`).
 
 `helios claims check [--backend B] [--covers ID] [--timeout S]`:
 
-1. Every claim covers at least one active block id; unknown ids fail. An id matching
+1. Every claim covers at least one active block id (requirement ids do not count toward this, so
+   a claim covering only requirement ids fails); unknown ids fail. An id matching
    `^R[0-9]+$` is a requirement id and is not checked against the registry; a retired block id
    counts as unknown.
 2. The backend exists and allows the claim's method and scope. Steps 1 and 2 run for every
@@ -878,7 +889,8 @@ passed, else 0.
   recording model returns a recorder for any attribute; calling a recorder records
   `kwargs["name"]` when it is a string and returns a new recorder. The suffix stripped is
   everything from the first `[`. Print `missing: <ids>` and `unexpected: <names>` lines (sorted,
-  comma-separated, only when non-empty) and exit 1 on a mismatch, else 0.
+  joined with `, `, only when non-empty) and exit 5 on a mismatch (a failed check, as in §7.1),
+  else 0.
 - `helios program diff <rev1> <rev2>`: load the registry at two git revisions (`git show
   <rev>:<path>` into a temporary module). The registry module path at a revision is
   `src/<module with dots as slashes>.py`, else `<module with dots as slashes>.py`; when neither
