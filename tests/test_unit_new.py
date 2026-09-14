@@ -685,7 +685,7 @@ def _symlink_hub(tmp_path: Path, kind: str) -> tuple[Path, Config]:
         notes.symlink_to(tmp_path / "afile")
     elif kind == "symlink_dir":
         # Inside the hub: a symlink resolving outside the hub is its own
-        # refusal (round 3 decision), tested separately.
+        # refusal, tested by test_units_dir_symlink_outside_hub_refuses.
         (hub / "realdir").mkdir()
         notes.symlink_to(hub / "realdir")
     elif kind == "dangling":
@@ -720,6 +720,32 @@ def test_units_parent_valid_symlink_dir_accepted(tmp_path: Path) -> None:
     )
     assert len(rows) == 1
     assert (hub / "realdir" / "units" / "U1.md").is_file()
+
+
+# Item 2: a units directory component symlinked outside the hub refuses at
+# step 1, before the TOCTOU-repeated check in step 5 (SPEC §10.2 step 1,
+# round 3 decision).
+def test_units_dir_symlink_outside_hub_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    (hub / ".git").mkdir()
+    (hub / ".agents").mkdir()
+    (hub / ".agents" / "workflow.toml").write_text('[project]\nunits = "notes/units"\n')
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (hub / "notes").symlink_to(outside)
+    monkeypatch.chdir(hub)
+    fake = FakeBeads()
+    monkeypatch.setattr(beads_mod, "Beads", lambda cwd: fake)
+    args = Namespace(unit="U1", title="T", stages="model", files=None, test=None)
+    assert unit_new.run(args) == 2
+    err = capsys.readouterr().err
+    assert err == (
+        f"helios: units directory resolves outside the hub: {hub / 'notes' / 'units'}\n"
+    )
+    assert fake.argv_log == []
 
 
 def test_dangling_unit_file_refuses(tmp_path: Path) -> None:
@@ -1198,8 +1224,11 @@ def test_lock_directory_refuses(tmp_path: Path) -> None:
     hub = _hub(tmp_path)
     runs = hub / ".helios" / "runs"
     runs.mkdir(parents=True)
-    (runs / "unit-U1.lock").mkdir()
-    with pytest.raises(UnitNewError, match=r"^cannot lock "):
+    lock = runs / "unit-U1.lock"
+    lock.mkdir()
+    with pytest.raises(
+        UnitNewError, match=rf"^cannot lock {re.escape(str(lock))}: not a regular file$"
+    ):
         with unit_lock(hub, ".helios/runs", "U1"):
             pass
 

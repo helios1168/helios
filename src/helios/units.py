@@ -113,7 +113,7 @@ def unit_lock(hub: Path, runs_dir: str, unit: str) -> Iterator[None]:
             path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644
         )
     except OSError as exc:
-        if exc.errno == errno.ELOOP:
+        if exc.errno in (errno.ELOOP, errno.EISDIR):
             raise UnitNewError(f"cannot lock {path}: not a regular file") from None
         raise UnitNewError(f"cannot lock {path}: {_error_text(exc)}") from None
     if not stat.S_ISREG(os.fstat(fd).st_mode):
