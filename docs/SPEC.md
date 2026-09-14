@@ -64,7 +64,9 @@ arguments and calls it.
 - A command module imports optional dependencies (for example `sympy`, `z3`) inside `run`, never
   at module level, so a missing optional package breaks only that command.
 - A command that gets a configuration error (`ValueError` or `TypeError` from `helios.config`)
-  prints `helios: <message>` to stderr and exits 2.
+  prints `helios: <message>` to stderr and exits 2. The same rule covers a program or claims
+  module that fails to import: the command prints `helios: cannot import <module>: <exception
+  type>: <message>` to stderr and exits 2.
 - `helios.templates.path(name)` returns `<repository>/templates/<name>` (the directory two levels
   above the package) and raises `FileNotFoundError` naming the path. Shipping templates inside a
   wheel is not in this wave.
@@ -318,6 +320,15 @@ These apply to claude, codex, opencode and agy.
   and never validated.
 - `parse(spec, exit_code, stdout_path)` never raises and never reads stderr. It reads stdout as
   bytes. Input handling:
+  - A path is not a regular file unless `os.stat` succeeds and `stat.S_ISREG` holds. This is
+    checked before opening, so a FIFO, socket or device is never opened or read. Any `OSError`
+    or `ValueError` from stat or read (a NUL byte in the path raises `ValueError`) means the path
+    cannot be read.
+  - Strip and stripped mean removing only the JSON whitespace characters space, tab, CR and LF
+    from both ends (`strip(" \t\r\n")`), never Python's default `str.strip`, which also removes
+    U+2028, U+2029, U+0085, NBSP and others.
+  - `json.loads` is called with a `parse_constant` that raises, so `NaN`, `Infinity` and
+    `-Infinity` make a line or document not JSON.
   - A `stdout_path` that is missing or is not a regular file, or that cannot be read, gives
     session_id None and native_error `no stdout`.
   - claude and agy: decode the bytes as UTF-8, strip, `json.loads`. A decode failure (invalid
@@ -336,17 +347,20 @@ These apply to claude, codex, opencode and agy.
   than 0, or when the output signals failure: claude `is_error` is JSON `true` (any other value
   is not a failure); codex any `turn.failed`,
   or no `turn.completed`; opencode any `error` event, or a last event that is not
-  `step_finish`; agy a `status` other than `SUCCESS`. `exit_code` None is not an error by
-  itself. The text is a non-empty string, the first that applies: claude `result`; codex
-  `error.message` of the last `turn.failed`, else `message` of the last `error` event; opencode
-  `error.data.message` of the first `error` event, else its `error.name`; agy `error`; else
-  `exit code <N>` when the exit code is not 0, else `turn did not complete`.
+  `step_finish`; agy a `status` other than `SUCCESS`, a missing `status` key included.
+  `exit_code` None is not an error by itself. The text is a non-empty string, the first that
+  applies: claude `result`; codex `error.message` of the last `turn.failed`, else `message` of
+  the last `error` event; opencode `error.data.message` of the first `error` event, else its
+  `error.name`; agy `error`; else `exit code <N>` when the exit code is not 0, else
+  `turn did not complete`.
 - structured is None whenever native_error is set, and always None for opencode. Otherwise it
   is claude or agy `structured_output`, or for codex the JSON in `<raw_dir>/last-message.json`.
-  Only a JSON object counts. A missing key, or a `last-message.json` that is missing or not a
-  regular file, gives None and the note `no structured result`. A present key or file whose
-  value is not an object (JSON `null` included), whose bytes are not valid UTF-8, or that is not
-  valid JSON gives None and the note `structured result is not a JSON object`. Never fall back to claude `result` or agy
+  Only a JSON object counts. A missing key, or a `last-message.json` that is missing, is not a
+  regular file or cannot be read, gives None and the note `no structured result`. The bytes of
+  `last-message.json` are stripped by the same JSON whitespace rule before `json.loads`. A
+  present key or file whose value is not an object (JSON `null` included), whose bytes are not
+  valid UTF-8, or that is not valid JSON gives None and the note
+  `structured result is not a JSON object`. Never fall back to claude `result` or agy
   `response`.
 - notes is empty unless a rule above adds one.
 - `helios.harness.get(name)` returns the adapter for `claude`, `codex`, `opencode`, `agy` and
@@ -591,13 +605,15 @@ an exclusive `mkdir`; if it already exists (a concurrent run took `n`), helios t
 `state.json` is written right after the `mkdir`, but a process can die between the two. Every
 reader (preflight, recovery, `helios ps`) treats an attempt directory whose `state.json` is
 missing or unreadable (empty, not valid JSON, not an object, or without a string `state`) as
-state `allocated` with `pid` null, `session_id` null and `execution_status` null; reading it
-never raises. Preflight reads attempt state without the lock, so it must accept this case and
-leave the decision to recovery under the lock. Before launch helios checks the
-worktree report path; if a file is there (stale), it moves it to `attempt-<n>/stale-report.json`
-and adds a note. A report is accepted only from the current attempt's path or the native schema
-channel of the current process. The input hashes (§7.1 step 6) are fixed in `input.json`
-before launch.
+state `allocated` with `pid` null, `session_id` null and `execution_status` null, and takes the
+attempt id `<bead>#<n>` from the directory name. In a readable file, a `pid` that is not an int
+greater than 0 (a bool counts as not an int) reads as null, and a `session_id` or
+`execution_status` that is not a string reads as null. Reading it never raises. Preflight reads
+attempt state without the lock, so it must accept these cases and leave the decision to recovery
+under the lock. Before launch helios checks the worktree report path; if a file is there
+(stale), it moves it to `attempt-<n>/stale-report.json` and adds a note. A report is accepted
+only from the current attempt's path or the native schema channel of the current process. The
+input hashes (§7.1 step 6) are fixed in `input.json` before launch.
 
 ### 8.4 Recovery
 
@@ -648,40 +664,59 @@ refuses stale evidence (§12).
 
 ### 9.2 Commands
 
+Every stderr message of `helios ps`, `helios attach`, `helios say` and `helios stop` starts with
+`helios: `. The worktree of a bead is the §7.3 path `<hub>/<project.worktrees>/<bead>`; helios
+never reads a worktree path from `input.json`.
+
 - `helios ps [--json]`: rows come from the directories under `<runs>`, one per bead, using its
   highest attempt (§8.3 reading rules apply), sorted by bead id. A bead gets a row when that
   attempt is not finalized or the bead is `in_progress`. Each bead is read once with `bd show`
   through `helios.beads`; when that fails, `unit`, `kind` and the in-progress test fall back to
   `-` and false. Columns: `bead`, `unit`, `kind`, `harness` (key `harness` of the attempt's
-  `input.json`, else `-`), `state`, `attempt` (the attempt id), `age`, `worktree`, `session`
-  (`<harness>:<session_id>`, else `-`). Text output is tab-separated with that header line;
-  `state` shows the stored state, plus ` (dead)` when the state is `launched` and the pid is not
-  alive. Age is now minus `updated`: under 60 s `<n>s`, under 60 min `<n>m`, under 24 h `<n>h`,
-  else `<n>d`, whole units rounded down, `-` when unknown. `--json` prints a list of objects
-  with those keys (null for unknown) plus `alive` (bool) and `last_event` (the `type` of the
-  last parseable line of the events file (§9.3) whose `bead` equals the bead and whose `attempt`
-  equals the attempt id, else null). With no rows, text prints the header only and `--json`
-  prints `[]`. Exit 0.
+  `input.json`, else `-`), `state`, `attempt` (the attempt id), `age`, `worktree` (the §7.3
+  path when that directory exists, else `-`), `session` (`<harness>:<session_id>`, else `-`).
+  Text output is tab-separated with that header line; `state` shows the stored state, plus
+  ` (dead)` when the state is `launched` and the pid is not alive. Age is now minus `updated`:
+  under 60 s `<n>s`, under 60 min `<n>m`, under 24 h `<n>h`, else `<n>d`, whole units rounded
+  down. A future `updated` gives `0s`. An `updated` without a UTC offset, or not parseable as
+  ISO 8601, is unknown, and an unknown age is `-`. `--json` prints a list of objects with those
+  keys plus `alive` (bool) and `last_event`. In `--json` every unknown value is null, `age`
+  included, and `state` is the stored state without the ` (dead)` suffix; the suffix is text
+  output only, and `alive` carries it in JSON. `last_event` is the `type` of the last line of
+  the events file (§9.3) whose `bead` equals the bead and whose `attempt` equals the attempt
+  id, else null. helios reads the events file as bytes, splits it on `b"\n"` only and decodes
+  each line as UTF-8; a line that does not decode, does not parse, or is not a JSON object is
+  skipped. With no rows, text prints the header only and `--json` prints `[]`. Exit 0.
 - `helios attach <bead>`: uses the highest attempt. It exits 2 with a message on stderr when
-  there is no attempt, when `input.json` has no `harness`, when the worktree is missing, or when
-  `session_id` is null (`no session recorded for <attempt_id>`; the session id is only known
-  after the adapter's parse, §7.1 step 8). Otherwise it builds the `LaunchSpec` from
-  configuration and the attempt paths with prompt `""`, calls the adapter's
+  there is no attempt, when `input.json` has no `harness`, when the §7.3 worktree directory is
+  missing, or when `session_id` is null (`helios: no session recorded for <attempt_id>`; the
+  session id is only known after the adapter's parse, §7.1 step 8). The harness comes from
+  `input.json` `harness`; an unknown harness name (the lookup raises `ValueError`) exits 2 with
+  `helios: <message>`. Otherwise it builds the `LaunchSpec` from the attempt paths with prompt
+  `""`, taking `model`, `effort`, `extra_args`, `timeout` and `server_url` from configuration
+  for the attempt's harness (§5), never from `input.json`. It calls the adapter's
   `attach_command(session_id, spec)`, replaces element 0 with the configured binary (§6.4),
   changes to the worktree directory and calls `os.execvp`. The harness lookup and the exec
   function are parameters of the library function, so tests inject them.
-- `helios say <bead> "<text>" [--kind steer|answer]`: `--kind` defaults to `steer`. A bead with
-  no directory under `<runs>` exits 2. Otherwise `say` always writes the message first (§9.4),
-  then adds the comment `<kind>: [<msg_id>] <text>` with the replay rule of §7.5, then appends
-  the event with type `<kind>`, source `orchestrator` and detail `<msg_id>`. When the highest
-  attempt is `launched` with a live pid, it prints `queued <msg_id>` to stderr and exits 3.
-  Otherwise it prints `<msg_id>` to stdout and exits 0. `say` never delivers: delivery belongs
-  to `helios resume`.
-- `helios stop <bead>`: exits 2 with `no running attempt for <bead>` unless the highest attempt
-  is `launched` with a live pid. It writes `attempt-<n>/stop-requested` holding the UTC time
+- `helios say <bead> "<text>" [--kind steer|answer]`: `--kind` defaults to `steer`. Text that
+  starts with `-` must follow `--` on the command line (`helios say <bead> -- "-text"`). A bead
+  with no directory under `<runs>`, or with no attempt directory, exits 2. Otherwise `say`
+  always writes the message first (§9.4), then adds the comment `<kind>: [<msg_id>] <text>`
+  with the replay rule of §7.5, then appends the event with type `<kind>`, source
+  `orchestrator` and detail `<msg_id>`. The comment and the event carry the attempt id of the
+  highest attempt as §8.3 reads it. When the bd comment fails, `say` prints `helios: <message>`
+  to stderr, appends no event and exits 1; the message stays in the inbox. When the highest
+  attempt is live (as defined under `helios stop`), it prints `helios: queued <msg_id>` to
+  stderr and exits 3. Otherwise it prints `<msg_id>` to stdout and exits 0. `say` never
+  delivers: delivery belongs to `helios resume`.
+- `helios stop <bead>`: exits 2 with `helios: no running attempt for <bead>` unless the highest
+  attempt is live. Live means state `launched`, a `pid` that reads as non-null under §8.3, and
+  `os.kill(pid, 0)` succeeding. It writes `attempt-<n>/stop-requested` holding the UTC time
   (`yyyy-mm-ddThh:mm:ssZ` and a newline) with a temp file and `os.replace`, then sends SIGINT
-  once to the attempt's process group with `os.killpg(pid, SIGINT)`, and exits 0 (also when the
-  group is already gone). It never escalates and never writes `state.json`. The running
+  once to the attempt's process group with `os.killpg(pid, SIGINT)`, and exits 0, also when the
+  group is already gone. A `PermissionError` from `os.killpg` counts like `ProcessLookupError`
+  (macOS gives EPERM for a zombie group leader): exit 0. It never escalates and never writes
+  `state.json`. The running
   `helios run` classifies an attempt whose `stop-requested` file exists as `interrupted` in
   step 8. The opencode abort route is not used in this wave.
 - `helios resume <bead> ["<text>"]`: exits 2 with a message on stderr when the bead has no
@@ -969,20 +1004,46 @@ project's `.agents/backends.toml`, else `templates/backends.toml`).
    a claim covering only requirement ids fails); unknown ids fail. An id matching
    `^R[0-9]+$` is a requirement id and is not checked against the registry; a retired block id
    counts as unknown.
-2. The backend exists and allows the claim's method and scope. Steps 1 and 2 run for every
-   selected claim before anything runs; any failure prints one line per problem to stderr and
-   exits 2.
+2. The backend exists and allows the claim's method and scope. The declared method, scope and
+   bound build a valid `Finding` with verdict `verified` (§4.2 rules 1 to 3: for example
+   `bounded` needs `bound`, and `exhaustive_finite_check` is never `universal`); a declaration
+   that does not is a step 2 problem. Steps 1 and 2 run for every selected claim before
+   anything runs; any failure prints one line per problem to stderr and exits 2. `claims check`
+   and `claims attack` remove `HELIOS_OMIT` from their own environment before loading the
+   registry; only a mutation run sets it.
 3. The claims module is imported with the hub and `<hub>/src` put in front of `sys.path`. Each
-   non-`manual` claim runs as `python -m helios.claims.runner <module> <name>` with cwd the hub
-   and a timeout from `--timeout S` (default 600). The runner prints one JSON line:
-   `{"result": true}`, `{"result": false}`, `{"finding": {...}}` or `{"error": "<traceback>"}`.
-   Only a JSON boolean or a `Finding` counts; any other return value is inconclusive with a
-   note. `True` gives a verified finding with `id` and `claim` set to the claim name and the
-   declared `covers`, `method`, `scope`, `bound` and `artifact`. `False` gives a refuted finding
-   with method `counterexample` when the backend allows it, else inconclusive. An error, a
-   timeout (note `timeout after <S> s`) or unparsable runner output gives inconclusive; an
-   error's traceback is saved to `<hub>/.helios/claims/<name>.traceback.txt` and that path goes
-   in `artifact`.
+   non-`manual` claim runs as `python -m helios.claims.runner <module> <name>` with cwd the
+   hub, `start_new_session=True` and a timeout from `--timeout S` (whole seconds, an int greater
+   than 0, default 600). The runner prints one JSON line: `{"result": true}`,
+   `{"result": false}`, `{"finding": {...}}`, `{"other": "<type name>"}` or
+   `{"error": "<traceback>"}`.
+   - The runner redirects file descriptor 1 to file descriptor 2 (`os.dup2`) while the claim
+     module is imported and the claim runs, and writes its one protocol line to the saved
+     original stdout, so claim output never reaches the protocol channel.
+   - The runner catches `BaseException` from the import and the claim, so `SystemExit` and
+     `KeyboardInterrupt` are errors with a traceback. A return value that is neither a JSON
+     boolean nor a `Finding` gives `{"other": "<type name>"}`.
+   - On timeout helios sends SIGKILL to the runner's process group, and the result is
+     inconclusive with the note `timeout after <S> s`, where `<S>` is the given int. After the
+     runner exits, for any reason, helios sends SIGKILL to that group too, ignoring
+     `ProcessLookupError` and `PermissionError`, so no grandchild survives.
+   - Apart from a timeout, the result counts only when the runner exits 0 and its stdout is
+     exactly one line holding one JSON object of the protocol. Otherwise it is inconclusive
+     with the note `runner exited <code>` when the exit code is not 0, else
+     `unparsable runner output`.
+   - helios never changes a declared method, scope or bound. `True` gives a verified finding
+     with `id` and `claim` set to the claim name and the declared `covers`, `method`, `scope`,
+     `bound` and `artifact`. `False` gives a refuted finding with method `counterexample` when
+     the backend allows it. When that finding would not validate, or the backend does not
+     allow `counterexample`, the result is inconclusive with a note naming the reason.
+   - A returned `Finding` keeps its verdict, method, scope, bound, artifact and notes, and
+     helios sets its `id`, `claim` and `covers` to the claim's. When its method or scope is not
+     allowed by the backend, the result is inconclusive with a note.
+   - An `other` result is inconclusive with the note `claim returned <type name>` and no
+     traceback file. An `error` result is inconclusive; its traceback is saved to
+     `<hub>/.helios/claims/<name>.traceback.txt`, and `artifact` holds the hub-relative path
+     `.helios/claims/<name>.traceback.txt`.
+   - An inconclusive finding always carries the declared method, scope and bound.
 4. Print one JSON finding per line to stdout. Exit 0 when every selected non-manual claim is
    verified (also when none is selected), else 3.
 
@@ -1003,24 +1064,33 @@ passed, else 0.
 - `helios program show [--output PATH]`: deterministic markdown. Sections `## <kind>` follow
   the kind order of §15.1, only for kinds with active blocks, with blocks sorted by id and one
   line per block `<id>  <expr>  # satisfies <ids> / relaxes <ids>`, where `expr` is `str(expr)`
-  with newlines replaced by spaces and id lists are joined with `, `. A half with no ids is
-  dropped with its ` / ` separator, and the whole comment is dropped when both are empty.
-  `## Retired` follows only when there are retired blocks, in the same line format sorted by
-  id. Output ends with one newline. `--output PATH` writes the file instead of stdout. The same
-  registry gives the same bytes.
+  with each `\r\n`, `\r` and `\n` replaced by one space, and each id list is sorted, then joined
+  with `, `. A half with no ids is dropped with its ` / ` separator, and the whole comment is
+  dropped when both are empty. `## Retired` follows only when there are retired blocks, in the
+  same line format sorted by id. Output ends with one newline, except that an empty registry
+  (no active and no retired blocks) prints nothing, zero bytes. `--output PATH` writes the file
+  instead of stdout. The same registry gives the same bytes.
 - `helios program check`: call each active block's `build` on a recording model object and
   assert the set of recorded names, with any `[...]` suffix stripped, equals the active
   constraint and objective ids that have a `build`. Only names recorded while building
   `constraint` and `objective` blocks are compared; blocks are built in insertion order. The
   recording model returns a recorder for any attribute; calling a recorder records
-  `kwargs["name"]` when it is a string and returns a new recorder. The suffix stripped is
-  everything from the first `[`. Print `missing: <ids>` and `unexpected: <names>` lines (sorted,
-  joined with `, `, only when non-empty) and exit 5 on a mismatch (a failed check, as in §7.1),
-  else 0.
-- `helios program diff <rev1> <rev2>`: load the registry at two git revisions (`git show
-  <rev>:<path>` into a temporary module). The registry module path at a revision is
+  `kwargs["name"]` when it is a string and returns a new recorder. The recording model and every
+  recorder also support indexing, slicing, iteration (yields nothing), `len` (0), truth (true),
+  every arithmetic, comparison and bitwise operator in both operand orders, and unary
+  operators; each returns a recorder except `len`, iteration and truth. The suffix stripped is
+  everything from the first `[`. A `build` that raises is the mismatch line
+  `error: <id>: <exception type>: <message>`. Print `missing: <ids>` and `unexpected: <names>`
+  lines (sorted, joined with `, `, only when non-empty) and exit 5 on a mismatch (a failed
+  check, as in §7.1), else 0.
+- `helios program diff <rev1> <rev2>`: load the registry at two git revisions. Each revision is
+  loaded in its own subprocess from `git archive <rev>` extracted into a temporary directory,
+  with that directory and its `src` first on `sys.path`, importing the module by name, so
+  sibling imports resolve at the same revision. The registry module path at a revision is
   `src/<module with dots as slashes>.py`, else `<module with dots as slashes>.py`; when neither
-  exists at that revision, exit 2. Only active ids are compared. Print every `+<id>` line (in
+  exists at that revision, exit 2. A module that fails to import at a revision exits 2 with
+  `helios: cannot import <module> at <rev>: <exception type>: <message>`. Only active ids are
+  compared. Print every `+<id>` line (in
   rev2, not rev1) sorted, then every `-<id>` line sorted. Exit 0.
 
 Semantic conformance beyond names (coefficients, bounds, domains, objective direction, feasible
