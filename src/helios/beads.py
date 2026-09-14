@@ -31,6 +31,31 @@ def decode_metadata(raw: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _decode_show_metadata(raw: dict[str, Any]) -> dict[str, Any]:
+    """Undo bd's double-encoding of compound metadata values from `bd show`/`bd list`.
+
+    `bd update --set-metadata` stores a list or dict as a literal JSON-text string (for
+    example `files` becomes '["a.py"]'), so it needs a second decode to come back as the
+    real value. Scalars set the same way already arrive as their real type from bd, and
+    `Beads.create` stores every value with its real JSON type too, including plain strings
+    such as "true" or "3" that must stay strings. Unlike `decode_metadata`, this only
+    unwraps a string when the decoded result is a list or dict, so already-correct strings
+    and scalars are never reinterpreted.
+    """
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except (json.JSONDecodeError, ValueError):
+                decoded = None
+            if isinstance(decoded, (list, dict)):
+                out[key] = decoded
+                continue
+        out[key] = value
+    return out
+
+
 def _as_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -55,12 +80,14 @@ class Bead:
     metadata: dict[str, Any] = field(default_factory=dict)
     docs: list[str] = field(default_factory=list)
     memories: list[str] = field(default_factory=list)
+    labels: list[str] = field(default_factory=list)
 
     @classmethod
     def from_show(cls, payload: dict[str, Any]) -> Bead:
-        """Build a Bead from one decoded `bd show` object."""
-        metadata = decode_metadata(dict(payload.get("metadata") or {}))
-        kind = str(metadata.get("kind") or _label_kind(payload.get("labels") or []) or "impl")
+        """Build a Bead from one decoded `bd show` or `bd list` object."""
+        labels = _as_list(payload.get("labels"))
+        metadata = _decode_show_metadata(dict(payload.get("metadata") or {}))
+        kind = str(metadata.get("kind") or _label_kind(labels) or "impl")
         accept = str(metadata.get("accept") or payload.get("acceptance_criteria") or "")
         return cls(
             id=str(payload["id"]),
@@ -77,6 +104,7 @@ class Bead:
             metadata=metadata,
             docs=_as_list(metadata.get("docs")),
             memories=_as_list(metadata.get("memories")),
+            labels=labels,
         )
 
 
@@ -266,6 +294,86 @@ class Beads:
     def set_state(self, bead_id: str, dimension: str, value: str, reason: str) -> None:
         self._run(["set-state", bead_id, f"{dimension}={value}", "--reason", reason])
 
+    def create(
+        self,
+        title: str,
+        *,
+        labels: list[str],
+        metadata: dict[str, Any],
+        type: str = "task",
+        description: str = "",
+    ) -> str:
+        """Create a bead and return its id (`bd create --metadata <json> --silent`).
+
+        Metadata is passed as one JSON object so every value keeps its real JSON type on
+        the way in; see `_decode_show_metadata` for how that survives the way back out.
+        """
+        argv = ["create", "--title", title, "--type", type, "--metadata", json.dumps(metadata)]
+        if description:
+            argv += ["--description", description]
+        if labels:
+            argv += ["--labels", ",".join(labels)]
+        argv += ["--silent"]
+        return self._run(argv).strip()
+
+    def dep_add(self, blocked: str, blocker: str) -> None:
+        """`bd dep add <blocked> <blocker>`: blocked depends on (is blocked by) blocker.
+
+        bd itself treats adding an existing dependency again as a no-op (exit 0, same
+        confirmation message), so there is nothing extra to check here.
+        """
+        self._run(["dep", "add", blocked, blocker])
+
+    def list(self, *, labels: list[str] = [], status: str | None = None) -> list[Bead]:
+        """Beads carrying every label in `labels`, via `bd list --json --label a,b -n 0`.
+
+        `status` filters to that stored status; `None` passes `--all` so every status,
+        closed included, comes back (bd's default listing hides closed beads).
+        """
+        argv = ["list", "--json", "-n", "0"]
+        if labels:
+            argv += ["--label", ",".join(labels)]
+        if status is None:
+            argv += ["--all"]
+        else:
+            argv += ["--status", status]
+        out = self._run(argv)
+        return [Bead.from_show(p) for p in json.loads(out or "[]")]
+
+    def remember(self, key: str, value: str) -> None:
+        """`bd remember --key <key> -- <value>`.
+
+        The `--` separator is required: without it, a value starting with `-` is parsed as
+        a flag. Round-trip through `recall` was checked byte for byte with a real bd for a
+        body ending in no newline, one newline, two newlines, a multi-line body, and a body
+        starting with `-`: every one of them comes back unchanged.
+        """
+        self._run(["remember", "--key", key, "--", value])
+
+    def recall(self, key: str) -> str | None:
+        """`bd recall <key> --json`; `None` when the key has no memory.
+
+        Reads `--json` rather than plain stdout: plain `bd recall` always prints the value
+        with one newline appended, which would be indistinguishable from a value that
+        itself ends in a newline. The JSON `value` field is the exact stored text.
+        """
+        proc = subprocess.run(
+            [self.binary, "recall", key, "--json"],
+            cwd=self.cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        payload = json.loads(proc.stdout)
+        return payload["value"] if payload.get("found") else None
+
+    def memories(self) -> dict[str, str]:
+        """`bd memories --json`: every stored key to its exact value."""
+        out = self._run(["memories", "--json"])
+        payload = json.loads(out or "{}")
+        payload.pop("schema_version", None)
+        return payload
+
 
 class FakeBeads:
     """In-memory ``Beads`` for tests, same interface."""
@@ -276,6 +384,9 @@ class FakeBeads:
         self.closed: dict[str, str] = {}
         self.states: dict[str, dict[str, str]] = {}
         self.argv_log: list[list[str]] = []
+        self.deps: dict[str, set[str]] = {}
+        self._memories: dict[str, str] = {}
+        self._next_id = 1
 
     def show(self, bead_id: str) -> Bead:
         return self.beads[bead_id]
@@ -301,6 +412,53 @@ class FakeBeads:
     def set_state(self, bead_id: str, dimension: str, value: str, reason: str) -> None:
         self.argv_log.append(["set-state", bead_id, dimension, value, reason])
         self.states.setdefault(bead_id, {})[dimension] = value
+
+    def create(
+        self,
+        title: str,
+        *,
+        labels: list[str],
+        metadata: dict[str, Any],
+        type: str = "task",
+        description: str = "",
+    ) -> str:
+        bead_id = f"fake-{self._next_id}"
+        self._next_id += 1
+        log_entry = ["create", title, list(labels), dict(metadata), type, description]
+        self.argv_log.append(log_entry)  # type: ignore[arg-type]
+        self.beads[bead_id] = Bead.from_show(
+            {
+                "id": bead_id,
+                "title": title,
+                "description": description,
+                "status": "open",
+                "labels": list(labels),
+                "metadata": dict(metadata),
+            }
+        )
+        return bead_id
+
+    def dep_add(self, blocked: str, blocker: str) -> None:
+        self.argv_log.append(["dep", "add", blocked, blocker])
+        self.deps.setdefault(blocked, set()).add(blocker)
+
+    def list(self, *, labels: list[str] = [], status: str | None = None) -> list[Bead]:
+        wanted = set(labels)
+        return [
+            b
+            for b in self.beads.values()
+            if wanted.issubset(b.labels) and (status is None or b.status == status)
+        ]
+
+    def remember(self, key: str, value: str) -> None:
+        self.argv_log.append(["remember", "--key", key, value])
+        self._memories[key] = value
+
+    def recall(self, key: str) -> str | None:
+        return self._memories.get(key)
+
+    def memories(self) -> dict[str, str]:
+        return dict(self._memories)
 
 
 def apply_writeback(beads: BeadsLike, bead_id: str, plan: Writeback) -> int:

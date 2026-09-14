@@ -130,7 +130,59 @@ def test_comment_has_ignores_quoted_markers() -> None:
     assert not comment_has(comments, "learned", "[hel-x#11]")
 
 
+def test_fake_create_round_trips_labels_and_metadata() -> None:
+    fake = FakeBeads()
+    bead_id = fake.create(
+        "probe",
+        labels=["kind:impl", "unit:x"],
+        metadata={"s": "true", "n": None, "flag": True, "files": ["a.py"]},
+    )
+    bead = fake.show(bead_id)
+    assert bead.labels == ["kind:impl", "unit:x"]
+    assert bead.kind == "impl"
+    assert bead.metadata["s"] == "true"
+    assert bead.metadata["n"] is None
+    assert bead.metadata["flag"] is True
+    assert bead.files == ["a.py"]
+
+
+def test_fake_dep_add_is_idempotent() -> None:
+    fake = FakeBeads()
+    fake.dep_add("b1", "b2")
+    fake.dep_add("b1", "b2")
+    assert fake.deps["b1"] == {"b2"}
+
+
+def test_fake_list_filters_by_labels_and_status() -> None:
+    fake = FakeBeads(
+        [
+            Bead(id="b1", labels=["unit:x", "kind:impl"], status="open"),
+            Bead(id="b2", labels=["unit:x", "kind:verify"], status="closed"),
+            Bead(id="b3", labels=["unit:y"], status="open"),
+        ]
+    )
+    assert [b.id for b in fake.list(labels=["unit:x"])] == ["b1", "b2"]
+    assert [b.id for b in fake.list(labels=["unit:x"], status="open")] == ["b1"]
+
+
+def test_fake_remember_recall_and_memories() -> None:
+    fake = FakeBeads()
+    assert fake.recall("missing") is None
+    fake.remember("k", "v1")
+    fake.remember("k", "v2")
+    assert fake.recall("k") == "v2"
+    assert fake.memories() == {"k": "v2"}
+
+
 BD = shutil.which("bd")
+
+
+def _init_bd_repo(tmp_path: Path) -> None:
+    """`git init` then `bd init --non-interactive` in a fresh directory."""
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["bd", "init", "--non-interactive"], cwd=tmp_path, check=True, capture_output=True
+    )
 
 
 @pytest.mark.skipif(BD is None, reason="bd is not on PATH")
@@ -148,3 +200,66 @@ def test_real_bd_show_round_trip(tmp_path: Path) -> None:
     bead = beads.show(bead_id)
     assert bead.id == bead_id
     assert bead.title == "probe"
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_create_round_trips_metadata_types(tmp_path: Path) -> None:
+    _init_bd_repo(tmp_path)
+    beads = Beads(tmp_path)
+    bead_id = beads.create(
+        "probe",
+        labels=["kind:impl", "unit:x"],
+        metadata={"s": "true", "n": None, "flag": True, "files": ["a.py"]},
+    )
+    bead = beads.show(bead_id)
+    assert bead.labels == ["kind:impl", "unit:x"]
+    assert bead.metadata["s"] == "true"
+    assert bead.metadata["n"] is None
+    assert bead.metadata["flag"] is True
+    assert bead.files == ["a.py"]
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_dep_add_is_idempotent(tmp_path: Path) -> None:
+    _init_bd_repo(tmp_path)
+    beads = Beads(tmp_path)
+    a = beads.create("A", labels=[], metadata={})
+    b = beads.create("B", labels=[], metadata={})
+    beads.dep_add(a, b)
+    beads.dep_add(a, b)  # must not raise
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_list_filters_by_labels_and_status(tmp_path: Path) -> None:
+    _init_bd_repo(tmp_path)
+    beads = Beads(tmp_path)
+    open_id = beads.create("open one", labels=["unit:x"], metadata={})
+    closed_id = beads.create("closed one", labels=["unit:x"], metadata={})
+    beads.close(closed_id, "done")
+    other_id = beads.create("other unit", labels=["unit:y"], metadata={})
+
+    all_x = {b.id for b in beads.list(labels=["unit:x"])}
+    assert all_x == {open_id, closed_id}
+    assert other_id not in all_x
+
+    open_only = {b.id for b in beads.list(labels=["unit:x"], status="open")}
+    assert open_only == {open_id}
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_remember_recall_round_trip(tmp_path: Path) -> None:
+    _init_bd_repo(tmp_path)
+    beads = Beads(tmp_path)
+    assert beads.recall("missing") is None
+    cases = {
+        "no-newline": "hello world",
+        "one-newline": "hello world\n",
+        "two-newlines": "hello world\n\n",
+        "multiline": "line1\nline2\nline3",
+        "leading-dash": "-not-a-flag value",
+    }
+    for key, value in cases.items():
+        beads.remember(key, value)
+    for key, value in cases.items():
+        assert beads.recall(key) == value
+    assert beads.memories() == cases
