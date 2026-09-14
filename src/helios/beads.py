@@ -247,6 +247,10 @@ class BeadsLike(Protocol):
     def set_metadata(self, bead_id: str, metadata: dict[str, str]) -> None: ...
     def close(self, bead_id: str, reason: str) -> None: ...
     def set_state(self, bead_id: str, dimension: str, value: str, reason: str) -> None: ...
+    def ready(self, *, labels: list[str] = []) -> list[Bead]: ...
+    def add_label(self, bead_id: str, label: str) -> None: ...
+    def gate_list(self) -> list[dict[str, Any]]: ...
+    def gate_blocks(self, gate_id: str) -> list[str]: ...
 
 
 class Beads:
@@ -339,6 +343,46 @@ class Beads:
             argv += ["--status", status]
         out = self._run(argv)
         return [Bead.from_show(p) for p in json.loads(out or "[]")]
+
+    def ready(self, *, labels: list[str] = []) -> list[Bead]:
+        """Ready beads via `bd ready --json --label a --label b -n 0`.
+
+        `--label` is repeated once per label (AND semantics: a bead must carry every
+        one). `-n 0` asks for unlimited rows, since `bd ready` otherwise defaults to
+        100 and would silently truncate a large ready set.
+        """
+        argv = ["ready", "--json", "-n", "0"]
+        for label in labels:
+            argv += ["--label", label]
+        out = self._run(argv)
+        return [Bead.from_show(p) for p in json.loads(out or "[]")]
+
+    def add_label(self, bead_id: str, label: str) -> None:
+        """`bd label add <bead> <label>`; adding a label the bead already has is a no-op."""
+        self._run(["label", "add", bead_id, label])
+
+    def gate_list(self) -> list[dict[str, Any]]:
+        """Open gates via `bd gate list --json -n 0`, bd's objects unchanged."""
+        out = self._run(["gate", "list", "--json", "-n", "0"])
+        return json.loads(out or "[]")
+
+    def gate_blocks(self, gate_id: str) -> list[str]:
+        """Sorted ids of the beads `gate_id` blocks.
+
+        Reads `bd show <gate> --json --include-dependents`. The field is
+        `dependents`: a list of objects with `id` and `dependency_type`, found by
+        creating a human gate blocking two beads in a temp repo (`bd gate create
+        --blocks`, `bd dep add <bead> <gate>`) and inspecting the JSON. Only entries
+        with `dependency_type == "blocks"` count.
+        """
+        out = self._run(["show", gate_id, "--json", "--include-dependents"])
+        payloads = json.loads(out)
+        if not payloads:
+            raise KeyError(f"bead {gate_id} not found")
+        dependents = payloads[0].get("dependents") or []
+        return sorted(
+            str(d["id"]) for d in dependents if d.get("dependency_type") == "blocks"
+        )
 
     def remember(self, key: str, value: str) -> None:
         """`bd remember --key <key> -- <value>`.
@@ -449,6 +493,38 @@ class FakeBeads:
             for b in self.beads.values()
             if wanted.issubset(b.labels) and (status is None or b.status == status)
         ]
+
+    def ready(self, *, labels: list[str] = []) -> list[Bead]:
+        wanted = set(labels)
+
+        def blocked(bead_id: str) -> bool:
+            return any(
+                self.beads[blocker].status != "closed"
+                for blocker in self.deps.get(bead_id, set())
+                if blocker in self.beads
+            )
+
+        return [
+            b
+            for b in self.beads.values()
+            if wanted.issubset(b.labels) and b.status == "open" and not blocked(b.id)
+        ]
+
+    def add_label(self, bead_id: str, label: str) -> None:
+        self.argv_log.append(["label", "add", bead_id, label])
+        labels = self.beads[bead_id].labels
+        if label not in labels:
+            labels.append(label)
+
+    def gate_list(self) -> list[dict[str, Any]]:
+        return [
+            {"id": b.id, "issue_type": "gate", "status": b.status}
+            for b in self.beads.values()
+            if b.metadata.get("issue_type") == "gate" and b.status == "open"
+        ]
+
+    def gate_blocks(self, gate_id: str) -> list[str]:
+        return sorted(blocked for blocked, blockers in self.deps.items() if gate_id in blockers)
 
     def remember(self, key: str, value: str) -> None:
         self.argv_log.append(["remember", "--key", key, value])

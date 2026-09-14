@@ -136,6 +136,19 @@ def test_worktree_prepare_creates_reuses_and_refuses(tmp_path: Path) -> None:
         worktree.prepare(hub=hub, bead="b2")
 
 
+def test_worktree_prepare_starts_from_given_commit(tmp_path: Path) -> None:
+    hub = make_repo(tmp_path / "hub")
+    start_commit = head(hub)
+    (hub / "later.txt").write_text("later\n")
+    subprocess.run(["git", "add", "."], cwd=hub, check=True)
+    subprocess.run(["git", "commit", "-qm", "later"], cwd=hub, check=True)
+    assert head(hub) != start_commit
+
+    info = worktree.prepare(hub=hub, bead="b3", start=start_commit)
+    assert head(info.path) == start_commit
+    assert info.base_commit == start_commit
+
+
 def test_confidential_basename_matches_at_any_depth(tmp_path: Path) -> None:
     hub = make_repo(tmp_path / "hub")
     base = head(hub)

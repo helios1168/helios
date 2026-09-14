@@ -1,10 +1,10 @@
 """Bead worktrees (SPEC §7.3).
 
 Path ``<hub>/<project.worktrees>/<bead>``, branch ``worktree-<bead>``. New
-trees are added from ``main`` and locked; existing ones are reused and
-refused when their branch differs. Passing ``again`` resets an existing tree to
-its branch tip. ``link_into_worktrees`` glob matches are symlinked in.
-``base_commit`` is the worktree HEAD before launch.
+trees are added from ``start`` (default ``main``) and locked; existing ones
+are reused and refused when their branch differs. Passing ``again`` resets an
+existing tree to its branch tip. ``link_into_worktrees`` glob matches are
+symlinked in. ``base_commit`` is the worktree HEAD before launch.
 """
 
 from __future__ import annotations
@@ -55,8 +55,13 @@ def prepare(
     worktrees: str = ".claude/worktrees",
     link_into_worktrees: tuple[str, ...] = (),
     again: bool = False,
+    start: str = "main",
 ) -> WorktreeInfo:
-    """Create or reuse the bead worktree and return it with ``base_commit``."""
+    """Create or reuse the bead worktree and return it with ``base_commit``.
+
+    ``start`` is the ref a new worktree branches from; it is ignored when an
+    existing worktree is reused.
+    """
     path = hub / worktrees / bead
     branch = branch_name(bead)
     created = False
@@ -77,7 +82,7 @@ def prepare(
             _git(path, "clean", "-fd", "-e", ".helios")
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _git(hub, "worktree", "add", str(path), "-b", branch, "main")
+        _git(hub, "worktree", "add", str(path), "-b", branch, start)
         _git(hub, "worktree", "lock", "--reason", "keep", str(path))
         created = True
     link_matches(hub, path, link_into_worktrees)

@@ -174,6 +174,43 @@ def test_fake_remember_recall_and_memories() -> None:
     assert fake.memories() == {"k": "v2"}
 
 
+def test_fake_ready_requires_every_label_and_no_open_blocker() -> None:
+    fake = FakeBeads(
+        [
+            Bead(id="b1", labels=["unit:x", "kind:impl"], status="open"),
+            Bead(id="b2", labels=["unit:x"], status="open"),
+            Bead(id="b3", labels=["unit:x", "kind:impl"], status="closed"),
+            Bead(id="g1", labels=[], status="open"),
+        ]
+    )
+    fake.dep_add("b2", "g1")
+    assert [b.id for b in fake.ready(labels=["unit:x"])] == ["b1"]
+    fake.close("g1", "resolved")
+    fake.beads["g1"].status = "closed"
+    assert {b.id for b in fake.ready(labels=["unit:x"])} == {"b1", "b2"}
+
+
+def test_fake_add_label_is_idempotent() -> None:
+    fake = FakeBeads([Bead(id="b1", labels=["kind:impl"])])
+    fake.add_label("b1", "unit:x")
+    fake.add_label("b1", "unit:x")
+    assert fake.beads["b1"].labels == ["kind:impl", "unit:x"]
+
+
+def test_fake_gate_list_and_gate_blocks() -> None:
+    fake = FakeBeads(
+        [
+            Bead(id="g1", metadata={"issue_type": "gate"}, status="open"),
+            Bead(id="b1"),
+            Bead(id="b2"),
+        ]
+    )
+    fake.dep_add("b1", "g1")
+    fake.dep_add("b2", "g1")
+    assert [g["id"] for g in fake.gate_list()] == ["g1"]
+    assert fake.gate_blocks("g1") == ["b1", "b2"]
+
+
 BD = shutil.which("bd")
 
 
@@ -244,6 +281,52 @@ def test_real_bd_list_filters_by_labels_and_status(tmp_path: Path) -> None:
 
     open_only = {b.id for b in beads.list(labels=["unit:x"], status="open")}
     assert open_only == {open_id}
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_ready_filters_by_two_labels_with_no_limit(tmp_path: Path) -> None:
+    _init_bd_repo(tmp_path)
+    beads = Beads(tmp_path)
+    both = beads.create("both labels", labels=["foo", "bar"], metadata={})
+    one = beads.create("one label", labels=["foo"], metadata={})
+    for i in range(150):
+        beads.create(f"filler {i}", labels=["foo", "bar"], metadata={})
+
+    ready_ids = {b.id for b in beads.ready(labels=["foo", "bar"])}
+    assert both in ready_ids
+    assert one not in ready_ids
+    assert len(ready_ids) == 151  # not truncated by bd's default -n 100
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_add_label_does_not_raise_on_existing_label(tmp_path: Path) -> None:
+    _init_bd_repo(tmp_path)
+    beads = Beads(tmp_path)
+    bead_id = beads.create("probe", labels=[], metadata={})
+    beads.add_label(bead_id, "unit:x")
+    beads.add_label(bead_id, "unit:x")  # must not raise
+    assert "unit:x" in beads.show(bead_id).labels
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_gate_list_and_gate_blocks_two_beads(tmp_path: Path) -> None:
+    _init_bd_repo(tmp_path)
+    beads = Beads(tmp_path)
+    a = beads.create("A", labels=[], metadata={})
+    b = beads.create("B", labels=[], metadata={})
+    gate = subprocess.run(
+        ["bd", "gate", "create", "--blocks", a, "--reason", "review", "--json"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    gate_id = json.loads(gate.stdout)["id"]
+    beads.dep_add(b, gate_id)
+
+    gates = beads.gate_list()
+    assert [g["id"] for g in gates] == [gate_id]
+    assert beads.gate_blocks(gate_id) == sorted([a, b])
 
 
 @pytest.mark.skipif(BD is None, reason="bd is not on PATH")
