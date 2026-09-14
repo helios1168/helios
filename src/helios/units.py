@@ -16,14 +16,16 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import os
 import re
+import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from helios.beads import Bead
-from helios.config import Config, resolve_harness, split_spec
+from helios.config import Config, resolve_harness
 from helios.templates import path as template_path
 
 STAGE_ORDER: tuple[str, ...] = (
@@ -88,19 +90,16 @@ class StageRow:
 def unit_lock(hub: Path, runs_dir: str, unit: str) -> Iterator[None]:
     """Hold the exclusive non-blocking creation lock (SPEC §10.2).
 
-    The lock file is ``<hub>/<project.runs>/unit-<unit>.lock``. A held lock
-    raises ``UnitNewError`` naming the unit. When the lock file itself cannot
-    be created, validation (which runs next and writes nothing) decides.
+    The caller validates the unit id first, so the lock path never uses an
+    unvalidated id. A lock file that cannot be created or locked for any
+    reason other than "held" refuses; the lock is never skipped.
     """
     path = hub / runs_dir / f"unit-{unit}.lock"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         handle = open(path, "a")
-    except OSError:
-        handle = None
-    if handle is None:
-        yield
-        return
+    except OSError as exc:
+        raise UnitNewError(f"cannot lock {path}: {_error_text(exc)}") from None
     with handle:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -109,11 +108,24 @@ def unit_lock(hub: Path, runs_dir: str, unit: str) -> Iterator[None]:
                 raise UnitNewError(
                     f"unit {unit} is being created by another process"
                 ) from None
-            raise
+            raise UnitNewError(f"cannot lock {path}: {_error_text(exc)}") from None
         try:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _error_text(exc: OSError) -> str:
+    """Human text for a lock OSError: the strerror when it has one."""
+    return exc.strerror or str(exc)
+
+
+def validate_unit_id(unit: str) -> None:
+    """Refuse a unit id outside `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$` (SPEC §10.2)."""
+    if re.fullmatch(_UNIT_RE, unit) is None:
+        raise UnitNewError(
+            f"invalid unit name {unit!r}: must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,99}}$"
+        )
 
 
 def _parent_index(stages: list[str], index: int) -> int | None:
@@ -155,17 +167,45 @@ def _resolve_author(
         ) from None
 
 
-def _check_units_dir(*, hub: Path, units: str) -> None:
-    """Refuse when an existing component of the units directory is not one.
+def _recorded_author(bead: Bead) -> str | None:
+    """The bead's recorded author metadata, None when missing or empty."""
+    author = bead.author or bead.metadata.get("author")
+    return author if isinstance(author, str) and author else None
 
-    SPEC §10.2 step 1: every existing component of ``<hub>/<project.units>``
-    is a directory, checked before anything is written.
+
+def _check_units_dir(*, hub: Path, units: str) -> None:
+    """Refuse when an existing units-dir component is not a directory.
+
+    SPEC §10.2 step 1, checked before anything is written. Each component is
+    examined with ``os.lstat`` so symlinks are seen for what they are: a
+    symlink must resolve (``os.stat`` succeeds) to a directory.
     """
     node: Path | None = None
     for part in (hub / units).parts:
         node = Path(part) if node is None else node / part
-        if node.exists() and not node.is_dir():
-            raise UnitNewError(f"units directory component is not a directory: {node}")
+        try:
+            kind = os.lstat(node)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise UnitNewError(
+                f"cannot stat units directory component {node}: {_error_text(exc)}"
+            ) from None
+        if stat.S_ISLNK(kind.st_mode):
+            try:
+                target = os.stat(node)
+            except OSError:
+                raise UnitNewError(
+                    f"units directory component is a broken symlink: {node}"
+                ) from None
+            if not stat.S_ISDIR(target.st_mode):
+                raise UnitNewError(
+                    f"units directory component is not a directory: {node}"
+                )
+        elif not stat.S_ISDIR(kind.st_mode):
+            raise UnitNewError(
+                f"units directory component is not a directory: {node}"
+            )
 
 
 def _validate(
@@ -179,10 +219,7 @@ def _validate(
     unit_path: Path,
 ) -> tuple[list[str], list[str] | None]:
     """Check every SPEC §10.2 step 1 rule before anything is written."""
-    if re.fullmatch(_UNIT_RE, unit) is None:
-        raise UnitNewError(
-            f"invalid unit name {unit!r}: must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,99}}$"
-        )
+    validate_unit_id(unit)
     stages = stages_raw.split(",")
     if any(item == "" for item in stages):
         raise UnitNewError("--stages has an empty item")
@@ -211,10 +248,10 @@ def _validate(
         files = files_raw.split(",")
         if any(item == "" for item in files):
             raise UnitNewError("--files has an empty item")
-        if not test:
+        if test is None or test.strip() == "":
             raise UnitNewError("--test is required when impl or validate is present")
     _check_units_dir(hub=hub, units=units)
-    if unit_path.exists():
+    if os.path.lexists(unit_path):
         raise UnitNewError(f"unit file already exists: {unit_path}")
     return stages, files
 
@@ -269,14 +306,19 @@ def create_unit(
     for index, stage in enumerate(stage_ids):
         spec = _spec_for_stage(config, stage)
         if stage in _VERIFY_STAGES:
-            parent = _parent_index(stage_ids, index)
-            assert parent is not None  # refused by _validate
-            parent_bead = reused[parent]
-            if parent_bead is not None and parent_bead.author:
-                parent_author = parent_bead.author
-            else:
-                parent_author = authors[parent]
-            if split_spec(spec)[0] == "other":
+            if spec == "other":
+                parent = _parent_index(stage_ids, index)
+                assert parent is not None  # refused by _validate
+                parent_bead = reused[parent]
+                if parent_bead is not None:
+                    recorded = _recorded_author(parent_bead)
+                    if recorded is None or recorded.strip() == "":
+                        raise UnitNewError(
+                            f"parent bead {parent_bead.id} has no usable author"
+                        )
+                    parent_author = recorded
+                else:
+                    parent_author = authors[parent]
                 authors.append(
                     _resolve_author(
                         spec=spec, parent_author=parent_author, config=config
@@ -285,7 +327,7 @@ def create_unit(
             else:
                 authors.append(spec)
         else:
-            if split_spec(spec)[0] == "other":
+            if spec == "other":
                 raise UnitNewError(
                     f"agent spec other is valid only for verify stages, not {stage}"
                 )
@@ -333,15 +375,12 @@ def create_unit(
     rows: list[StageRow] = []
     for i, (bead_id, stage) in enumerate(zip(bead_ids, stage_ids)):
         hit = reused[i]
-        if hit is not None and hit.author:
-            row_author = hit.author
-        else:
-            row_author = authors[i]
+        recorded = _recorded_author(hit) if hit is not None else None
         rows.append(
             StageRow(
                 bead=bead_id,
                 stage=stage,
-                author=row_author,
+                author=recorded or authors[i],
                 blocked_by=bead_ids[i - 1] if i else None,
             )
         )

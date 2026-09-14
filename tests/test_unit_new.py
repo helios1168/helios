@@ -71,6 +71,7 @@ REFUSALS: list[dict[str, Any]] = [
     {"unit": "U1", "stages": "model,impl", "files": None, "test": "t"},
     {"unit": "U1", "stages": "model,impl", "files": "a.py", "test": None},
     {"unit": "U1", "stages": "model,impl", "files": "a.py", "test": ""},
+    {"unit": "U1", "stages": "model,impl", "files": "a.py", "test": "   "},
     {"unit": "U1", "stages": "model,validate", "files": "a.py", "test": None},
     {"unit": "U1", "stages": "impl", "files": "a,,b", "test": "t"},
     {"unit": "U1\n", "stages": "model"},
@@ -660,6 +661,186 @@ def test_units_dir_component_is_file(tmp_path: Path) -> None:
         _run_ok(fake=fake, hub=hub, stages="model", files=None, test=None)
     assert fake.argv_log == []
     assert not (hub / "docs" / "units" / "U1.md").exists()
+
+
+# Round 3: symlink units components and unit file paths (lstat, lexists).
+def _symlink_hub(tmp_path: Path, kind: str) -> tuple[Path, Config]:
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    (tmp_path / "afile").write_text("x", encoding="utf-8")
+    (tmp_path / "adir").mkdir()
+    notes = hub / "notes"
+    if kind == "file":
+        notes.write_text("x", encoding="utf-8")
+    elif kind == "symlink_file":
+        notes.symlink_to(tmp_path / "afile")
+    elif kind == "symlink_dir":
+        notes.symlink_to(tmp_path / "adir")
+    elif kind == "dangling":
+        notes.symlink_to(tmp_path / "missing")
+    elif kind == "loop":
+        notes.symlink_to(notes)
+    elif kind == "unitfile_dangling":
+        (hub / "notes" / "units").mkdir(parents=True)
+        (hub / "notes" / "units" / "U1.md").symlink_to(tmp_path / "missing.md")
+    from helios.config import ProjectConfig
+
+    return hub, Config(hub=hub, project=ProjectConfig(units="notes/units"))
+
+
+@pytest.mark.parametrize("kind", ["file", "symlink_file", "dangling", "loop"])
+def test_units_parent_symlink_refuses(tmp_path: Path, kind: str) -> None:
+    hub, config = _symlink_hub(tmp_path, kind)
+    fake = FakeBeads()
+    with pytest.raises(UnitNewError):
+        create_unit(
+            beads=fake, config=config, unit="U1", title="T", stages="model",
+            files=None, test=None,
+        )
+    assert fake.argv_log == []
+
+
+def test_units_parent_valid_symlink_dir_accepted(tmp_path: Path) -> None:
+    hub, config = _symlink_hub(tmp_path, "symlink_dir")
+    rows = create_unit(
+        beads=FakeBeads(), config=config, unit="U1", title="T", stages="model",
+        files=None, test=None,
+    )
+    assert len(rows) == 1
+    assert (tmp_path / "adir" / "units" / "U1.md").is_file()
+
+
+def test_dangling_unit_file_refuses(tmp_path: Path) -> None:
+    hub, config = _symlink_hub(tmp_path, "unitfile_dangling")
+    fake = FakeBeads()
+    with pytest.raises(UnitNewError, match="already exists"):
+        create_unit(
+            beads=fake, config=config, unit="U1", title="T", stages="model",
+            files=None, test=None,
+        )
+    assert fake.argv_log == []
+
+
+# Round 3: the unit id is validated before the lock path is built.
+def test_traversal_unit_writes_nothing_anywhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hub = _hub(tmp_path)
+    monkeypatch.chdir(hub)
+    fake = FakeBeads()
+    monkeypatch.setattr(beads_mod, "Beads", lambda cwd: fake)
+    code = cli.main(["unit", "new", "../../../../../escape", "T", "--stages", "model"])
+    assert code == 2
+    assert capsys.readouterr().err.startswith("helios: ")
+    assert fake.argv_log == []
+    assert not (hub / ".helios").exists()
+    assert not (hub / "docs").exists()
+
+
+# Round 3: an unusable runs directory refuses instead of running unlocked.
+def test_runs_dir_unusable_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    hub = _hub(tmp_path)
+    (hub / ".agents").mkdir()
+    (hub / ".agents" / "workflow.toml").write_text('[project]\nruns = "runs-is-a-file"\n')
+    (hub / "runs-is-a-file").write_text("x", encoding="utf-8")
+    monkeypatch.chdir(hub)
+    fake = FakeBeads()
+    monkeypatch.setattr(beads_mod, "Beads", lambda cwd: fake)
+    args = Namespace(unit="U8", title="T", stages="model", files=None, test=None)
+    assert unit_new.run(args) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("helios: cannot lock ")
+    assert fake.argv_log == []
+    assert not _unit_path(hub, "U8").exists()
+
+
+# Round 3: a reused parent bead without a usable author refuses.
+@pytest.mark.parametrize("author", [None, "", "   "])
+def test_reused_parent_author_unusable_refuses(
+    tmp_path: Path, author: str | None
+) -> None:
+    hub = _hub(tmp_path)
+    meta: dict[str, Any] = {"unit": "U1", "kind": "impl"}
+    if author is not None:
+        meta["author"] = author
+    fake = FakeBeads(
+        [
+            Bead.from_show(
+                {
+                    "id": "imp",
+                    "labels": ["unit:U1", "kind:impl"],
+                    "status": "open",
+                    "metadata": meta,
+                }
+            )
+        ]
+    )
+    with pytest.raises(UnitNewError) as excinfo:
+        create_unit(
+            beads=fake,
+            config=_config(hub),
+            unit="U1",
+            title="T",
+            stages="impl,verify-code",
+            files="a",
+            test="t",
+        )
+    assert str(excinfo.value) == "parent bead imp has no usable author"
+    assert fake.argv_log == []
+
+
+# Round 3: a recorded non-blank author still resolves, and an explicit
+# profiled spec is recorded verbatim (only other resolves to a bare harness).
+@pytest.mark.parametrize(
+    "author,order,expect",
+    [("bogus", ("codex",), "codex"), ("opencode", ("opencode", "codex"), "codex")],
+)
+def test_reused_parent_author_records_and_resolves(
+    tmp_path: Path, author: str, order: tuple[str, ...], expect: str
+) -> None:
+    hub = _hub(tmp_path)
+    fake = FakeBeads(
+        [
+            Bead.from_show(
+                {
+                    "id": "imp",
+                    "labels": ["unit:U1", "kind:impl"],
+                    "status": "open",
+                    "metadata": {"unit": "U1", "kind": "impl", "author": author},
+                }
+            )
+        ]
+    )
+    rows = create_unit(
+        beads=fake,
+        config=_config(hub, verify_order=order),
+        unit="U1",
+        title="T",
+        stages="impl,verify-code",
+        files="a",
+        test="t",
+    )
+    assert [(row.bead, row.author) for row in rows] == [("imp", author), ("fake-1", expect)]
+
+
+def test_explicit_profiled_spec_recorded_verbatim(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    fake = FakeBeads()
+    rows = create_unit(
+        beads=fake,
+        config=_config(hub, implement="codex:gpt-5", verify_code="claude:opus"),
+        unit="U1",
+        title="T",
+        stages="impl,verify-code",
+        files="a",
+        test="t",
+    )
+    assert [row.author for row in rows] == ["codex:gpt-5", "claude:opus"]
+    creates = [entry for entry in fake.argv_log if entry[0] == "create"]
+    assert cast(dict[str, Any], creates[0][3])["author"] == "codex:gpt-5"
+    assert cast(dict[str, Any], creates[1][3])["author"] == "claude:opus"
 
 
 # Round 2: file bytes are the one-pass substitution even for a \r title.

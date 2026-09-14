@@ -41,6 +41,7 @@ def run(args: argparse.Namespace) -> int:
         print(f"helios: {exc}", file=sys.stderr)
         return 2
     try:
+        units.validate_unit_id(args.unit)
         with units.unit_lock(cfg.hub, cfg.project.runs, args.unit):
             rows = units.create_unit(
                 beads=beads.Beads(cfg.hub),
