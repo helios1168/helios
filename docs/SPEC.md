@@ -1040,8 +1040,16 @@ variable `HELIOS_OMIT` (comma-separated). A program module may expose `DATA`;
 `helios.claims`: decorator `@claim(name, covers, backend, method, scope, bound=None,
 artifact=None, redundant=())` registers a zero-argument callable returning `True`, `False` or a
 `Finding`. `bound` is `dict[str, str] | None`, the same type as `Finding.bound`. `project.claims`
-names the module; claims are collected from that module and its submodules, and two claims
-sharing a name is a step 1 problem. Backends and their allowed methods and scopes come from
+names the module; claims are collected from that module and its submodules, where a submodule is
+a module present in `sys.modules` under the module's package prefix after importing it (helios
+never walks the package directory). A claim name matches `^[A-Za-z0-9_][A-Za-z0-9._-]{0,199}$`
+(`re.fullmatch`); `@claim` raises `ValueError` for any other name, which the command reports as
+an import failure (§2.3). A claim record's identity is (module name, `__qualname__`,
+`co_firstlineno`); registering the same identity again replaces the record. Two collected records
+with the same name and different identities are a step 1 problem (`<name>: duplicate claim
+name`), found over every collected claim before `--backend`, `--covers` or name filters apply.
+The runner receives the identity of the record helios validated and runs exactly that record,
+never a later registration of the same name from any other module. Backends and their allowed methods and scopes come from
 `backends.toml` (the project's `.agents/backends.toml`, else `templates/backends.toml`).
 
 `helios claims check [--backend B] [--covers ID] [--timeout S]`:
@@ -1058,7 +1066,8 @@ sharing a name is a step 1 problem. Backends and their allowed methods and scope
    and `claims attack` remove `HELIOS_OMIT` from their own environment before loading the
    registry; only a mutation run sets it.
 3. The claims module is imported with the hub and `<hub>/src` put in front of `sys.path`. Each
-   non-`manual` claim runs as `python -m helios.claims.runner <module> <name>` with cwd the
+   non-`manual` claim runs as `python -m helios.claims.runner <module> <name>` plus the record's
+   identity as further arguments, with cwd the
    hub, `start_new_session=True` and a timeout from `--timeout S` (whole seconds, an int greater
    than 0, default 600). The runner prints one JSON line: `{"result": true}`,
    `{"result": false}`, `{"finding": {...}}`, `{"other": "<type name>"}` or
@@ -1075,8 +1084,13 @@ sharing a name is a step 1 problem. Backends and their allowed methods and scope
      SIGKILL to the runner's process group, and the result is inconclusive with the note
      `timeout after <S> s`, where `<S>` is the given int. After the runner exits, for any
      reason, helios sends SIGKILL to that group too, ignoring `ProcessLookupError` and
-     `PermissionError`, so no grandchild survives, then collects the runner's stdout with a
-     bounded read.
+     `PermissionError`, so no grandchild in the runner's process group survives. A grandchild
+     that left the group (`setsid`) may survive. helios reads the runner's stdout and stderr with
+     daemon threads calling `os.read` on the raw descriptors, and collection is bounded at 2 s
+     after the runner exits: after the bound helios keeps what it has read, abandons the threads
+     without closing their streams from the main thread, and continues.
+   - `import ctypes` for the best-effort C stdio flush sits inside the flush's own `try`, so a
+     runner without `ctypes` still runs claims.
    - Apart from a timeout, the result counts only when the runner exits 0 and its stdout is
      exactly one line holding one JSON object of the protocol. Otherwise it is inconclusive
      with the note `runner exited <code>` when the exit code is not 0, else
@@ -1138,9 +1152,13 @@ passed, else 0.
 - `helios program diff <rev1> <rev2>`: load the registry at two git revisions. Each revision is
   loaded in its own subprocess, run with `python -P` and cwd the extracted tree, from
   `git archive <rev>` extracted into a temporary directory, with `sys.path` set explicitly to
-  that directory and its `src` first, importing the module by name, so
-  sibling imports resolve at the same revision. The child returns its active ids to helios on a
-  separate channel from its stdout, so output during import cannot corrupt them. The registry
+  `[<tree>/src, <tree>, <parent of the helios package>, <stdlib>, <platstdlib>, <each entry of
+  site.getsitepackages() of the helios interpreter>]`, importing the module by name, so
+  sibling imports resolve at the same revision and third-party packages such as SymPy import.
+  The child imports every module its own script needs before it replaces `sys.path`, so a tree
+  file such as `json.py` never shadows them. The child returns its active ids to helios on a
+  separate channel from its stdout, a file inside the temporary directory, so output during
+  import cannot corrupt them and nothing is left in `TMPDIR`. The registry
   module path at a revision is
   `src/<module with dots as slashes>.py`, else `<module with dots as slashes>.py`; when neither
   exists at that revision, exit 2. A module that fails to import at a revision exits 2 with
