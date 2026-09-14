@@ -703,8 +703,9 @@ never reads a worktree path from `input.json`.
   with no directory under `<runs>`, or with no attempt directory, exits 2. Otherwise `say`
   always writes the message first (§9.4), then adds the comment `<kind>: [<msg_id>] <text>`
   with the replay rule of §7.5, then appends the event with type `<kind>`, source
-  `orchestrator` and detail `<msg_id>`. The comment and the event carry the attempt id of the
-  highest attempt as §8.3 reads it. When the bd comment fails, `say` prints `helios: <message>`
+  `orchestrator` and detail `<msg_id>`. The event's `attempt` field is the attempt id of the
+  highest attempt as §8.3 reads it; the comment keeps the format `<kind>: [<msg_id>] <text>`
+  with no attempt id. When the bd comment fails, `say` prints `helios: <message>`
   to stderr, appends no event and exits 1; the message stays in the inbox. When the highest
   attempt is live (as defined under `helios stop`), it prints `helios: queued <msg_id>` to
   stderr and exits 3. Otherwise it prints `<msg_id>` to stdout and exits 0. `say` never
@@ -1031,7 +1032,8 @@ project's `.agents/backends.toml`, else `templates/backends.toml`).
      exactly one line holding one JSON object of the protocol. Otherwise it is inconclusive
      with the note `runner exited <code>` when the exit code is not 0, else
      `unparsable runner output`.
-   - helios never changes a declared method, scope or bound. `True` gives a verified finding
+   - helios never changes a declared scope or bound, and changes the method only in the
+     `False` case below. `True` gives a verified finding
      with `id` and `claim` set to the claim name and the declared `covers`, `method`, `scope`,
      `bound` and `artifact`. `False` gives a refuted finding with method `counterexample` when
      the backend allows it. When that finding would not validate, or the backend does not
