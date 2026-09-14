@@ -56,6 +56,19 @@ def test_bead_from_show_reads_metadata_and_labels() -> None:
     assert bead.author == "opencode"
 
 
+def test_bead_from_show_renders_non_string_scalars_as_json_text() -> None:
+    payload = {
+        "id": "b1",
+        "status": "open",
+        "metadata": {"test": True, "accept": 3, "unit": None, "author": False},
+    }
+    bead = Bead.from_show(payload)
+    assert bead.test == "true"
+    assert bead.accept == "3"
+    assert bead.unit is None
+    assert bead.author == "false"
+
+
 def test_replay_skips_existing_kind_and_marker() -> None:
     fake = FakeBeads([Bead(id="b1")])
     plan = plan_writeback(
@@ -257,6 +270,29 @@ def test_real_bd_create_round_trips_metadata_types(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_non_string_metadata_scalars_read_back_as_json_text(tmp_path: Path) -> None:
+    _init_bd_repo(tmp_path)
+    beads = Beads(tmp_path)
+
+    bool_id = beads.create("bool test", labels=[], metadata={})
+    subprocess.run(
+        ["bd", "update", bool_id, "--set-metadata", "test=true"],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+    assert beads.show(bool_id).test == "true"
+
+    number_id = beads.create("number test", labels=[], metadata={})
+    subprocess.run(
+        ["bd", "update", number_id, "--set-metadata", "test=3"],
+        cwd=tmp_path, check=True, capture_output=True,
+    )
+    assert beads.show(number_id).test == "3"
+
+    string_id = beads.create("string test", labels=[], metadata={"test": "true"})
+    assert beads.show(string_id).test == "true"
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
 def test_real_bd_dep_add_is_idempotent(tmp_path: Path) -> None:
     _init_bd_repo(tmp_path)
     beads = Beads(tmp_path)
@@ -346,3 +382,26 @@ def test_real_bd_remember_recall_round_trip(tmp_path: Path) -> None:
     for key, value in cases.items():
         assert beads.recall(key) == value
     assert beads.memories() == cases
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_memories_keeps_a_key_named_schema_version(tmp_path: Path) -> None:
+    _init_bd_repo(tmp_path)
+    beads = Beads(tmp_path)
+    beads.remember("schema_version", "not bd's own field")
+    beads.remember("foo", "bar")
+    memories = beads.memories()
+    assert memories["foo"] == "bar"
+    # bd's own bookkeeping field (an int) is dropped; it is never mistaken for a
+    # string-valued memory, whatever key that memory happens to be stored under.
+    assert "schema_version" not in memories or isinstance(memories["schema_version"], str)
+    assert beads.recall("schema_version") == "not bd's own field"
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_remember_does_not_raise_on_truncated_multibyte_echo(tmp_path: Path) -> None:
+    _init_bd_repo(tmp_path)
+    beads = Beads(tmp_path)
+    value = "a" * 60 + "é" * 20
+    beads.remember("multibyte", value)  # must not raise UnicodeDecodeError
+    assert beads.recall("multibyte") == value

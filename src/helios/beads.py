@@ -87,19 +87,19 @@ class Bead:
         """Build a Bead from one decoded `bd show` or `bd list` object."""
         labels = _as_list(payload.get("labels"))
         metadata = _decode_show_metadata(dict(payload.get("metadata") or {}))
-        kind = str(metadata.get("kind") or _label_kind(labels) or "impl")
-        accept = str(metadata.get("accept") or payload.get("acceptance_criteria") or "")
+        kind = _to_text(metadata.get("kind")) or _label_kind(labels) or "impl"
+        accept = _to_text(metadata.get("accept")) or str(payload.get("acceptance_criteria") or "")
         return cls(
             id=str(payload["id"]),
             title=str(payload.get("title") or ""),
             description=str(payload.get("description") or ""),
             kind=kind,
-            unit=_opt_str(metadata.get("unit")),
-            parent=_opt_str(metadata.get("parent")),
+            unit=_opt_text(metadata.get("unit")),
+            parent=_opt_text(metadata.get("parent")),
             accept=accept,
             files=_as_list(metadata.get("files")),
-            test=str(metadata.get("test") or ""),
-            author=_opt_str(metadata.get("author")),
+            test=_to_text(metadata.get("test")),
+            author=_opt_text(metadata.get("author")),
             status=str(payload.get("status") or "open"),
             metadata=metadata,
             docs=_as_list(metadata.get("docs")),
@@ -108,8 +108,29 @@ class Bead:
         )
 
 
-def _opt_str(value: Any) -> str | None:
-    return str(value) if value is not None else None
+def _to_text(value: Any) -> str:
+    """Text form of a metadata scalar (SPEC §7.1).
+
+    `metadata` keeps a decoded value's real JSON type, but the text fields of
+    `Bead` (`kind`, `accept`, `test`) are always strings. A string value is kept
+    as is; any other non-null value round-trips through its JSON text, so a bool
+    `true` reads back as `"true"` and a number `3` as `"3"`, not Python's
+    `str(True)` == `"True"`. `None` becomes an empty string.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+def _opt_text(value: Any) -> str | None:
+    """Like `_to_text`, but `None` stays `None` for an optional field."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
 
 
 def _label_kind(labels: list[Any]) -> str | None:
@@ -260,27 +281,41 @@ class Beads:
         self.cwd = cwd
         self.binary = binary
 
-    def _run(self, argv: list[str]) -> str:
+    def _run_bytes(self, argv: list[str]) -> bytes:
         proc = subprocess.run(
             [self.binary, *argv],
             cwd=self.cwd,
             capture_output=True,
-            text=True,
             check=False,
         )
         if proc.returncode != 0:
-            raise RuntimeError(f"bd {' '.join(argv)} failed: {proc.stderr.strip()}")
+            stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"bd {' '.join(argv)} failed: {stderr}")
         return proc.stdout
 
+    def _run(self, argv: list[str]) -> str:
+        """Lenient decode, for commands whose stdout helios does not parse as JSON.
+
+        `bd remember` echoes the stored value truncated at a fixed byte count in its
+        confirmation message, which can cut a multi-byte UTF-8 character in half; a
+        strict decode there raises `UnicodeDecodeError` even though bd stored the
+        value correctly, so this replaces undecodable bytes instead.
+        """
+        return self._run_bytes(argv).decode("utf-8", errors="replace")
+
+    def _run_json(self, argv: list[str]) -> str:
+        """Strict UTF-8 decode, for `--json` output, which bd always emits well-formed."""
+        return self._run_bytes(argv).decode("utf-8")
+
     def show(self, bead_id: str) -> Bead:
-        out = self._run(["show", bead_id, "--json"])
+        out = self._run_json(["show", bead_id, "--json"])
         payloads = json.loads(out)
         if not payloads:
             raise KeyError(f"bead {bead_id} not found")
         return Bead.from_show(payloads[0])
 
     def comments(self, bead_id: str) -> list[Comment]:
-        out = self._run(["comments", bead_id, "--json"])
+        out = self._run_json(["comments", bead_id, "--json"])
         return [Comment(**c) for c in json.loads(out or "[]")]
 
     def add_comment(self, bead_id: str, text: str) -> None:
@@ -341,7 +376,7 @@ class Beads:
             argv += ["--all"]
         else:
             argv += ["--status", status]
-        out = self._run(argv)
+        out = self._run_json(argv)
         return [Bead.from_show(p) for p in json.loads(out or "[]")]
 
     def ready(self, *, labels: list[str] = []) -> list[Bead]:
@@ -354,7 +389,7 @@ class Beads:
         argv = ["ready", "--json", "-n", "0"]
         for label in labels:
             argv += ["--label", label]
-        out = self._run(argv)
+        out = self._run_json(argv)
         return [Bead.from_show(p) for p in json.loads(out or "[]")]
 
     def add_label(self, bead_id: str, label: str) -> None:
@@ -363,7 +398,7 @@ class Beads:
 
     def gate_list(self) -> list[dict[str, Any]]:
         """Open gates via `bd gate list --json -n 0`, bd's objects unchanged."""
-        out = self._run(["gate", "list", "--json", "-n", "0"])
+        out = self._run_json(["gate", "list", "--json", "-n", "0"])
         return json.loads(out or "[]")
 
     def gate_blocks(self, gate_id: str) -> list[str]:
@@ -375,7 +410,7 @@ class Beads:
         --blocks`, `bd dep add <bead> <gate>`) and inspecting the JSON. Only entries
         with `dependency_type == "blocks"` count.
         """
-        out = self._run(["show", gate_id, "--json", "--include-dependents"])
+        out = self._run_json(["show", gate_id, "--json", "--include-dependents"])
         payloads = json.loads(out)
         if not payloads:
             raise KeyError(f"bead {gate_id} not found")
@@ -399,23 +434,33 @@ class Beads:
 
         Reads `--json` rather than plain stdout: plain `bd recall` always prints the value
         with one newline appended, which would be indistinguishable from a value that
-        itself ends in a newline. The JSON `value` field is the exact stored text.
+        itself ends in a newline. The JSON `value` field is the exact stored text. bd
+        exits 1 (still printing a well-formed `{"found": false, ...}` body) for a missing
+        key, so this reads stdout directly rather than through `_run_json`, which would
+        raise on that nonzero exit.
         """
         proc = subprocess.run(
             [self.binary, "recall", key, "--json"],
             cwd=self.cwd,
             capture_output=True,
-            text=True,
             check=False,
         )
-        payload = json.loads(proc.stdout)
+        payload = json.loads(proc.stdout.decode("utf-8"))
         return payload["value"] if payload.get("found") else None
 
     def memories(self) -> dict[str, str]:
-        """`bd memories --json`: every stored key to its exact value."""
-        out = self._run(["memories", "--json"])
+        """`bd memories --json`: every stored key to its exact value.
+
+        bd mixes its own bookkeeping field into the same flat JSON object as the
+        real memories, for example `{"foo": "bar", "schema_version": 1}` (checked
+        against a real bd in a temp repo). That field's value is always an int; a
+        real memory value is always a string, so only a non-string `schema_version`
+        entry is bd's own and gets dropped.
+        """
+        out = self._run_json(["memories", "--json"])
         payload = json.loads(out or "{}")
-        payload.pop("schema_version", None)
+        if not isinstance(payload.get("schema_version"), str):
+            payload.pop("schema_version", None)
         return payload
 
 
