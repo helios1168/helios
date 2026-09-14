@@ -1354,7 +1354,7 @@ def test_stored_completed_bad_captured_fails_report_check(
     assert any(c["name"] == "report" and not c["passed"] for c in env["checks"])
 
 
-def test_state_json_has_six_keys(tmp_path: Path, monkeypatch) -> None:
+def test_state_json_has_seven_keys(tmp_path: Path, monkeypatch) -> None:
     hub = make_hub(tmp_path)
     set_fake(monkeypatch, write_script(
         tmp_path, {"exit_code": 0, "stdout": "x", "session_id": "s1",
@@ -1364,9 +1364,25 @@ def test_state_json_has_six_keys(tmp_path: Path, monkeypatch) -> None:
                            config=config_mod.load(hub),
                            harness_override="fake") == 0
     state = attempt_mod.read_state(hub / ".helios" / "runs" / "b1" / "attempt-1")
-    assert set(state) == {"state", "attempt_id", "pid", "session_id",
+    assert set(state) == {"state", "attempt_id", "pid", "pid_start", "session_id",
                           "execution_status", "updated"}
     assert state["execution_status"] == "completed"
+
+
+def test_pid_start_recorded_at_launch(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "done", "summary": "s"}}))
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    assert run_mod.run_one("b1", hub=hub, beads=beads,
+                           config=config_mod.load(hub),
+                           harness_override="fake") == 0
+    state = attempt_mod.read_state(hub / ".helios" / "runs" / "b1" / "attempt-1")
+    # pid_start is set once at launch and survives every later transition
+    # through to `finalized` (SPEC §8.2).
+    assert isinstance(state["pid_start"], str) and state["pid_start"]
+    assert state["state"] == "finalized"
 
 
 def test_empty_attempt_dir_recovers(tmp_path: Path, monkeypatch) -> None:
@@ -1706,13 +1722,15 @@ def test_transition_keeps_keys() -> None:
     with _tf.TemporaryDirectory() as tmp:
         d = Path(tmp) / "b" / "attempt-1"
         attempt_mod.write_state(d, attempt_id="b#1", state="launched", pid=4242,
+                                pid_start="Mon Sep 14 00:00:00 2026",
                                 session_id="s9", execution_status=None)
         attempt_mod.transition(d, "native_completed", execution_status="completed")
         attempt_mod.transition(d, "validated")
         attempt_mod.transition(d, "finalized")
         log = [json.loads(x) for x in (d / "state.log").read_text().splitlines()]
-    assert all(set(x) == {"state", "attempt_id", "pid", "session_id",
+    assert all(set(x) == {"state", "attempt_id", "pid", "pid_start", "session_id",
                           "execution_status", "updated"} for x in log)
+    assert all(x["pid_start"] == "Mon Sep 14 00:00:00 2026" for x in log)
     assert [x["execution_status"] for x in log] == [None, "completed", "completed", "completed"]
 
 

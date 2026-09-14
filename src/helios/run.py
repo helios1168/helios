@@ -1459,7 +1459,7 @@ def _dry_run_one(
     else:
         action = attempt_mod.classify_recovery(
             latest.get("state"),
-            pid_alive=attempt_mod.is_pid_alive(latest.get("pid")),
+            pid_alive=attempt_mod.is_pid_alive(latest.get("pid"), latest.get("pid_start")),
         )
     if action == "refuse":
         return _refuse_live(bead_id, latest.get("attempt_id") if latest else None)
@@ -1663,7 +1663,7 @@ def _run_one_inner(
         if latest is not None:
             action = attempt_mod.classify_recovery(
                 latest.get("state"),
-                pid_alive=attempt_mod.is_pid_alive(latest.get("pid")),
+                pid_alive=attempt_mod.is_pid_alive(latest.get("pid"), latest.get("pid_start")),
             )
             if action == "refuse":
                 return _refuse_live(bead_id, latest.get("attempt_id"))
@@ -1816,7 +1816,8 @@ def _run_one_inner(
 
         def _record_launched(pid: int) -> None:
             launched_box["fired"] = True
-            attempt_mod.transition(attempt_obj.dir, "launched", pid=pid)
+            pid_start = attempt_mod.read_pid_start(pid)
+            attempt_mod.transition(attempt_obj.dir, "launched", pid=pid, pid_start=pid_start)
             events_mod.append(
                 hub,
                 source="helios",
@@ -2071,7 +2072,8 @@ def run_turn(
 
     def _record_launched(pid: int) -> None:
         launched_box["fired"] = True
-        attempt_mod.transition(attempt_obj.dir, "launched", pid=pid)
+        pid_start = attempt_mod.read_pid_start(pid)
+        attempt_mod.transition(attempt_obj.dir, "launched", pid=pid, pid_start=pid_start)
         events_mod.append(
             hub,
             source="helios",

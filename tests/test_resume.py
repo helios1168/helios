@@ -128,8 +128,44 @@ def test_refuses_when_live(tmp_path: Path, monkeypatch) -> None:
     finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
     attempt_dir = hub / cfg.project.runs / "b1" / "attempt-1"
     attempt_mod.transition(attempt_dir, "launched", pid=1)
-    monkeypatch.setattr(attempt_mod, "is_pid_alive", lambda pid: True)
+    monkeypatch.setattr(attempt_mod, "is_pid_alive", lambda pid, pid_start=None: True)
     with pytest.raises(resume_mod.ResumeRefusal):
+        resume_mod.resume("b1", None, hub=hub, beads=beads, config=cfg)
+
+
+def test_refuses_when_live_real_process(tmp_path: Path, monkeypatch) -> None:
+    """The same liveness rule as `helios stop` (SPEC §9.2): a real running
+    process, not a mock, drives the refusal (rule item 4)."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    attempt_dir = hub / cfg.project.runs / "b1" / "attempt-1"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        pid_start = attempt_mod.read_pid_start(proc.pid)
+        attempt_mod.transition(attempt_dir, "launched", pid=proc.pid, pid_start=pid_start)
+        with pytest.raises(resume_mod.ResumeRefusal, match="is still running"):
+            resume_mod.resume("b1", None, hub=hub, beads=beads, config=cfg)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_does_not_refuse_when_pid_reused(tmp_path: Path, monkeypatch) -> None:
+    """A leader pid whose start time no longer matches is a reused pid: not
+    live, so resume must not refuse it as "still running" (rule item 4)."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    attempt_dir = hub / cfg.project.runs / "b1" / "attempt-1"
+    attempt_mod.transition(attempt_dir, "launched", pid=os.getpid(), pid_start="original-start-time")
+    monkeypatch.setattr(attempt_mod, "read_pid_start", lambda pid: "a-different-start-time")
+    # Still refused, but for being unfinalized, not for being live.
+    with pytest.raises(resume_mod.ResumeRefusal, match="is not finalized"):
         resume_mod.resume("b1", None, hub=hub, beads=beads, config=cfg)
 
 

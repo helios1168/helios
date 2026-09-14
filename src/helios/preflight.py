@@ -163,7 +163,7 @@ def _check_attempt_finalized(bead: Bead, ctx: PreflightContext) -> list[str]:
         return []
     action = attempt_mod.classify_recovery(
         latest.get("state"),
-        pid_alive=attempt_mod.is_pid_alive(latest.get("pid")),
+        pid_alive=attempt_mod.is_pid_alive(latest.get("pid"), latest.get("pid_start")),
     )
     if action == "refuse":
         return [

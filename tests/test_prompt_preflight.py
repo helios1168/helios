@@ -395,8 +395,9 @@ def test_preflight_gitignore_honors_git_info_exclude(tmp_path: Path) -> None:
     assert check([impl_bead()], ctx) == []
 
 
-def test_preflight_unfinalized_attempt(tmp_path: Path) -> None:
+def test_preflight_unfinalized_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import os
+    import sys
 
     from helios import attempt as att
 
@@ -409,10 +410,27 @@ def test_preflight_unfinalized_attempt(tmp_path: Path) -> None:
     assert check([bead], ctx) == []
     att.transition(attempt.dir, "finalized")
     assert check([bead], ctx) == []
-    # A live pid refuses, naming attach and stop.
-    live, _ = att.allocate(
+    # A live pid (a real process-group leader whose start time matches)
+    # refuses, naming attach and stop (SPEC §9.2 liveness rule, item 4).
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        pid_start = att.read_pid_start(proc.pid)
+        live, _ = att.allocate(
+            hub=hub, runs_rel=".helios/runs", bead="b1", worktree=tmp_path, pid=proc.pid
+        )
+        att.transition(live.dir, "launched", pid_start=pid_start)
+        errors = check([bead], ctx)
+        assert any("helios attach b1" in e and "helios stop b1" in e for e in errors)
+    finally:
+        proc.kill()
+        proc.wait()
+    # A reused pid (its current start time no longer matches the recorded
+    # one) is not live, so preflight does not refuse it (rule item 4).
+    reused, _ = att.allocate(
         hub=hub, runs_rel=".helios/runs", bead="b1", worktree=tmp_path, pid=os.getpid()
     )
-    att.transition(live.dir, "launched")
-    errors = check([bead], ctx)
-    assert any("helios attach b1" in e and "helios stop b1" in e for e in errors)
+    att.transition(reused.dir, "launched", pid_start="original-start-time")
+    monkeypatch.setattr(att, "read_pid_start", lambda pid: "a-different-start-time")
+    assert check([bead], ctx) == []

@@ -60,7 +60,7 @@ def say(
     *,
     kind: str = "steer",
     bead_store: beads.BeadsLike | None = None,
-    pid_alive: Callable[[int | None], bool] | None = None,
+    pid_alive: Callable[[int | None, str | None], bool] | None = None,
 ) -> tuple[str, bool]:
     """Write, comment, and event a message without delivering it (SPEC §9.4)."""
     numbers = attempt.existing_attempts(hub / runs_rel / bead)
@@ -73,17 +73,5 @@ def say(
     attempt_id = str(state.get("attempt_id") or f"{bead}#{numbers[-1]}")
     add_comment(store, bead, kind, msg_id, text)
     record_event(hub, bead, attempt_id, kind, msg_id)
-    alive = (pid_alive or _pid_alive)(state.get("pid"))
+    alive = (pid_alive or attempt.is_pid_alive)(state.get("pid"), state.get("pid_start"))
     return msg_id, state.get("state") == "launched" and alive
-
-
-def _pid_alive(pid: int | None) -> bool:
-    if pid is None:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True

@@ -42,6 +42,8 @@ def safe_state(directory: Path) -> dict[str, Any]:
         )
         session_id = normalized.get("session_id")
         normalized["session_id"] = session_id if isinstance(session_id, str) else None
+        pid_start = normalized.get("pid_start")
+        normalized["pid_start"] = pid_start if isinstance(pid_start, str) else None
         execution_status = normalized.get("execution_status")
         normalized["execution_status"] = execution_status if isinstance(execution_status, str) else None
         normalized["attempt_id"] = normalized["attempt_id"] if isinstance(normalized.get("attempt_id"), str) else None
@@ -49,7 +51,7 @@ def safe_state(directory: Path) -> dict[str, Any]:
         return normalized
     except (OSError, ValueError, TypeError, json.JSONDecodeError, RecursionError):
         return {"state": "allocated", "attempt_id": None, "pid": None,
-                "session_id": None, "updated": None}
+                "pid_start": None, "session_id": None, "updated": None}
 
 
 def _input(directory: Path) -> dict[str, Any]:
@@ -137,7 +139,7 @@ def rows(hub: Path, runs_rel: str, *, bead_store: beads.BeadsLike | None = None,
         session_id = state.get("session_id")
         session = f"{harness}:{session_id}" if harness is not None and session_id is not None else None
         pid = state.get("pid")
-        alive = attempt.is_pid_alive(pid) if pid is not None else False
+        alive = attempt.is_pid_alive(pid, state.get("pid_start")) if pid is not None else False
         stored = state["state"]
         attempt_id = state.get("attempt_id") or f"{bead_dir.name}#{directory.name.removeprefix('attempt-')}"
         row = {"bead": bead_dir.name, "unit": unit, "kind": kind, "harness": harness,
@@ -193,7 +195,8 @@ def stop(hub: Path, runs_rel: str, bead: str) -> None:
     directory = latest(hub / runs_rel, bead)
     state = safe_state(directory) if directory else {}
     pid = state.get("pid")
-    if not directory or state.get("state") != "launched" or not attempt.is_pid_alive(pid):
+    pid_start = state.get("pid_start")
+    if not directory or state.get("state") != "launched" or not attempt.is_pid_alive(pid, pid_start):
         raise ValueError(f"no running attempt for {bead}")
     path = directory / "stop-requested"
     fd, temporary = tempfile.mkstemp(dir=directory, prefix="stop.", suffix=".tmp")

@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -59,9 +61,39 @@ def test_message_answer_and_live_attempt_is_queued(tmp_path: Path) -> None:
     directory = _attempt(tmp_path, state="launched", pid=123)
     store = FakeBeads([Bead(id="b1")])
     msg_id, queued = messages.say(tmp_path, ".helios/runs", "b1", "answer", kind="answer",
-                                  bead_store=store, pid_alive=lambda pid: True)
+                                  bead_store=store, pid_alive=lambda pid, pid_start=None: True)
     assert queued
     assert json.loads((directory.parent / "inbox" / f"{msg_id}.json").read_text())["kind"] == "answer"
+
+
+def test_message_answer_and_real_live_process_is_queued(tmp_path: Path) -> None:
+    """`say` reaches the same shared liveness rule as `helios stop` (rule
+    item 4) through its default `attempt.is_pid_alive`, no override needed."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        pid_start = attempt.read_pid_start(proc.pid)
+        directory = _attempt(tmp_path, state="launched", pid=proc.pid, pid_start=pid_start)
+        store = FakeBeads([Bead(id="b1")])
+        msg_id, queued = messages.say(tmp_path, ".helios/runs", "b1", "answer", kind="answer",
+                                      bead_store=store)
+        assert queued
+        assert json.loads((directory.parent / "inbox" / f"{msg_id}.json").read_text())["kind"] == "answer"
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_message_not_queued_when_pid_reused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reused pid is never live, so `say` delivers instead of queuing."""
+    _attempt(tmp_path, state="launched", pid=os.getpid(), pid_start="original-start-time")
+    monkeypatch.setattr(attempt, "read_pid_start", lambda pid: "a-different-start-time")
+    store = FakeBeads([Bead(id="b1")])
+    msg_id, queued = messages.say(tmp_path, ".helios/runs", "b1", "answer", kind="answer",
+                                  bead_store=store)
+    assert not queued
+    assert msg_id
 
 
 def test_message_without_runs_fails_without_writing(tmp_path: Path) -> None:
@@ -383,7 +415,7 @@ def test_stop_rejects_invalid_pid_without_signal_or_marker(tmp_path: Path, monke
 
 def test_stop_ignores_permission_error_from_gone_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     directory = _attempt(tmp_path, state="launched", pid=123)
-    monkeypatch.setattr(sessions.attempt, "is_pid_alive", lambda pid: True)
+    monkeypatch.setattr(sessions.attempt, "is_pid_alive", lambda pid, pid_start=None: True)
     def gone(pid, sig):
         raise PermissionError("gone")
     monkeypatch.setattr(sessions.os, "killpg", gone)
@@ -480,9 +512,71 @@ def test_stop_real_group_and_gone_group(tmp_path: Path, monkeypatch: pytest.Monk
             process.kill()
             process.wait()
     gone = _attempt(tmp_path, "b2", state="launched", pid=123)
-    monkeypatch.setattr(sessions.attempt, "is_pid_alive", lambda pid: True)
+    monkeypatch.setattr(sessions.attempt, "is_pid_alive", lambda pid, pid_start=None: True)
     monkeypatch.setattr(sessions.os, "killpg", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()))
     sessions.stop(tmp_path, ".helios/runs", "b2")
+
+
+def test_stop_reused_pid_start_mismatch_sends_no_signal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A leader pid whose start time no longer matches is a reused pid: not
+    live, and `helios stop` must never signal it (SPEC §9.2)."""
+    directory = _attempt(tmp_path, state="launched", pid=os.getpid(),
+                          pid_start="original-start-time")
+    monkeypatch.setattr(attempt, "read_pid_start", lambda pid: "a-different-start-time")
+    monkeypatch.setattr(sessions.os, "killpg", lambda *args: pytest.fail("killpg called"))
+    with pytest.raises(ValueError, match="no running attempt for b1"):
+        sessions.stop(tmp_path, ".helios/runs", "b1")
+    assert not (directory / "stop-requested").exists()
+    rows = sessions.rows(tmp_path, ".helios/runs", bead_store=FakeBeads([Bead(id="b1")]))
+    assert rows[0]["alive"] is False
+
+
+def test_stop_signals_group_after_leader_reaped(tmp_path: Path) -> None:
+    """The leader has exited and been reaped, but a grandchild in the same
+    process group still runs: the attempt is still live, and `stop`
+    delivers SIGINT to the whole group, which ends the child (SPEC §9.2).
+
+    The grandchild is spawned with a plain (non-shell) ``subprocess.Popen``,
+    which shares the leader's process group without touching its signal
+    disposition: a shell ``cmd &`` background job would have SIGINT ignored
+    by POSIX job-control rules and never see the signal this test sends.
+    """
+    child_pid_file = tmp_path / "child.pid"
+    leader_script = (
+        "import subprocess, sys\n"
+        "child = subprocess.Popen(['sleep', '30'])\n"
+        "open(sys.argv[1], 'w').write(str(child.pid))\n"
+    )
+    leader = subprocess.Popen(
+        [sys.executable, "-c", leader_script, str(child_pid_file)],
+        start_new_session=True,
+    )
+    leader.wait(timeout=5)
+    child_pid = int(child_pid_file.read_text().strip())
+    try:
+        with pytest.raises(ProcessLookupError):
+            os.kill(leader.pid, 0)
+        directory = _attempt(tmp_path, state="launched", pid=leader.pid,
+                              pid_start="a-start-time-that-no-longer-matters")
+        rows = sessions.rows(tmp_path, ".helios/runs", bead_store=FakeBeads([Bead(id="b1")]))
+        assert rows[0]["alive"] is True
+        sessions.stop(tmp_path, ".helios/runs", "b1")
+        assert (directory / "stop-requested").is_file()
+        for _ in range(50):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("child did not exit after SIGINT to its process group")
+    finally:
+        try:
+            os.killpg(leader.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def test_cli_dispatches_all_four_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:

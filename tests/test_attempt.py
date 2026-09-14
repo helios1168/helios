@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -115,3 +118,80 @@ def test_events_line_is_at_most_4096_bytes(tmp_path: Path) -> None:
     assert len(raw) <= 4096
     with pytest.raises(ValueError):
         events.append(tmp_path, source="helios", type="launched", bead="b" * 5000)
+
+
+def test_pid_start_defaults_null_and_survives_transitions(tmp_path: Path) -> None:
+    d = tmp_path / "b" / "attempt-1"
+    att.write_state(d, attempt_id="b#1", state="allocated")
+    assert att.read_state(d)["pid_start"] is None
+    att.transition(d, "launched", pid=4242, pid_start="Sun Sep 14 00:00:00 2026")
+    assert att.read_state(d)["pid_start"] == "Sun Sep 14 00:00:00 2026"
+    # A later transition that does not set pid_start keeps the stored value.
+    att.transition(d, "native_completed")
+    assert att.read_state(d)["pid_start"] == "Sun Sep 14 00:00:00 2026"
+
+
+def test_legacy_state_json_without_pid_start_reads_as_null(tmp_path: Path) -> None:
+    d = tmp_path / "b" / "attempt-1"
+    d.mkdir(parents=True)
+    (d / "state.json").write_text(json.dumps({
+        "state": "launched", "attempt_id": "b#1", "pid": 4242,
+        "session_id": "s1", "execution_status": None, "updated": att.utc_now(),
+    }))
+    state = att.read_state(d)
+    assert state.get("pid_start") is None
+    # A transition on a pre-upgrade file still works and now carries all seven keys.
+    record = att.transition(d, "finalized")
+    assert set(record) == {"state", "attempt_id", "pid", "pid_start",
+                            "session_id", "execution_status", "updated"}
+    assert record["pid_start"] is None
+
+
+def test_is_pid_alive_null_pid(tmp_path: Path) -> None:
+    assert att.is_pid_alive(None) is False
+    assert att.is_pid_alive(None, "whatever") is False
+
+
+def test_is_pid_alive_null_pid_start_falls_back_to_group_test() -> None:
+    proc = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        assert att.is_pid_alive(proc.pid) is True
+        assert att.is_pid_alive(proc.pid, None) is True
+    finally:
+        proc.kill()
+        proc.wait()
+    assert att.is_pid_alive(proc.pid, None) is False
+
+
+def test_is_pid_alive_reused_pid_start_mismatch_is_not_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The leader (this test process) exists, but its recorded start time no
+    # longer matches: a reused pid, never live.
+    monkeypatch.setattr(att, "read_pid_start", lambda pid: "some-other-start-time")
+    assert att.is_pid_alive(os.getpid(), "original-start-time") is False
+
+
+def test_is_pid_alive_leader_reaped_falls_back_to_group_test(tmp_path: Path) -> None:
+    # The bash leader starts a grandchild in the same process group, then
+    # exits; the leader pid is reaped, but the group (via the child) lives on.
+    child_pid_file = tmp_path / "child.pid"
+    leader = subprocess.Popen(
+        ["bash", "-c", f"sleep 30 & echo $! > {child_pid_file}"],
+        start_new_session=True,
+    )
+    leader.wait(timeout=5)
+    child_pid = int(child_pid_file.read_text().strip())
+    try:
+        with pytest.raises(ProcessLookupError):
+            os.kill(leader.pid, 0)
+        assert att.is_pid_alive(leader.pid, "a-start-time-that-does-not-matter") is True
+    finally:
+        try:
+            os.killpg(leader.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        for _ in range(50):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)

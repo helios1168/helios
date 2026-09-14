@@ -43,7 +43,7 @@ def _latest_finalized(
     n = numbers[-1]
     attempt_dir = attempt_mod.attempt_dir(hub, runs_rel, bead_id, n)
     state = attempt_mod.read_state(attempt_dir)
-    if attempt_mod.is_pid_alive(state.get("pid")):
+    if attempt_mod.is_pid_alive(state.get("pid"), state.get("pid_start")):
         raise ResumeRefusal(f"attempt {state.get('attempt_id')} is still running")
     if state.get("state") != "finalized":
         raise ResumeRefusal(f"attempt {state.get('attempt_id')} is not finalized")

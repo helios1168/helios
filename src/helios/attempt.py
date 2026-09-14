@@ -1,14 +1,23 @@
 """Attempt lifecycle records (SPEC §8).
 
-``state.json`` is ``{"state", "attempt_id", "pid", "session_id",
+``state.json`` is ``{"state", "attempt_id", "pid", "pid_start", "session_id",
 "execution_status", "updated"}`` (SPEC §8.2), written to a temp file and
 moved with ``os.replace``; every transition appends one line to
-``state.log``. Every write carries all six keys, and a transition keeps the
-stored ``execution_status`` (and ``pid`` and ``session_id``) unless it sets
-a new value. An attempt directory without ``state.json`` reads as state
-``allocated`` with null pid, session and status (SPEC §8.3). Recovery
-classification (SPEC §8.4) is a pure function; staleness (SPEC §8.5)
-compares input hashes and ancestry.
+``state.log``. Every write carries all seven keys, and a transition keeps the
+stored ``execution_status`` (and ``pid``, ``pid_start`` and ``session_id``)
+unless it sets a new value. ``pid_start`` is set once at launch (SPEC §7.1
+step 7) and never changes after. An attempt directory without ``state.json``
+reads as state ``allocated`` with null pid, pid_start, session and status
+(SPEC §8.3). Recovery classification (SPEC §8.4) is a pure function;
+staleness (SPEC §8.5) compares input hashes and ancestry.
+
+Liveness (SPEC §8.2, §9.2) is one function, ``is_pid_alive``, used by every
+caller that asks whether an attempt is live (``helios stop``, ``helios ps``,
+preflight, resume, recovery): the leader pid exists and its current
+``ps -o lstart=`` text equals ``pid_start``, or, when the leader no longer
+exists (or ``pid_start`` is null), the process group is alive
+(``os.killpg(pid, 0)`` succeeds or raises ``PermissionError``). A leader
+whose start time differs from ``pid_start`` is a reused pid: never live.
 """
 
 from __future__ import annotations
@@ -94,8 +103,10 @@ def read_state(dir: Path) -> dict[str, Any]:
 
     A ``state.json`` that is missing or unreadable (empty, not valid
     JSON, not an object, or without a string ``state``) reads as state
-    ``allocated`` with null pid, session id and execution status;
-    reading never raises for these cases.
+    ``allocated`` with null pid, pid_start, session id and execution
+    status; reading never raises for these cases. A file written before
+    ``pid_start`` existed has no such key, so ``.get("pid_start")`` reads
+    as null the same way.
     """
     try:
         data = jsonio.loads((dir / "state.json").read_text())
@@ -108,6 +119,7 @@ def read_state(dir: Path) -> dict[str, Any]:
             "state": "allocated",
             "attempt_id": attempt_id,
             "pid": None,
+            "pid_start": None,
             "session_id": None,
             "execution_status": None,
             "updated": utc_now(),
@@ -121,6 +133,7 @@ def write_state(
     attempt_id: str,
     state: str,
     pid: int | None = None,
+    pid_start: str | None = None,
     session_id: str | None = None,
     execution_status: str | None = None,
 ) -> dict[str, Any]:
@@ -131,6 +144,7 @@ def write_state(
         "state": state,
         "attempt_id": attempt_id,
         "pid": pid,
+        "pid_start": pid_start,
         "session_id": session_id,
         "execution_status": execution_status,
         "updated": utc_now(),
@@ -191,13 +205,14 @@ def transition(
     state: str,
     *,
     pid: int | None = None,
+    pid_start: str | None = None,
     session_id: str | None = None,
     execution_status: str | None = None,
 ) -> dict[str, Any]:
     """Move an attempt to ``state`` (SPEC §8.2).
 
-    The stored ``pid``, ``session_id`` and ``execution_status`` survive
-    unless the call sets a new value.
+    The stored ``pid``, ``pid_start``, ``session_id`` and
+    ``execution_status`` survive unless the call sets a new value.
     """
     current = read_state(dir)
     stored = current.get("execution_status")
@@ -206,6 +221,7 @@ def transition(
         attempt_id=current["attempt_id"],
         state=state,
         pid=pid if pid is not None else current.get("pid"),
+        pid_start=pid_start if pid_start is not None else current.get("pid_start"),
         session_id=session_id if session_id is not None else current.get("session_id"),
         execution_status=(
             execution_status if execution_status is not None else stored
@@ -245,12 +261,53 @@ def classify_recovery(state: str | None, *, pid_alive: bool) -> RecoveryAction:
     return "crash_and_new"
 
 
-def is_pid_alive(pid: int | None) -> bool:
-    """True when ``pid`` names a live process."""
-    if pid is None:
-        return False
+def read_pid_start(pid: int) -> str | None:
+    """Stripped ``ps -o lstart= -p <pid>`` text, or null on failure or empty
+    output (SPEC §7.1 step 7). A small wrapper so tests can monkeypatch the
+    ``ps`` call instead of the real process table.
+    """
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    text = proc.stdout.strip()
+    return text or None
+
+
+def _leader_exists(pid: int) -> bool:
     try:
         os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def is_pid_alive(pid: int | None, pid_start: str | None = None) -> bool:
+    """Attempt liveness (SPEC §8.2, §9.2): the shared rule every caller uses.
+
+    True when the leader pid exists and its current ``ps -o lstart=`` text
+    equals ``pid_start``; or, when the leader no longer exists, or
+    ``pid_start`` is null, when the process group is alive
+    (``os.killpg(pid, 0)`` succeeds or raises ``PermissionError``). A leader
+    pid whose start time differs from ``pid_start`` is a reused pid: never
+    live, and helios never signals it. A null ``pid_start`` falls back to
+    the process-group test alone.
+    """
+    if pid is None:
+        return False
+    if pid_start is not None and _leader_exists(pid):
+        return read_pid_start(pid) == pid_start
+    try:
+        os.killpg(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
