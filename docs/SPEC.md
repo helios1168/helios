@@ -551,7 +551,7 @@ later in the text does not count.
   - `failed`: any execution failure (§4.4) or failed helios check;
   - `blocked`: report `blocked`;
   - `waiting`: report `partial`, `needs_input` or `needs_review`, or a verify verdict other than verified.
-- helios never reopens, relabels or deletes beads in this wave.
+- helios never reopens or deletes beads in this wave; the only label it adds is `curated` (§14).
 
 ## 8. Attempt lifecycle
 
@@ -786,10 +786,11 @@ given, in bd's order. The §3 stage order comes from `helios.stages.STAGES`.
 - `unit run` exits 0 when it stopped after a successful `until` stage, 3 when it stopped at a
   `stop_at` kind or with no ready bead, else with the last run's code.
 - `control.default`: `manual` makes `unit run` refuse without `--until` (exit 2); `until` uses
-  `control.until` when `--until` is absent; `auto` runs until a stop condition other than
-  `until`. An unknown `control.default`, an `--until` that is not a §3 stage, or an `--until`
-  stage with no bead of the unit (label `kind:<until>`) exits 2. These value checks live in the
-  control module, not in config loading.
+  `control.until` when `--until` is absent; `auto` honors an explicit `--until` and otherwise
+  runs until a stop condition other than `until`. An unknown `control.default`, an `--until`
+  that is not a §3 stage, a `control.until` used when `--until` is absent that is not a §3
+  stage, or an `--until` stage with no bead of the unit (label `kind:<until>`) exits 2. These
+  value checks live in the control module, not in config loading.
 
 ## 12. Merge
 
@@ -803,8 +804,10 @@ for its whole run; a held lock exits 2. Steps run in the order 1, 2, 8, 3, 4, 5,
    exist and not be stale (§8.5). The impl bead must be closed. Any failure refuses.
 2. Refuse unless the hub is on `main` and both trees are clean. The hub is on `main` when
    `git symbolic-ref --short HEAD` prints `main`. A tree is clean when
-   `git status --porcelain --untracked-files=no` prints nothing, in the hub and in the worktree.
-3. Record `main_before`. In the worktree run `git rebase main`; on conflict run
+   `git status --porcelain --untracked-files=no` prints nothing, in the hub and, when the
+   worktree directory exists, in the worktree.
+3. Record `main_before` as metadata `merge_main_before`. Then in the worktree run
+   `git rebase main`; on conflict run
    `git rebase --abort`, set `run=conflict`, stop.
 4. Rerun `project.test` and `project.typecheck` in the worktree; failure stops.
 5. If `main` moved since step 3, stop and say so; a second run starts over.
@@ -812,14 +815,16 @@ for its whole run; a held lock exits 2. Steps run in the order 1, 2, 8, 3, 4, 5,
    `git merge --ff-only worktree-<bead>`.
 7. When `origin` exists (`git remote` lists it), run `git push origin main`. Then remove the
    worktree: `git worktree unlock <path>`, `git worktree remove --force <path>`,
-   `git branch -d worktree-<bead>`.
+   `git branch -d worktree-<bead>`. Each of unlock, remove and branch delete is skipped when its
+   target is already gone, so a rerun after a crash during step 7 exits 0.
 8. Recovery runs after step 2 and before step 3: when metadata `merge_commit` is set and
    `git merge-base --is-ancestor <merge_commit> main` exits 0, skip to step 7.
 
 Every step writes the comment `merge: [<bead>@<main_before>:<step>] <detail>` under the replay
 rule of §7.5, where `<step>` is one of `rebased` or `conflict` (step 3), `tested` or
 `test-failed` (step 4), `main-moved` (step 5), `merged` (step 6), `pushed` and `removed`
-(step 7).
+(step 7). `<main_before>` is always the value of metadata `merge_main_before`, so the markers
+of a recovery run use it too.
 
 A test checks that `bd set-state` on a closed bead does not reopen it. If it does, merge sets no
 state on closed beads.
@@ -850,29 +855,46 @@ its trailing newline or lack of one.
 
 - `Memory(key, header, body)` is a frozen dataclass; `header` is the line 2 object as a dict.
   `read` of a missing key raises `KeyError`.
-- Keys match `^[A-Za-z0-9][A-Za-z0-9._-]*$`, else `ValueError` naming the key.
+- Keys match `^[a-z0-9][a-z0-9._-]{0,199}$` with `re.fullmatch`, else `ValueError` naming the
+  key. Keys are lowercase and at most 200 characters, so they never collide on a
+  case-insensitive filesystem and never exceed file name limits.
 - Line 2 is `json.dumps(header, sort_keys=True, ensure_ascii=False)` with the default
   separators. Parsing requires the text to start with `helios-memory 1\n`, then one line holding
-  a JSON object, then `\n`; anything else raises `ValueError` naming the key. The body may be
-  empty. Line endings are never normalized.
+  a JSON object, then `\n`, and requires line 2 to equal exactly
+  `json.dumps(header, sort_keys=True, ensure_ascii=False)` of the object it parses to; anything
+  else raises `ValueError` naming the key. The body may be empty. Line endings are never
+  normalized.
+- A body over 60000 UTF-8 bytes, a body or header string containing NUL, or a header string
+  that is not encodable as UTF-8 raises `ValueError` naming the key, on every backend, before
+  anything is written.
 - **beads backend**: `bd remember --key <key> "<value>"`, `bd recall <key>`, `bd memories`.
   `write` calls `bd` first (through `helios.beads`), then writes the export file under
-  `memory.export_dir` via a temp file and `os.replace`. The backend skips `bd memories` values
-  that do not start with line 1 and prints a note naming each skipped key to stderr. A memory
+  `memory.export_dir` via a temp file and `os.replace`. When it reads `bd memories`, the backend
+  skips values that do not parse and prints a note naming each skipped key to stderr. A memory
   body must survive `bd remember` and `bd recall` unchanged. If bd changes it (for example a
   trailing newline), the beads backend stores the whole value in a form bd keeps, and a test
-  round-trips bodies ending in no newline, `\n` and `\n\n`.
+  round-trips bodies ending in no newline, `\n` and `\n\n`. `helios.beads` reads `bd` output as
+  bytes and decodes it with `errors="replace"` for commands whose output helios does not parse
+  (for example the `bd remember` echo), so a truncated echo never fails a write that bd
+  completed.
 - **files backend**: `<export_dir>/<key>.md` holding exactly the value format.
 - `write` refuses: a header without `source` as a non-empty string (`ValueError`), a `status`
   outside `active`, `superseded`, `retracted` (`ValueError`; a missing `status` is written as
   `active`), and any call while the environment has `HELIOS_BEAD` set (`PermissionError`, since
   workers never write memories). Other header keys are kept. `supersedes` never edits another
   memory.
-- `export` writes each memory to `<directory>/<key>.md` and never deletes files; `import_` reads
-  the same format from only the `*.md` files directly in the directory, in sorted name order;
-  export after import reproduces the tree byte for byte.
-- `stale()` lists active memories whose `source` bead carries the label `truth:wrong`. The bead
-  id is `source` up to the first `#`; a bead that does not exist is not stale; the result is
+- `export` writes each memory to `<directory>/<key>.md` and never deletes files. On either
+  backend it raises `ValueError` naming the key or file for a value that does not parse; only
+  the beads backend's reading of `bd memories` skips such values with the stderr note.
+- `import_` reads the same format from only the `*.md` files directly in the directory, in
+  sorted name order. It checks every such file (name and content) before writing any; a bad file
+  raises `ValueError` naming it and nothing is written. Export after import reproduces the tree
+  byte for byte.
+- `stale()` lists active memories whose `source` bead carries the label `truth:wrong`, and
+  prints the same stderr note for values that do not parse. The bead id is `source` up to the
+  first `#`. A bead exists only when `bd show` returns an object whose `id` equals that id
+  exactly (bd matches partial ids); a bead that does not exist is not stale. A lookup that fails
+  for any other reason propagates as an error and is never read as not stale. The result is
   sorted by key.
 - `inject(keys)` returns `### <key>\n\n<body>` for each key, joined with `\n\n`, in the given
   order; a missing key raises `KeyError`.
