@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, NoReturn, Protocol, Sequence
 
-from helios.beads import Beads
+from helios.beads import Beads, BeadNotFound
 from helios.config import Config
 
 MAGIC = "helios-memory 1"
@@ -272,25 +272,17 @@ def _labels_from_show(show: Callable[[str], Any]) -> LabelsOf:
     """Build a label lookup from a beads show method (SPEC §13).
 
     A bead exists only when show returns an object whose id equals the
-    requested id exactly; anything else is a missing bead. Only the exact
-    missing-bead KeyError that helios.beads raises reads as missing (a
-    dedicated subclass, the "not found" message, or a dict miss naming
-    exactly the requested id, which is the FakeBeads missing signal); a
-    KeyError from a malformed payload, and every other lookup error,
-    propagates.
+    requested id exactly; anything else is a missing bead. Only
+    ``BeadNotFound``, the dedicated exception helios.beads raises for a
+    missing bead, reads as missing; any other KeyError, or any other
+    lookup error, propagates.
     """
 
     def lookup(bead_id: str) -> Sequence[str] | None:
         try:
             bead = show(bead_id)
-        except KeyError as exc:
-            if type(exc) is not KeyError:
-                return None
-            if exc.args and "not found" in str(exc.args[0]):
-                return None
-            if exc.args == (bead_id,):
-                return None
-            raise
+        except BeadNotFound:
+            return None
         if bead.id != bead_id:
             return None
         return list(bead.labels)

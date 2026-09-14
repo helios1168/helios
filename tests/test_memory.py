@@ -15,7 +15,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from helios import memory as mem
-from helios.beads import Bead, Beads, FakeBeads
+from helios.beads import Bead, BeadNotFound, Beads, FakeBeads
 from helios.config import Config, MemoryConfig, load
 
 KEY = "probe"
@@ -1021,6 +1021,31 @@ def test_value_size_limit_boundary(tmp_path: Path) -> None:
 # Round 2: stale() narrows KeyError to the missing-bead signal.
 
 
+def test_labels_from_show_fake_beads_missing_is_missing() -> None:
+    """FakeBeads.show raises BeadNotFound for a missing bead; that reads as missing."""
+    lookup = mem._labels_from_show(FakeBeads().show)
+    assert lookup("hel-404") is None
+
+
+def test_labels_from_show_plain_key_error_propagates() -> None:
+    """A show raising a plain KeyError(bead_id), not BeadNotFound, propagates."""
+    def show(bead_id: str) -> Bead:
+        raise KeyError(bead_id)
+
+    lookup = mem._labels_from_show(show)
+    with pytest.raises(KeyError):
+        lookup("hel-1")
+
+
+def test_labels_from_show_wrong_id_is_missing() -> None:
+    """A show returning a Bead whose id differs from the request reads as missing."""
+    def show(bead_id: str) -> Bead:
+        return Bead(id="hel-other", labels=["truth:wrong"])
+
+    lookup = mem._labels_from_show(show)
+    assert lookup("hel-1") is None
+
+
 def test_stale_malformed_show_shapes_propagate(tmp_path: Path) -> None:
     """A show that returns id-less objects or raises a foreign KeyError is not a miss."""
     def no_id(bead_id: str) -> Bead:
@@ -1125,7 +1150,8 @@ def test_stale_real_bd_exact_and_partial(
     backend.write("partial", {"source": f"{suffix}#1"}, "x")
     backend.write("fine", {"source": f"{fine}#1"}, "x")
     backend.write("gone", {"source": f"{wrong}#1", "status": "retracted"}, "x")
-    assert Beads(repo).show(suffix).id == wrong  # bd resolves the partial id
+    with pytest.raises(BeadNotFound):
+        Beads(repo).show(suffix)  # bd's partial resolution now reads as missing
     assert backend.stale() == ["exact"]
 
 
