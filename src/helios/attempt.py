@@ -89,25 +89,29 @@ class Attempt:
 
 
 def read_state(dir: Path) -> dict[str, Any]:
-    """Read ``state.json``; a missing file reads as ``allocated`` (SPEC §8.3).
+    """Read ``state.json``; damage reads as ``allocated`` (SPEC §8.3).
 
-    Reading never raises for a missing file: the record is state
-    ``allocated`` with null pid, session id and execution status.
+    A ``state.json`` that is missing or unreadable (empty, not valid
+    JSON, not an object, or without a string ``state``) reads as state
+    ``allocated`` with null pid, session id and execution status;
+    reading never raises for these cases.
     """
     try:
-        return json.loads((dir / "state.json").read_text())
-    except FileNotFoundError:
-        pass
-    match = re.fullmatch(r"attempt-(\d+)", dir.name)
-    attempt_id = f"{dir.parent.name}#{match.group(1)}" if match else dir.name
-    return {
-        "state": "allocated",
-        "attempt_id": attempt_id,
-        "pid": None,
-        "session_id": None,
-        "execution_status": None,
-        "updated": utc_now(),
-    }
+        data = json.loads((dir / "state.json").read_text())
+    except (OSError, ValueError):
+        data = None
+    if not isinstance(data, dict) or not isinstance(data.get("state"), str):
+        match = re.fullmatch(r"attempt-(\d+)", dir.name)
+        attempt_id = f"{dir.parent.name}#{match.group(1)}" if match else dir.name
+        return {
+            "state": "allocated",
+            "attempt_id": attempt_id,
+            "pid": None,
+            "session_id": None,
+            "execution_status": None,
+            "updated": utc_now(),
+        }
+    return data
 
 
 def write_state(

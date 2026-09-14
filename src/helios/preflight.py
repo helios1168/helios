@@ -71,6 +71,8 @@ def ensure(beads: list[Bead], ctx: PreflightContext) -> None:
 
 def _check_bead(bead: Bead, ctx: PreflightContext) -> list[str]:
     errors: list[str] = []
+    if bead.status == "closed":
+        errors.append(f"{bead.id}: bead is closed")
     if bead.kind in ("impl", "validate"):
         if not bead.files:
             errors.append(f"{bead.id}: impl bead needs `files`")

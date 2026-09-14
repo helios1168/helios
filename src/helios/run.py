@@ -36,6 +36,24 @@ _RUNNING: dict[str, subprocess.Popen[str]] = {}
 _RUNNING_LOCK = threading.Lock()
 _INTERRUPT = threading.Event()
 _RUN_ACTIVE = threading.Event()
+
+
+def _reg_add(key: str, proc: subprocess.Popen[str]) -> None:
+    """Register a running child; always through ``_RUNNING_LOCK``."""
+    with _RUNNING_LOCK:
+        _RUNNING[key] = proc
+
+
+def _reg_remove(key: str) -> None:
+    """Drop a finished child from the registry."""
+    with _RUNNING_LOCK:
+        _RUNNING.pop(key, None)
+
+
+def _reg_snapshot() -> list[subprocess.Popen[str]]:
+    """The currently running children."""
+    with _RUNNING_LOCK:
+        return list(_RUNNING.values())
 _RUN_DEPTH = 0
 _RUN_DEPTH_LOCK = threading.Lock()
 _PREV_SIGINT: Callable[[int, FrameType | None], object] | int | None = None
@@ -52,16 +70,26 @@ def _handle_sigint(signum: int, frame: FrameType | None) -> None:
 
 
 def _stopper_main() -> None:
-    """Stop every running child group while the run is active (SPEC §7.1)."""
-    while _RUN_ACTIVE.is_set():
-        if not _INTERRUPT.wait(0.2):
+    """Stop every running child group while the run is active (SPEC §7.1).
+
+    Blocks in ``Event.wait()``, then runs the stop sequences of all
+    running groups concurrently so each gets its SIGINT at once. Groups
+    registered after the flag (a check that raced it) are picked up on
+    the next sweep; the thread exits only when the run ends with no
+    groups left.
+    """
+    while True:
+        flagged = _INTERRUPT.wait(timeout=0.5)
+        procs = _reg_snapshot()
+        active = _RUN_ACTIVE.is_set()
+        if not active and not procs:
+            return
+        if not flagged or not procs:
             continue
-        with _RUNNING_LOCK:
-            procs = list(_RUNNING.values())
-        for proc in procs:
-            if not (_RUN_ACTIVE.is_set() and _INTERRUPT.is_set()):
-                return
-            _stop_sequence(proc, proc.pid)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(procs), thread_name_prefix="stopper-seq"
+        ) as pool:
+            list(pool.map(lambda p: _stop_sequence(p, p.pid), procs))
 
 
 def _run_depth_enter() -> int:
@@ -262,13 +290,13 @@ def _launch_and_wait(
                 pass
         if on_launched is not None:
             on_launched(child_pid)
-        with _RUNNING_LOCK:
-            _RUNNING[run_key] = proc
+        _reg_add(run_key, proc)
         try:
             start = time.monotonic()
             while True:
                 if _INTERRUPT.is_set():
                     exit_code = proc.wait()
+                    _wait_group_gone(proc, pgid, 30)
                     return exit_code, False, True, False, child_pid
                 try:
                     exit_code = proc.wait(timeout=0.05)
@@ -276,6 +304,7 @@ def _launch_and_wait(
                     pass
                 else:
                     if _INTERRUPT.is_set():
+                        _wait_group_gone(proc, pgid, 30)
                         return exit_code, False, True, False, child_pid
                     return exit_code, False, False, False, child_pid
                 if time.monotonic() - start >= timeout_s:
@@ -285,8 +314,7 @@ def _launch_and_wait(
             exit_code = _stop_sequence(proc, pgid)
             return exit_code, False, True, False, child_pid
         finally:
-            with _RUNNING_LOCK:
-                _RUNNING.pop(run_key, None)
+            _reg_remove(run_key)
 
 
 def _run_shell(
@@ -312,12 +340,12 @@ def _run_shell(
     except OSError as exc:
         log_path.write_text(f"failed to start: {exc}\n")
         return False, 127, f"failed to start: {exc}"
-    with _RUNNING_LOCK:
-        _RUNNING[run_key] = proc
+    _reg_add(run_key, proc)
     try:
         while True:
             if _INTERRUPT.is_set():
                 proc.wait()
+                _wait_group_gone(proc, proc.pid, 30)
                 try:
                     out, err = proc.communicate(timeout=5)
                 except (subprocess.TimeoutExpired, ValueError, OSError):
@@ -337,8 +365,7 @@ def _run_shell(
             log_path.write_text(f"$ {command}\ninterrupted\n{out}{err}")
             return False, proc.poll(), "interrupted"
     finally:
-        with _RUNNING_LOCK:
-            _RUNNING.pop(run_key, None)
+        _reg_remove(run_key)
     code = proc.returncode
     log_path.write_text(f"$ {command}\n(exit {code})\n{out}{err}")
     detail = (out + err).strip()[-2000:]
@@ -512,7 +539,8 @@ def _event_type_for(
     """Map the outcome to one SPEC §9.3 event type."""
     if execution_status is not envelope_mod.ExecutionStatus.COMPLETED or not checks_passed:
         return "failed"
-    assert report is not None
+    if report is None:
+        return "failed"
     if report.status is envelope_mod.WorkStatus.DONE:
         return "completed"
     if report.status is envelope_mod.WorkStatus.NEEDS_INPUT:
@@ -580,7 +608,6 @@ class _Capture:
     raw_error: str | None
     store_bytes: bytes | None
     force: envelope_mod.ExecutionStatus | None
-    report_check_detail: str | None
     notes: list[str]
 
 
@@ -596,16 +623,15 @@ def _capture_fresh(
         elif file_error is not None:
             notes.append(f"report file unreadable ({file_error}); using native")
         store = (
-            raw
-            if raw is not None
-            else (json.dumps(native_structured, indent=2, sort_keys=True) + "\n").encode()
-        )
-        return _Capture(native_structured, None, store, None, None, notes)
+            json.dumps(native_structured, ensure_ascii=False, indent=2, sort_keys=True)
+            + "\n"
+        ).encode("utf-8")
+        return _Capture(native_structured, None, store, None, notes)
     if file_candidate is not None:
-        return _Capture(file_candidate, None, raw, None, None, notes)
+        return _Capture(file_candidate, None, raw, None, notes)
     if file_error is not None:
-        return _Capture(None, file_error, raw, None, None, notes)
-    return _Capture(None, None, None, None, None, notes)
+        return _Capture(None, file_error, raw, None, notes)
+    return _Capture(None, None, None, None, notes)
 
 
 def _capture_resume(
@@ -624,13 +650,7 @@ def _capture_resume(
     store: bytes | None = None
     if raw is None and stored is None and legacy_path is not None:
         candidate, error, store = _read_report_bytes(legacy_path)
-    if stored is envelope_mod.ExecutionStatus.COMPLETED and candidate is None:
-        if raw is None:
-            detail = "captured report is missing"
-        else:
-            detail = f"captured report invalid: {error}"
-        return _Capture(None, error, None, stored, detail, [])
-    return _Capture(candidate, error, store, stored, None, [])
+    return _Capture(candidate, error, store, stored, [])
 
 
 @dataclass
@@ -670,6 +690,7 @@ def _finish_attempt(
     timed_out: bool,
     launch_failed: bool,
     transition_from: str | None,
+    launched: bool = True,
 ) -> int:
     """Validate, check, commit, envelop, write back and finalize one attempt."""
     bead = args.bead
@@ -722,74 +743,82 @@ def _finish_attempt(
         if launch_failed:
             terminal = "launch_failed"
         attempt_mod.transition(
-            attempt_dir, terminal, execution_status=execution.value
+            attempt_dir,
+            terminal,
+            execution_status=execution.value,
+            session_id=native_session,
         )
 
     checks_dir = attempt_dir / "checks"
     checks: list[envelope_mod.Check] = []
-    if capture.report_check_detail is not None:
+    if (
+        execution is envelope_mod.ExecutionStatus.COMPLETED
+        and report is None
+    ):
+        if capture.candidate is None:
+            problem = (
+                "captured report is missing"
+                if capture.raw_error is None
+                else f"captured report invalid: {capture.raw_error}"
+            )
+        else:
+            problem = f"captured report invalid: {report_error}"
+        checks.append(
+            envelope_mod.Check(name="report", passed=False, detail=problem)
+        )
+    if not launched:
+        if bead.test:
+            checks.append(
+                envelope_mod.Check(name="test", passed=False, detail="interrupted")
+            )
+        if args.config.project.typecheck:
+            checks.append(
+                envelope_mod.Check(
+                    name="typecheck", passed=False, detail="interrupted"
+                )
+            )
         checks.append(
             envelope_mod.Check(
-                name="report",
-                passed=False,
-                detail=capture.report_check_detail,
+                name="ownership", passed=False, detail="interrupted"
             )
         )
-    if bead.test:
-        passed, code, detail = _run_shell(
-            bead.test, args.worktree_path, checks_dir / "test.log",
-            f"{attempt_dir}:check:test",
-        )
-        checks.append(
-            envelope_mod.Check(
-                name="test",
-                passed=passed,
-                command=bead.test,
-                exit_code=code,
-                detail=detail,
-                log_path="checks/test.log",
+        checks_passed = False
+        output_commit: str | None = None
+    else:
+        if bead.test:
+            passed, code, detail = _run_shell(
+                bead.test, args.worktree_path, checks_dir / "test.log",
+                f"{attempt_dir}:check:test",
             )
-        )
-    typecheck_cmd = args.config.project.typecheck
-    if typecheck_cmd:
-        passed, code, detail = _run_shell(
-            typecheck_cmd, args.worktree_path, checks_dir / "typecheck.log",
-            f"{attempt_dir}:check:typecheck",
-        )
-        checks.append(
-            envelope_mod.Check(
-                name="typecheck",
-                passed=passed,
-                command=typecheck_cmd,
-                exit_code=code,
-                detail=detail,
-                log_path="checks/typecheck.log",
+            checks.append(
+                envelope_mod.Check(
+                    name="test",
+                    passed=passed,
+                    command=bead.test,
+                    exit_code=code,
+                    detail=detail,
+                    log_path="checks/test.log",
+                )
             )
-        )
-    ownership = ownership_mod.check(
-        worktree=args.worktree_path,
-        base_commit=args.base_commit,
-        files=list(bead.files),
-        always_allowed=args.config.project.always_allowed,
-        kind=bead.kind,
-        verify_artifacts=args.config.project.verify_artifacts,
-        unit=bead.unit,
-        confidential=args.config.project.confidential,
-        memory_export_dir=args.config.memory.export_dir,
-        link_into_worktrees=args.config.project.link_into_worktrees,
-    )
-    try:
-        cached = _git_nul(
-            args.worktree_path, "diff", "--cached", "--name-only",
-            "--no-renames", "-z", args.base_commit,
-        )
-    except RuntimeError:
-        cached = []
-    seen = set(ownership.allowed) | set(ownership.rejected)
-    extra = [p for p in cached if p not in seen]
-    if extra:
-        extra_allowed, extra_rejected = _classify_extra_paths(
-            extra,
+        typecheck_cmd = args.config.project.typecheck
+        if typecheck_cmd:
+            passed, code, detail = _run_shell(
+                typecheck_cmd, args.worktree_path, checks_dir / "typecheck.log",
+                f"{attempt_dir}:check:typecheck",
+            )
+            checks.append(
+                envelope_mod.Check(
+                    name="typecheck",
+                    passed=passed,
+                    command=typecheck_cmd,
+                    exit_code=code,
+                    detail=detail,
+                    log_path="checks/typecheck.log",
+                )
+            )
+        ownership = ownership_mod.check(
+            worktree=args.worktree_path,
+            base_commit=args.base_commit,
             files=list(bead.files),
             always_allowed=args.config.project.always_allowed,
             kind=bead.kind,
@@ -797,42 +826,61 @@ def _finish_attempt(
             unit=bead.unit,
             confidential=args.config.project.confidential,
             memory_export_dir=args.config.memory.export_dir,
+            link_into_worktrees=args.config.project.link_into_worktrees,
         )
-        ownership = ownership_mod.OwnershipResult(
-            allowed=tuple([*ownership.allowed, *extra_allowed]),
-            rejected=tuple([*ownership.rejected, *extra_rejected]),
-            detail=(
-                f"rejected: {', '.join([*ownership.rejected, *extra_rejected])}"
-                if [*ownership.rejected, *extra_rejected]
-                else "all paths allowed"
-            ),
-        )
-    checks.append(
-        envelope_mod.Check(
-            name="ownership",
-            passed=ownership.passed,
-            detail=ownership.detail,
-        )
-    )
-    checks_passed = all(c.passed for c in checks)
-
-    if not ownership.passed:
-        output_commit: str | None = None
-    else:
-        summary = report.summary if report is not None else execution.value
         try:
+            cached_base = _git_nul(
+                args.worktree_path, "diff", "--cached", "--name-only",
+                "--no-renames", "-z", args.base_commit,
+            )
+        except RuntimeError:
+            cached_base = []
+        try:
+            cached_head = _git_nul(
+                args.worktree_path, "diff", "--cached", "--name-only",
+                "--no-renames", "-z", "HEAD",
+            )
+        except RuntimeError:
+            cached_head = []
+        seen = set(ownership.allowed) | set(ownership.rejected)
+        extra = [p for p in [*cached_base, *cached_head] if p not in seen]
+        if extra:
+            extra_allowed, extra_rejected = _classify_extra_paths(
+                extra,
+                files=list(bead.files),
+                always_allowed=args.config.project.always_allowed,
+                kind=bead.kind,
+                verify_artifacts=args.config.project.verify_artifacts,
+                unit=bead.unit,
+                confidential=args.config.project.confidential,
+                memory_export_dir=args.config.memory.export_dir,
+            )
+            ownership = ownership_mod.OwnershipResult(
+                allowed=tuple([*ownership.allowed, *extra_allowed]),
+                rejected=tuple([*ownership.rejected, *extra_rejected]),
+                detail=(
+                    f"rejected: {', '.join([*ownership.rejected, *extra_rejected])}"
+                    if [*ownership.rejected, *extra_rejected]
+                    else "all paths allowed"
+                ),
+            )
+        checks.append(
+            envelope_mod.Check(
+                name="ownership",
+                passed=ownership.passed,
+                detail=ownership.detail,
+            )
+        )
+        checks_passed = all(c.passed for c in checks)
+
+        if not ownership.passed:
+            output_commit = None
+        else:
+            summary = report.summary if report is not None else execution.value
             _stage_and_commit(
                 args.worktree_path, bead.id, summary, list(ownership.allowed)
             )
             output_commit = _head_commit(args.worktree_path)
-        except RuntimeError:
-            checks.append(
-                envelope_mod.Check(
-                    name="commit", passed=False, detail="git commit failed"
-                )
-            )
-            checks_passed = False
-            output_commit = None
 
     harness_cfg = args.config.harness.get(args.harness_name)
     verdict: str | None = None
@@ -1070,12 +1118,11 @@ class _BeadLock:
 
 def _refuse_live(bead_id: str, attempt_id: str | None) -> int:
     """Print the attach and stop commands and refuse with exit 2 (SPEC §8.4)."""
-    text = (
+    print(
         f"attempt {attempt_id} is still running; "
-        f"use `helios attach {bead_id}` or `helios stop {bead_id}`"
+        f"use `helios attach {bead_id}` or `helios stop {bead_id}`",
+        file=sys.stderr,
     )
-    print(text)
-    print(text, file=sys.stderr)
     return 2
 
 
@@ -1104,8 +1151,21 @@ def _dry_run_one(
     worktree_path = hub / config.project.worktrees / bead_id
     branch = worktree_mod.branch_name(bead_id)
     numbers = attempt_mod.existing_attempts(hub / config.project.runs / bead_id)
-    next_n = (numbers[-1] if numbers else 0) + 1
-    attempt_path = hub / config.project.runs / bead_id / f"attempt-{next_n}"
+    prompt_size: int | None = None
+    attempt_path: Path | None = None
+    if action == "resume" and numbers:
+        candidate_path = hub / config.project.runs / bead_id / f"attempt-{numbers[-1]}"
+        try:
+            prompt_size = len((candidate_path / "prompt.md").read_bytes())
+        except OSError:
+            prompt_size = None
+        else:
+            attempt_path = candidate_path
+    if attempt_path is None:
+        next_n = (numbers[-1] if numbers else 0) + 1
+        attempt_path = hub / config.project.runs / bead_id / f"attempt-{next_n}"
+    else:
+        next_n = numbers[-1] if numbers else 1
     report_path = attempt_mod.worktree_report_path(worktree_path, next_n)
     prompt, _, _, _, _, _ = _assemble_inputs(
         hub=hub,
@@ -1136,7 +1196,9 @@ def _dry_run_one(
     print(f"argv: {' '.join(harness.argv(spec))}")
     print(f"worktree: {worktree_path}")
     print(f"attempt: {attempt_path}")
-    print(f"prompt_bytes: {len(prompt.encode('utf-8'))}")
+    if prompt_size is None:
+        prompt_size = len(prompt.encode("utf-8"))
+    print(f"prompt_bytes: {prompt_size}")
     return 0
 
 
@@ -1202,22 +1264,18 @@ def run_one(
     dry_run: bool = False,
 ) -> int:
     """Run one bead through launch, checks, commit and write-back (SPEC §7.1)."""
-    depth = _run_depth_enter()
-    try:
-        if depth == 1:
-            _INTERRUPT.clear()
-        return _run_one_inner(
-            bead_id,
-            hub=hub,
-            beads=beads,
-            config=config,
-            harness_override=harness_override,
-            timeout_s=timeout_s,
-            again=again,
-            dry_run=dry_run,
-        )
-    finally:
-        _run_depth_exit()
+    if not _RUN_ACTIVE.is_set():
+        _INTERRUPT.clear()
+    return _run_one_inner(
+        bead_id,
+        hub=hub,
+        beads=beads,
+        config=config,
+        harness_override=harness_override,
+        timeout_s=timeout_s,
+        again=again,
+        dry_run=dry_run,
+    )
 
 
 def _run_one_inner(
@@ -1240,6 +1298,9 @@ def _run_one_inner(
     skill_error = _missing_skill(hub, bead.kind)
     if skill_error is not None:
         print(f"preflight: {bead_id}: {skill_error}", file=sys.stderr)
+        return 2
+    if bead.status == "closed":
+        print(f"preflight: {bead_id}: bead is closed", file=sys.stderr)
         return 2
     harness_name = config_mod.harness_for_kind(
         cfg, bead.kind, author=bead.author, override=harness_override
@@ -1291,7 +1352,11 @@ def _run_one_inner(
                 if old_dir.is_dir():
                     try:
                         if action == "crash_and_new":
-                            attempt_mod.transition(old_dir, "crashed")
+                            attempt_mod.transition(
+                                old_dir,
+                                "crashed",
+                                execution_status=envelope_mod.ExecutionStatus.CRASHED.value,
+                            )
                             stored = _stored_execution(old_dir)
                             _write_recovery_envelope(
                                 hub=hub, config=cfg, bead=bead,
@@ -1389,8 +1454,10 @@ def _run_one_inner(
             }
         )
         run_key = str(attempt_obj.dir)
+        launched_box = {"fired": False}
 
         def _record_launched(pid: int) -> None:
+            launched_box["fired"] = True
             attempt_mod.transition(attempt_obj.dir, "launched", pid=pid)
             events_mod.append(
                 hub,
@@ -1413,13 +1480,14 @@ def _run_one_inner(
             run_key=run_key,
             on_launched=_record_launched,
         )
+        native = harness.parse(spec, proc_exit, stdout_path)
         if launch_failed:
             attempt_mod.transition(
                 attempt_obj.dir,
                 "launch_failed",
                 execution_status=envelope_mod.ExecutionStatus.LAUNCH_FAILED.value,
+                session_id=native.session_id,
             )
-        native = harness.parse(spec, proc_exit, stdout_path)
         finish_args = _FinishArgs(
             hub=hub,
             config=cfg,
@@ -1443,6 +1511,7 @@ def _run_one_inner(
             timed_out=timed_out,
             launch_failed=launch_failed,
             transition_from=None if launch_failed else "launched",
+            launched=launched_box["fired"],
         )
     finally:
         lock.release(remove_if_created=dry_run)
@@ -1556,7 +1625,9 @@ def run_many(
         _INTERRUPT.clear()
         if _install_handler():
             _RUN_ACTIVE.set()
-            stopper = threading.Thread(target=_stopper_main, daemon=True)
+            stopper = threading.Thread(
+                target=_stopper_main, name="_stopper_main", daemon=True
+            )
             stopper.start()
     try:
         hub = hub.resolve()
@@ -1637,6 +1708,6 @@ def run_many(
         if outermost:
             _RUN_ACTIVE.clear()
             if stopper is not None:
-                stopper.join(timeout=5)
+                stopper.join()
             _restore_handler()
         _run_depth_exit()

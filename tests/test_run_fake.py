@@ -48,10 +48,20 @@ def make_hub(tmp_path: Path) -> Path:
     return hub
 
 
-def make_bead(bead_id: str = "b1", **kw) -> beads_mod.Bead:
-    base = dict(id=bead_id, kind="impl", files=["src/"], test="true", docs=[], memories=[])
-    base.update(kw)
-    return beads_mod.Bead(**base)
+def make_bead(bead_id: str = "b1", **kw: object) -> beads_mod.Bead:
+    fields: dict[str, object] = {
+        "id": bead_id, "kind": "impl", "files": ["src/"], "test": "true",
+        "docs": [], "memories": [],
+    }
+    fields.update(kw)
+    return beads_mod.Bead(
+        id=fields["id"] if isinstance(fields["id"], str) else bead_id,
+        kind=fields["kind"] if isinstance(fields["kind"], str) else "impl",
+        files=list(fields["files"]) if isinstance(fields["files"], list) else ["src/"],
+        test=fields["test"] if isinstance(fields["test"], str) else "true",
+        docs=list(fields["docs"]) if isinstance(fields["docs"], list) else [],
+        memories=list(fields["memories"]) if isinstance(fields["memories"], list) else [],
+    )
 
 
 def write_script(tmp_path: Path, payload: dict, name: str = "script.json") -> Path:
@@ -1340,6 +1350,488 @@ def test_empty_attempt_dir_recovers(tmp_path: Path, monkeypatch) -> None:
            (hub / ".helios" / "runs" / "b1" / "attempt-1" / "state.log").read_text().splitlines()]
     assert log == ["crashed", "finalized"]
     assert read_envelope(hub, "b1", 2)["execution_status"] == "completed"
+
+
+def test_commit_owned_variants(tmp_path: Path, monkeypatch) -> None:
+    cases = {
+        "combined": (
+            {"src/b1/old.txt": "o\n", "src/b1/gone.txt": "g\n", "src/b1/a": "a\n"},
+            "git mv src/b1/old.txt src/b1/new.txt && git rm -q src/b1/gone.txt && "
+            "echo t > src/b1/tmp && git add src/b1/tmp && rm src/b1/tmp && echo edited > src/b1/a",
+            {("D", "src/b1/old.txt"), ("A", "src/b1/new.txt"),
+             ("D", "src/b1/gone.txt"), ("M", "src/b1/a")},
+        ),
+        "special_names": (
+            {"src/b1/o l d é.txt": "o\n", "src/b1/g*o?ne[1].txt": "g\n",
+             "src/b1/keep*.txt": "k\n"},
+            "git mv 'src/b1/o l d é.txt' 'src/b1/[ab] n*é?.txt' && "
+            "git rm -q 'src/b1/g*o?ne[1].txt' && echo new > 'src/b1/:(glob)x*'",
+            {("D", "src/b1/o l d é.txt"), ("A", "src/b1/[ab] n*é?.txt"),
+             ("D", "src/b1/g*o?ne[1].txt"), ("A", "src/b1/:(glob)x*")},
+        ),
+        "rm_r_dir": (
+            {"src/b1/d/x": "1\n", "src/b1/d/sub/y": "2\n", "src/b1/keep": "k\n"},
+            "git rm -r -q src/b1/d",
+            {("D", "src/b1/d/x"), ("D", "src/b1/d/sub/y")},
+        ),
+        "staged_nonascii_deleted": (
+            {"src/b1/a": "a\n"},
+            "mkdir -p src/b1 && echo t > 'src/b1/tmp é*' && git add 'src/b1/tmp é*' && "
+            "rm 'src/b1/tmp é*' && echo e > src/b1/a",
+            {("M", "src/b1/a")},
+        ),
+    }
+    for name, (extra, cmd, want) in cases.items():
+        hub = make_hub(tmp_path / name)
+        if extra:
+            for rel, text in extra.items():
+                (hub / rel).parent.mkdir(parents=True, exist_ok=True)
+                (hub / rel).write_text(text)
+            subprocess.run(["git", "add", "."], cwd=hub, check=True)
+            subprocess.run(["git", "commit", "-qm", "extra"], cwd=hub, check=True)
+        base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=hub, check=True,
+            capture_output=True, text=True).stdout.strip()
+        set_fake(monkeypatch, write_script(
+            tmp_path / name, {"report": {"status": "done", "summary": "ok"}}))
+        beads = beads_mod.FakeBeads([beads_mod.Bead(
+            id="b1", kind="impl", files=["src/b1/"], test=cmd)])
+        rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                             config=config_mod.load(hub), harness_override="fake")
+        wt = hub / ".claude" / "worktrees" / "b1"
+        env = read_envelope(hub, "b1", 1)
+        raw = subprocess.run(
+            ["git", "show", "-z", "--no-renames", "--name-status", "--format=", "HEAD"],
+            cwd=wt, check=True, capture_output=True).stdout.decode()
+        toks = [t for t in raw.split("\0") if t]
+        got = set(zip(toks[0::2], toks[1::2]))
+        commits = subprocess.run(
+            ["git", "rev-list", f"{base}..HEAD"], cwd=wt, check=True,
+            capture_output=True, text=True).stdout.splitlines()
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=wt, check=True,
+            capture_output=True, text=True).stdout.strip()
+        assert rc == 0 and "b1" in beads.closed, name
+        assert len(commits) == 1 and got == want, name
+        assert env["output_commit"] == head, name
+
+
+def test_commit_ownership_across_boundary(tmp_path: Path, monkeypatch) -> None:
+    cases = [
+        ("dest_outside", {"src/b1/old.txt": "o\n"},
+         "mkdir -p other && git mv src/b1/old.txt other/new.txt", "other/new.txt"),
+        ("agent_commits_unowned", {},
+         "echo evil > README.md && git commit -qam evil && mkdir -p src/b1 && echo y > src/b1/y",
+         "README.md"),
+    ]
+    for name, extra, cmd, bad in cases:
+        hub = make_hub(tmp_path / name)
+        for rel, text in extra.items():
+            (hub / rel).parent.mkdir(parents=True, exist_ok=True)
+            (hub / rel).write_text(text)
+        if extra:
+            subprocess.run(["git", "add", "."], cwd=hub, check=True)
+            subprocess.run(["git", "commit", "-qm", "extra"], cwd=hub, check=True)
+        set_fake(monkeypatch, write_script(
+            tmp_path / name, {"report": {"status": "done", "summary": "ok"}}))
+        beads = beads_mod.FakeBeads([beads_mod.Bead(
+            id="b1", kind="impl", files=["src/b1/"], test=cmd)])
+        rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                             config=config_mod.load(hub), harness_override="fake")
+        env = read_envelope(hub, "b1", 1)
+        own = [c for c in env["checks"] if c["name"] == "ownership"][0]
+        assert rc == 5 and not own["passed"] and bad in own["detail"], name
+        assert env["output_commit"] is None and not beads.closed, name
+        assert beads.states["b1"]["run"] == "failed", name
+
+
+def test_commit_agent_partial(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=hub, check=True,
+        capture_output=True, text=True).stdout.strip()
+    cmd = ("mkdir -p src/b1 && echo 1 > src/b1/p && git add src/b1/p && git commit -qm part && "
+           "echo 2 > src/b1/q && git add src/b1/q && echo 3 > src/b1/r")
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="impl", files=["src/b1/"], test=cmd)])
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    wt = hub / ".claude" / "worktrees" / "b1"
+    env = read_envelope(hub, "b1", 1)
+    commits = subprocess.run(
+        ["git", "rev-list", f"{base}..HEAD"], cwd=wt, check=True,
+        capture_output=True, text=True).stdout.splitlines()
+    raw = subprocess.run(
+        ["git", "show", "-z", "--no-renames", "--name-status", "--format=", "HEAD"],
+        cwd=wt, check=True, capture_output=True).stdout.decode()
+    toks = [t for t in raw.split("\0") if t]
+    assert rc == 0 and len(commits) == 2
+    assert set(zip(toks[0::2], toks[1::2])) == {("A", "src/b1/q"), ("A", "src/b1/r")}
+    assert env["output_commit"] == subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=wt, check=True,
+        capture_output=True, text=True).stdout.strip()
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=wt, check=True,
+        capture_output=True, text=True).stdout == ""
+
+
+def test_committed_then_removed_is_committed(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="impl", files=["src/b1/"],
+        test="mkdir -p src/b1 && echo 1 > src/b1/p && git add src/b1/p && "
+             "git commit -qm part && git rm -q src/b1/p")])
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    wt = hub / ".claude" / "worktrees" / "b1"
+    env = read_envelope(hub, "b1", 1)
+    tree = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=wt, check=True,
+        capture_output=True, text=True).stdout.splitlines()
+    assert rc == 0 and "src/b1/p" not in tree
+    assert env["output_commit"] is not None
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=wt, check=True,
+        capture_output=True, text=True).stdout == ""
+
+
+def test_committed_then_removed_unowned_fails(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    (hub / "other").mkdir()
+    (hub / "other" / "x.txt").write_text("o\n")
+    subprocess.run(["git", "add", "."], cwd=hub, check=True)
+    subprocess.run(["git", "commit", "-qm", "extra"], cwd=hub, check=True)
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="impl", files=["src/b1/"],
+        test="mkdir -p src/b1 && echo y > src/b1/y && git rm -q other/x.txt")])
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    env = read_envelope(hub, "b1", 1)
+    assert rc == 5 and env["output_commit"] is None
+
+
+def test_worktree_tamper_keeps_completed(tmp_path: Path, monkeypatch) -> None:
+    for tamper in ("delete", "garbage", "other_valid"):
+        hub = make_hub(tmp_path / tamper)
+        set_fake(monkeypatch, write_script(
+            tmp_path / tamper, {"report": {"status": "done", "summary": "ok"}}))
+        real_wb = beads_mod.apply_writeback
+
+        def boom(*a, **k):
+            raise RuntimeError("bd died")
+
+        monkeypatch.setattr(beads_mod, "apply_writeback", boom)
+        beads = beads_mod.FakeBeads([beads_mod.Bead(
+            id="b1", kind="impl", files=["src/b1/"],
+            test="mkdir -p src/b1 && echo y > src/b1/y")])
+        with pytest.raises(RuntimeError):
+            run_mod.run_one("b1", hub=hub, beads=beads,
+                            config=config_mod.load(hub), harness_override="fake")
+        cap_before = (hub / ".helios" / "runs" / "b1" / "attempt-1" / "report.json").read_bytes()
+        rp = attempt_mod.worktree_report_path(hub / ".claude" / "worktrees" / "b1", 1)
+        if tamper == "delete":
+            rp.unlink()
+        elif tamper == "garbage":
+            rp.write_text("{garbage")
+        else:
+            rp.write_text(json.dumps({"status": "blocked", "summary": "evil"}))
+        monkeypatch.setattr(beads_mod, "apply_writeback", real_wb)
+        rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                             config=config_mod.load(hub), harness_override="fake")
+        env = read_envelope(hub, "b1", 1)
+        assert rc == 0 and env["execution_status"] == "completed", tamper
+        assert env["report"]["summary"] == "ok" and "b1" in beads.closed, tamper
+        assert (hub / ".helios" / "runs" / "b1" / "attempt-1" / "report.json").read_bytes() == cap_before
+
+
+@pytest.mark.parametrize("tamper", ["delete", "garbage", "array", "empty",
+                                    "schema_invalid", "missing_summary"])
+def test_captured_tamper_keeps_completed_fails_report(
+    tmp_path: Path, monkeypatch, tamper: str
+) -> None:
+    hub = make_hub(tmp_path)
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    real_wb = beads_mod.apply_writeback
+
+    def boom(*a, **k):
+        raise RuntimeError("bd died")
+
+    monkeypatch.setattr(beads_mod, "apply_writeback", boom)
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="impl", files=["src/b1/"],
+        test="mkdir -p src/b1 && echo y > src/b1/y")])
+    with pytest.raises(RuntimeError):
+        run_mod.run_one("b1", hub=hub, beads=beads,
+                        config=config_mod.load(hub), harness_override="fake")
+    cap = hub / ".helios" / "runs" / "b1" / "attempt-1" / "report.json"
+    {"delete": lambda: cap.unlink(), "garbage": lambda: cap.write_text("{garbage"),
+     "array": lambda: cap.write_text("[]"), "empty": lambda: cap.write_text(""),
+     "schema_invalid": lambda: cap.write_text(json.dumps({"status": "bogus", "summary": "x"})),
+     "missing_summary": lambda: cap.write_text(json.dumps({"status": "done"}))}[tamper]()
+    monkeypatch.setattr(beads_mod, "apply_writeback", real_wb)
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    env = json.loads((hub / ".helios" / "runs" / "b1" / "attempt-1" / "envelope.json").read_text())
+    rep = [c for c in env["checks"] if c["name"] == "report"]
+    assert env["execution_status"] == "completed", tamper
+    assert rep and rep[0]["passed"] is False and rep[0]["detail"], tamper
+    assert rc == 5 and "b1" not in beads.closed, tamper
+    assert beads.states["b1"]["run"] == "failed", tamper
+
+
+def test_captured_bytes_identical(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    text = '{ "summary" : "é ok \\u00e9" ,\n\t"status":"done" }\n\n'
+    set_fake(monkeypatch, write_script(tmp_path, {"report_text": text}))
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    cap = (hub / ".helios" / "runs" / "b1" / "attempt-1" / "report.json").read_bytes()
+    assert rc == 0 and cap == text.encode()
+
+
+def test_captured_native_choice_is_dumps(tmp_path: Path, monkeypatch) -> None:
+    from helios.harness import fake as fake_mod
+    from helios.harness.base import NativeResult
+
+    hub = make_hub(tmp_path)
+    native = {"status": "done", "summary": "native"}
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "file"}}))
+    monkeypatch.setattr(
+        fake_mod.FakeHarness, "parse", lambda self, spec, code, path: NativeResult(
+            session_id="s1", structured=dict(native)))
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    real_wb = beads_mod.apply_writeback
+
+    def boom(*a, **k):
+        raise RuntimeError("bd died")
+
+    monkeypatch.setattr(beads_mod, "apply_writeback", boom)
+    with pytest.raises(RuntimeError):
+        run_mod.run_one("b1", hub=hub, beads=beads,
+                        config=config_mod.load(hub), harness_override="fake")
+    cap = (hub / ".helios" / "runs" / "b1" / "attempt-1" / "report.json").read_bytes()
+    assert json.loads(cap) == native
+    assert cap == (json.dumps(native, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
+    monkeypatch.setattr(beads_mod, "apply_writeback", real_wb)
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    assert rc == 0
+    assert read_envelope(hub, "b1", 1)["report"]["summary"] == "native"
+
+
+def test_state_survives_two_resumes(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}, "session_id": "s7"}))
+    count = {"n": 0}
+    real_wb = beads_mod.apply_writeback
+
+    def boom(*a, **k):
+        if count["n"] < 2:
+            count["n"] += 1
+            raise RuntimeError("bd died")
+        return real_wb(*a, **k)
+
+    monkeypatch.setattr(beads_mod, "apply_writeback", boom)
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="impl", files=["src/b1/"],
+        test="mkdir -p src/b1 && echo y > src/b1/y")])
+    seen = []
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            run_mod.run_one("b1", hub=hub, beads=beads,
+                            config=config_mod.load(hub), harness_override="fake")
+        st = attempt_mod.read_state(hub / ".helios" / "runs" / "b1" / "attempt-1")
+        seen.append(st["execution_status"])
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    assert rc == 0 and seen == ["completed", "completed"]
+    assert attempt_mod.existing_attempts(hub / ".helios" / "runs" / "b1") == [1]
+    assert attempt_mod.read_state(
+        hub / ".helios" / "runs" / "b1" / "attempt-1")["execution_status"] == "completed"
+
+
+def test_transition_keeps_keys() -> None:
+    import tempfile as _tf
+
+    with _tf.TemporaryDirectory() as tmp:
+        d = Path(tmp) / "b" / "attempt-1"
+        attempt_mod.write_state(d, attempt_id="b#1", state="launched", pid=4242,
+                                session_id="s9", execution_status=None)
+        attempt_mod.transition(d, "native_completed", execution_status="completed")
+        attempt_mod.transition(d, "validated")
+        attempt_mod.transition(d, "finalized")
+        log = [json.loads(x) for x in (d / "state.log").read_text().splitlines()]
+    assert all(set(x) == {"state", "attempt_id", "pid", "session_id",
+                          "execution_status", "updated"} for x in log)
+    assert [x["execution_status"] for x in log] == [None, "completed", "completed", "completed"]
+
+
+@pytest.mark.parametrize("variant", ["nostate", "empty", "truncated", "array", "no_state_key"])
+def test_damaged_state_json_recovers(tmp_path: Path, monkeypatch, variant: str) -> None:
+    hub = make_hub(tmp_path)
+    info = worktree_mod.prepare(hub=hub, bead="b1")
+    d = hub / ".helios" / "runs" / "b1" / "attempt-1"
+    d.mkdir(parents=True)
+    if variant == "empty":
+        (d / "state.json").write_text("")
+    elif variant == "truncated":
+        (d / "state.json").write_text('{"state": "laun')
+    elif variant == "array":
+        (d / "state.json").write_text("[]")
+    elif variant == "no_state_key":
+        (d / "state.json").write_text('{"pid": 1}')
+    _ = info
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "done", "summary": "s"}}))
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    assert rc == 0, variant
+    assert attempt_mod.existing_attempts(hub / ".helios" / "runs" / "b1") == [1, 2], variant
+    log = [json.loads(line)["state"] for line in
+           (d / "state.log").read_text().splitlines()]
+    assert log == ["crashed", "finalized"], variant
+    assert read_envelope(hub, "b1", 2)["execution_status"] == "completed", variant
+
+
+@pytest.mark.parametrize("variant", ["nostate", "empty", "truncated", "array", "no_state_key"])
+def test_damaged_state_json_dry_run(tmp_path: Path, monkeypatch, capsys, variant: str) -> None:
+    hub = make_hub(tmp_path)
+    worktree_mod.prepare(hub=hub, bead="b1")
+    d = hub / ".helios" / "runs" / "b1" / "attempt-1"
+    d.mkdir(parents=True)
+    if variant == "empty":
+        (d / "state.json").write_text("")
+    elif variant == "truncated":
+        (d / "state.json").write_text('{"state": "laun')
+    elif variant == "array":
+        (d / "state.json").write_text("[]")
+    elif variant == "no_state_key":
+        (d / "state.json").write_text('{"pid": 1}')
+    before = {str(p.relative_to(hub)) for p in hub.rglob("*")}
+    set_fake(monkeypatch, write_script(tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    rc = run_mod.run_many(["b1"], hub=hub, beads=beads,
+                          config=config_mod.load(hub), harness_override="fake",
+                          dry_run=True)
+    out = capsys.readouterr().out
+    after = {str(p.relative_to(hub)) for p in hub.rglob("*")}
+    assert rc == 0 and "recovery:" in out, variant
+    assert before == after and beads.argv_log == [], variant
+
+
+def test_closed_bead_is_preflight_error(tmp_path: Path, monkeypatch, capsys) -> None:
+    hub = make_hub(tmp_path)
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    closed = make_bead("b1")
+    closed.status = "closed"
+    beads = beads_mod.FakeBeads([closed])
+    assert run_mod.run_many(["b1"], hub=hub, beads=beads,
+                            config=config_mod.load(hub),
+                            harness_override="fake") == 2
+    assert not (hub / ".helios" / "runs").exists()
+    assert not (hub / ".claude" / "worktrees").exists()
+    beads2 = beads_mod.FakeBeads([closed])
+    assert run_mod.run_one("b1", hub=hub, beads=beads2,
+                           config=config_mod.load(hub),
+                           harness_override="fake", dry_run=True) == 2
+
+
+def test_handler_takes_no_lock() -> None:
+    import signal as _signal
+
+    prev = _signal.getsignal(_signal.SIGINT)
+    _signal.signal(_signal.SIGINT, run_mod._handle_sigint)
+    try:
+        with run_mod._RUNNING_LOCK:
+            with run_mod._RUN_DEPTH_LOCK:
+                os.kill(os.getpid(), _signal.SIGINT)
+        assert run_mod._INTERRUPT.is_set()
+    finally:
+        _signal.signal(_signal.SIGINT, prev)
+        run_mod._INTERRUPT.clear()
+
+
+def test_install_handler_only_main_thread() -> None:
+    box: dict = {}
+    thread = __import__("threading").Thread(
+        target=lambda: box.update(ok=run_mod._install_handler()))
+    thread.start()
+    thread.join()
+    assert box["ok"] is False
+
+
+def test_sigint_storm_launch(tmp_path: Path) -> None:
+    import threading as _threading
+
+    hub = make_hub(tmp_path)
+    script = write_script(
+        tmp_path, {"sleep_s": 20, "stdout": "slow", "session_id": "s1",
+                   "report": {"status": "done", "summary": "ok"}})
+    proc = spawn_child(hub, script, "b1,b2,b3", maxp=3)
+    for bid in ("b1", "b2", "b3"):
+        wait_for(hub / ".helios" / "runs" / bid / "attempt-1" / "stdout.jsonl", "slow")
+    def storm() -> None:
+        for _ in range(10):
+            try:
+                os.kill(proc.pid, signal.SIGINT)
+            except ProcessLookupError:
+                return
+            time.sleep(0.005)
+    worker = _threading.Thread(target=storm)
+    worker.start()
+    out, _ = proc.communicate(timeout=90)
+    worker.join()
+    assert proc.returncode == 4
+    for bid in ("b1", "b2", "b3"):
+        a1 = hub / ".helios" / "runs" / bid / "attempt-1"
+        assert attempt_mod.read_state(a1)["state"] == "finalized"
+        assert read_envelope(hub, bid, 1)["execution_status"] == "interrupted"
+        assert not attempt_mod.is_pid_alive(attempt_mod.read_state(a1).get("pid"))
+    assert run_mod._RUN_DEPTH == 0
+    assert not [t for t in _threading.enumerate()
+                if "_stopper_main" in t.name and t.is_alive()]
+    _ = out
+
+
+def test_session_survives_crash_before_envelope(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import helios.ownership as _own
+
+    hub = make_hub(tmp_path)
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}, "session_id": "s7"}))
+    real = _own.check
+
+    def boom(*a, **k):
+        raise RuntimeError("check died")
+
+    monkeypatch.setattr(_own, "check", boom)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    with pytest.raises(RuntimeError):
+        run_mod.run_one("b1", hub=hub, beads=beads,
+                        config=config_mod.load(hub), harness_override="fake")
+    monkeypatch.setattr(_own, "check", real)
+    assert attempt_mod.read_state(
+        hub / ".helios" / "runs" / "b1" / "attempt-1")["session_id"] == "s7"
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    assert rc == 0
+    assert read_envelope(hub, "b1", 1)["session_id"] == "s7"
+    assert beads.beads["b1"].metadata["session"] == "fake:s7"
 
 
 def test_lock_refusal_second_process(tmp_path: Path) -> None:
