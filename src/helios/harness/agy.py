@@ -1,0 +1,92 @@
+"""Antigravity CLI harness adapter (SPEC §6.3)."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from helios.harness.base import Harness, LaunchSpec, NativeResult
+
+
+class AgyAdapter(Harness):
+    """Adapter for the Antigravity CLI (SPEC §6.3)."""
+
+    name = "agy"
+
+    def argv(self, spec: LaunchSpec) -> list[str]:
+        """Build argv for a fresh or resumed turn (SPEC §6.3)."""
+        out = [
+            "agy",
+            "--output-format",
+            "json",
+            "--json-schema",
+            str(spec.report_schema_path),
+            "--dangerously-skip-permissions",
+        ]
+        if spec.model:
+            out += ["--model", spec.model]
+        if spec.effort:
+            out += ["--effort", spec.effort]
+        if spec.resume_session:
+            out += ["--conversation", spec.resume_session]
+        out += list(spec.extra_args)
+        out += ["-p", spec.prompt]
+        return out
+
+    def stdin_text(self, spec: LaunchSpec) -> str | None:
+        """The prompt travels in argv for agy (SPEC §6.3)."""
+        return None
+
+    def parse(
+        self, spec: LaunchSpec, exit_code: int | None, stdout_path: Path
+    ) -> NativeResult:
+        """Parse the single JSON object stdout (SPEC §6.4)."""
+        try:
+            text = stdout_path.read_text()
+        except OSError:
+            return NativeResult(session_id=None, structured=None, native_error="no stdout")
+        try:
+            obj = json.loads(text.strip())
+        except Exception:
+            return NativeResult(session_id=None, structured=None, native_error="invalid JSON")
+        if not isinstance(obj, dict):
+            return NativeResult(session_id=None, structured=None, native_error="invalid JSON")
+        session_id = obj.get("conversation_id")
+        if not isinstance(session_id, str) or not session_id:
+            session_id = None
+        if obj.get("status") != "SUCCESS" or _exit_failed(exit_code):
+            error = obj.get("error")
+            if not isinstance(error, str) or not error:
+                error = _exit_or_incomplete(exit_code)
+            return NativeResult(
+                session_id=session_id, structured=None, native_error=error
+            )
+        structured: dict[str, Any] | None = obj.get("structured_output")
+        if structured is None:
+            return NativeResult(
+                session_id=session_id,
+                structured=None,
+                notes=("no structured result",),
+            )
+        if not isinstance(structured, dict):
+            return NativeResult(
+                session_id=session_id,
+                structured=None,
+                notes=("structured result is not a JSON object",),
+            )
+        return NativeResult(session_id=session_id, structured=structured)
+
+    def attach_command(self, session_id: str, spec: LaunchSpec) -> list[str]:
+        """Return the argv that reopens this session (SPEC §6.3)."""
+        return ["agy", "--conversation", session_id]
+
+
+def _exit_failed(exit_code: int | None) -> bool:
+    return isinstance(exit_code, int) and exit_code != 0
+
+
+def _exit_or_incomplete(exit_code: int | None) -> str:
+    if _exit_failed(exit_code):
+        return f"exit code {exit_code}"
+    return "turn did not complete"
