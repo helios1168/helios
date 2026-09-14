@@ -888,7 +888,7 @@ nonzero, else 4.
 - `helios next [<unit>]` runs the first candidate whose kind is not in `control.stop_at`
   (`helios run`, §7.1) and prints one line from its envelope:
   `<attempt_id>\t<execution_status>\t<status or ->\t<verdict or ->\t<summary or ->`. With no
-  such candidate it prints `no ready bead` to stderr and exits 3. Otherwise it exits with the
+  such candidate it prints `helios: no ready bead` to stderr and exits 3. Otherwise it exits with the
   run's code, or per the execution failure rule above.
 - `helios unit run <unit> [--until <stage>]` loops. Each round takes the first candidate,
   `stop_at` kinds included. It stops before running that candidate when its kind is in
@@ -1138,7 +1138,7 @@ an import failure (§2.3). A record's module is the `__name__` of the module-lev
 called `claim(...)` (walk outward from the call to the first frame whose code name is
 `<module>`; with none found, the direct caller's `f_globals["__name__"]`), never
 `func.__module__`, `__qualname__`, `co_firstlineno` or `repr`. A record is keyed by (module,
-claim name); registering the same key again replaces the record. Before importing the
+claim name). Before importing the
 configured module, helios removes it and every module under its package prefix from
 `sys.modules` and clears the registry, so collection sees exactly one import pass; the runner
 does the same in its own process. Collection keeps records whose module is the configured module
