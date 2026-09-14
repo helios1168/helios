@@ -26,7 +26,21 @@ HashFunction = Callable[[Bead], dict[str, str]]
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+    """Run git, decoding stdout/stderr as UTF-8 with `surrogateescape`, by hand
+    from raw bytes rather than through a text-mode pipe.
+
+    A manual decode never raises `UnicodeDecodeError` on a non-UTF-8 path or
+    message (SPEC 12 item 2), and, unlike `subprocess.run(text=True)`, never
+    translates a `\\r\\n` in the output: `.encode("utf-8", "surrogateescape")`
+    recovers the exact original bytes, which the patch-id pipeline (item 1) needs.
+    """
+    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=False)
+    return subprocess.CompletedProcess(
+        proc.args,
+        proc.returncode,
+        proc.stdout.decode("utf-8", "surrogateescape"),
+        proc.stderr.decode("utf-8", "surrogateescape"),
+    )
 
 
 def _git_output(cwd: Path, *args: str) -> str:
@@ -172,42 +186,50 @@ def _remove_worktree(hub: Path, path: Path, branch: str) -> None:
 
 
 def _non_merge_patch_ids(cwd: Path, base: str, tip: str) -> list[str] | None:
-    """`git patch-id --stable` of each non-merge commit in `base..tip`, oldest first.
+    """`git patch-id --verbatim` of each non-merge commit in `base..tip`, oldest first.
 
-    `None` when a merge commit sits in that range: a verified commit or its rebase
-    never contains one (SPEC 12 item 8).
+    Computed from raw bytes (`--verbatim`, no text decoding), never from git's own
+    whitespace-blind `--stable` mode, so a whitespace-only edit is not silently
+    ignored (SPEC 12 item 1). `None` when a merge commit sits in the range: a
+    verified commit or its rebase never contains one (SPEC 12 item 8).
     """
     if _git_output(cwd, "rev-list", "--min-parents=2", f"{base}..{tip}"):
         return None
     commits = _git_output(cwd, "rev-list", "--reverse", f"{base}..{tip}")
     ids = []
     for commit in commits.splitlines() if commits else []:
-        patch = _git(cwd, "show", commit)
+        patch = _git(cwd, "show", "--binary", "--no-textconv", "--no-ext-diff", "--no-color", "--format=", commit)
         if patch.returncode:
             raise MergeError(patch.stderr.strip() or f"git show {commit} failed", 4)
+        # `_git` decodes with `surrogateescape`; re-encoding the same way recovers
+        # the exact original bytes for `--verbatim`, which reads raw diff bytes.
+        patch_bytes = patch.stdout.encode("utf-8", "surrogateescape")
         patch_id = subprocess.run(
-            ["git", "patch-id", "--stable"],
-            cwd=cwd,
-            input=patch.stdout,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            check=False,
+            ["git", "patch-id", "--verbatim"], cwd=cwd, input=patch_bytes, capture_output=True, check=False
         )
         if patch_id.returncode:
-            raise MergeError(patch_id.stderr.strip() or "git patch-id failed", 4)
-        ids.append(patch_id.stdout.split()[0] if patch_id.stdout.split() else "")
+            raise MergeError(
+                patch_id.stderr.decode("utf-8", "surrogateescape").strip() or "git patch-id failed", 4
+            )
+        fields = patch_id.stdout.split()
+        ids.append(fields[0].decode("ascii") if fields else "")
     return ids
 
 
 def _is_verified_commit(hub: Path, head: str, output_commit: str) -> bool:
     """True when `head` is `output_commit` rebased: the same non-merge commits, in
-    order, by patch-id, since diverging from main (SPEC 12 item 8)."""
-    head_base = _git_output(hub, "merge-base", head, "main")
+    order, by patch-id, since diverging from main (SPEC 12 item 8).
+
+    An empty verified range (`output_commit` already on main) never passes here:
+    equality with `output_commit` is the only acceptance route in that case (item 3).
+    """
     output_base = _git_output(hub, "merge-base", output_commit, "main")
-    head_ids = _non_merge_patch_ids(hub, head_base, head)
     output_ids = _non_merge_patch_ids(hub, output_base, output_commit)
-    return head_ids is not None and head_ids == output_ids
+    if not output_ids:
+        return False
+    head_base = _git_output(hub, "merge-base", head, "main")
+    head_ids = _non_merge_patch_ids(hub, head_base, head)
+    return head_ids == output_ids
 
 
 def _finish_step7(
@@ -307,6 +329,8 @@ def merge_bead(
             raise MergeError(f"worktree is not on branch {branch}")
         head = _git_output(worktree, "rev-parse", "HEAD")
         output_commit = str(bead.metadata.get("output_commit"))
+        if _git(hub, "cat-file", "-e", f"{output_commit}^{{commit}}").returncode != 0:
+            raise MergeError(f"verified output_commit {output_commit} is not a commit")
         if head != output_commit and not _is_verified_commit(hub, head, output_commit):
             raise MergeError(f"worktree HEAD {head} is not the verified output_commit {output_commit}")
         # Diff against the merge base, falling back to git's well-known empty tree

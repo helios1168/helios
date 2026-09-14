@@ -1101,6 +1101,177 @@ def test_clean_does_not_ignore_a_change_to_a_path_named_dot_beads_itself(tmp_pat
     assert merge_module._clean(hub, ignore_beads=True) is False
 
 
+# ---------------------------------------------------------------- h3c-fix5 item 1:
+# patch-id is computed from bytes (--verbatim), never --stable, so a
+# whitespace-only edit is a different, unverified commit.
+
+
+def _repo_for_patch_id(tmp_path: Path, content: str) -> tuple[Path, Path]:
+    hub = tmp_path / "repo"
+    hub.mkdir(parents=True)
+    _git(hub, "init", "-b", "main")
+    _git(hub, "config", "user.email", "test@example.com")
+    _git(hub, "config", "user.name", "Test")
+    (hub / "value.txt").write_text("base\n")
+    (hub / ".beads").mkdir()
+    (hub / ".beads" / "issues.jsonl").write_text("{}\n")
+    _git(hub, "add", ".")
+    _git(hub, "commit", "-m", "base")
+    worktree = tmp_path / "worktree" / "b1"
+    worktree.parent.mkdir()
+    _git(hub, "worktree", "add", "-b", "worktree-b1", str(worktree), "main")
+    (worktree / "value.txt").write_text(content)
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "change")
+    return hub, worktree
+
+
+WHITESPACE_VARIANTS = {
+    "indent": ("def f():\n    return 1\n", "def f():\n        return 1\n"),
+    "inside-string": ('x = "a b"\n', 'x = "a  b"\n'),
+    "makefile-tab": ("target:\n\tcommand\n", "target:\n    command\n"),
+    "trailing-space": ("line\n", "line \n"),
+    "crlf": ("line\n", "line\r\n"),
+}
+
+
+@pytest.mark.parametrize("variant", list(WHITESPACE_VARIANTS))
+def test_whitespace_only_edit_refuses_fresh_and_after_check_failure(tmp_path: Path, variant: str) -> None:
+    original, edited = WHITESPACE_VARIANTS[variant]
+
+    hub, worktree = _repo_for_patch_id(tmp_path / "fresh", original)
+    beads = _beads(hub, worktree)
+    (worktree / "value.txt").write_text(edited)
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "--amend", "--no-edit")
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value).startswith("worktree HEAD")
+
+    hub2, worktree2 = _repo_for_patch_id(tmp_path / "after-exit5", original)
+    beads2 = _beads(hub2, worktree2)
+    with pytest.raises(MergeError) as check_error:
+        _run(beads2, hub2, runner=lambda _c, _w: 1)
+    assert check_error.value.code == 5
+    (worktree2 / "value.txt").write_text(edited)
+    _git(worktree2, "add", ".")
+    _git(worktree2, "commit", "--amend", "--no-edit")
+    with pytest.raises(MergeError) as error2:
+        _run(beads2, hub2)
+    assert error2.value.code == 2
+    assert str(error2.value).startswith("worktree HEAD")
+
+
+def test_identical_recommit_still_merges(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    _git(worktree, "commit", "--amend", "--no-edit")
+    assert _run(beads, hub) == (0, "merged")
+
+
+def test_hand_rebase_onto_newer_main_still_merges(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    (hub / "other.txt").write_text("other\n")
+    _git(hub, "add", "other.txt")
+    _git(hub, "commit", "-m", "advance main")
+    _git(worktree, "rebase", "main")
+    assert _run(beads, hub) == (0, "merged")
+
+
+# ---------------------------------------------------------------- h3c-fix5 item 2:
+# no `_git` call raises UnicodeDecodeError.
+
+
+def test_non_utf8_file_in_verified_commit_merges_after_check_failure_and_main_ahead(
+    tmp_path: Path,
+) -> None:
+    hub, worktree = _repo(tmp_path)
+    (worktree / "binary.dat").write_bytes(b"caf\xe9")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "binary content")
+    beads = _beads(hub, worktree)
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub, runner=lambda _c, _w: 1)
+    assert error.value.code == 5
+    (hub / "ahead.txt").write_text("ahead\n")
+    _git(hub, "add", "ahead.txt")
+    _git(hub, "commit", "-m", "main ahead")
+    assert _run(beads, hub) == (0, "merged")
+
+
+def test_non_utf8_filename_does_not_crash_clean_check_or_beads_diff(tmp_path: Path, monkeypatch) -> None:
+    """This host's filesystem (APFS) rejects a non-UTF-8 name outright, so this
+    feeds `_clean` and the branch-diff path list the surrogate-escaped text a real
+    non-UTF-8 filename decodes to (via `_git`'s own `errors="surrogateescape"`),
+    and checks neither raises."""
+    import helios.merge as merge_module
+
+    odd_name = b"weird-\xe9.txt".decode("utf-8", "surrogateescape")
+
+    def fake_status(_cwd: Path, *args: str):
+        return subprocess.CompletedProcess(["git", *args], 0, f" M {odd_name}\0", "")
+
+    monkeypatch.setattr(merge_module, "_git", fake_status)
+    assert merge_module._clean(tmp_path, ignore_beads=False) is False
+
+    def fake_diff(_cwd: Path, *args: str):
+        return subprocess.CompletedProcess(["git", *args], 0, f"{odd_name}\n", "")
+
+    monkeypatch.setattr(merge_module, "_git", fake_diff)
+    assert merge_module._git_output(tmp_path, "diff").splitlines() == [odd_name]
+
+
+# ---------------------------------------------------------------- h3c-fix5 item 3:
+# an empty verified range never passes the patch-id comparison.
+
+
+def test_empty_verified_range_refuses(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    assert _run(beads, hub) == (0, "merged")
+    first_merge_commit = beads.beads["b1"].metadata["merge_commit"]
+
+    _git(hub, "worktree", "add", str(worktree), "-b", "worktree-b1", "main")
+    (worktree / "second.txt").write_text("second\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "second change")
+    new_head = _git(worktree, "rev-parse", "HEAD")
+
+    # A stale output_commit that is already on main, not the branch's actual
+    # (unverified) tip: merge-base(output_commit, main)..output_commit is empty.
+    beads.beads["b1"].metadata["output_commit"] = first_merge_commit
+    envelope_path = hub / ".helios" / "runs" / "v1" / "attempt-1" / "envelope.json"
+    payload = Envelope.model_validate_json(envelope_path.read_text()).model_copy(
+        update={"base_commit": first_merge_commit}
+    )
+    envelope_path.write_text(payload.model_dump_json())
+
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == f"worktree HEAD {new_head} is not the verified output_commit {first_merge_commit}"
+
+
+# ---------------------------------------------------------------- h3c-fix5 item 4:
+# a missing output_commit object refuses before any merge-base call.
+
+
+def test_missing_output_commit_object_refuses(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    missing = "0" * 40
+    beads.beads["b1"].metadata["output_commit"] = missing
+    envelope_path = hub / ".helios" / "runs" / "v1" / "attempt-1" / "envelope.json"
+    payload = Envelope.model_validate_json(envelope_path.read_text()).model_copy(update={"base_commit": missing})
+    envelope_path.write_text(payload.model_dump_json())
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == f"verified output_commit {missing} is not a commit"
+
+
 BD = shutil.which("bd")
 
 

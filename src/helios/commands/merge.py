@@ -20,8 +20,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def _print_error(message: str) -> None:
-    """Print every line of `message` to stderr, each prefixed ``helios: `` (SPEC 12 item 4)."""
-    for line in message.splitlines() or [message]:
+    """Print every line of `message` to stderr, each prefixed ``helios: `` (SPEC 12 item 4).
+
+    `message` may carry surrogate-escaped bytes from git output (SPEC 12 item 2); a
+    round trip through `backslashreplace` turns those into plain, printable text.
+    """
+    safe = message.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+    for line in safe.splitlines() or [safe]:
         print(f"helios: {line}", file=sys.stderr)
 
 
