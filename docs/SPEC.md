@@ -703,9 +703,10 @@ exit 2, before any filesystem or `bd` access.
   (`<harness>:<session_id>` when `harness` is a string, else `-`).
   Text output is tab-separated with that header line; `state` shows the stored state, plus
   ` (dead)` when the state is `launched` and the pid is not alive. Each field of a text row is
-  rendered by replacing `\` with `\\`, tab with `\t`, LF with `\n`, CR with `\r`, `\x0b` with
-  `\\x0b`, `\x0c` with `\\x0c`, `\x1c` with `\\x1c`, `\x1d` with `\\x1d`, `\x1e` with `\\x1e`,
-  `\x85` with `\\x85`, U+2028 with `\\u2028` and U+2029 with `\\u2029`, then encoding as
+  rendered by replacing `\` with `\\`, tab with `\t`, LF with `\n`, CR with `\r`, and each of the
+  characters U+000B, U+000C, U+001C, U+001D, U+001E, U+0085, U+2028 and U+2029 with its escape
+  text (one backslash, then `x0b`, `x0c`, `x1c`, `x1d`, `x1e`, `x85`, `u2028` or `u2029`), then
+  encoding as
   `sys.stdout.encoding` (utf-8 when unset) with `backslashreplace` and decoding back, so a row is
   always exactly one line with the header's column count; `--json` is unaffected, since
   `json.dumps` already escapes. The
