@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import shutil
 import subprocess
@@ -33,7 +32,7 @@ def sample_header(**extra: Any) -> dict[str, Any]:
     return header
 
 
-def canon(key: str, header: dict[str, Any], body: str) -> bytes:
+def canon(header: dict[str, Any], body: str) -> bytes:
     return mem.serialize(header, body).encode("utf-8")
 
 
@@ -46,9 +45,10 @@ def canon(key: str, header: dict[str, Any], body: str) -> bytes:
     body=st.text(alphabet=st.characters(codec=None, blacklist_categories=())),
 )
 def test_format_inverse_any_text(header: dict[str, Any], body: str) -> None:
-    text = mem.serialize(header, body)
+    full = {**header, "status": "active"}
+    text = mem.serialize(full, body)
     parsed = mem.parse("k", text)
-    assert (parsed.header, parsed.body) == (header, body)
+    assert (parsed.header, parsed.body) == (full, body)
     assert mem.serialize(parsed.header, parsed.body) == text
 
 
@@ -58,15 +58,19 @@ def test_format_inverse_any_text(header: dict[str, Any], body: str) -> None:
      "helios-memory 1\n{}\n\n", "y" * 1_000_000],
 )
 def test_format_inverse_edges(body: str) -> None:
-    parsed = mem.parse("k", mem.serialize({"source": "s"}, body))
+    parsed = mem.parse("k", mem.serialize({"source": "s", "status": "active"}, body))
     assert parsed.body == body
 
 
-def test_nan_inf_header_bytes_stable() -> None:
-    text = mem.serialize({"source": "s", "n": float("nan"), "i": 1e400}, "b")
-    parsed = mem.parse("k", text)
-    assert math.isnan(parsed.header["n"]) and parsed.header["i"] == float("inf")
-    assert mem.serialize(parsed.header, parsed.body) == text
+def test_nonfinite_header_refused() -> None:
+    with pytest.raises(ValueError):
+        mem.serialize({"source": "s", "n": float("nan")}, "b")
+    with pytest.raises(ValueError):
+        mem.serialize({"source": "s", "i": float("inf")}, "b")
+    for raw in ("NaN", "Infinity", "-Infinity"):
+        with pytest.raises(ValueError) as excinfo:
+            mem.parse("nan-key", f'helios-memory 1\n{{"n": {raw}, "source": "s"}}\n\nb')
+        assert "nan-key" in str(excinfo.value)
 
 
 def test_format_line2_is_sorted_json_with_default_separators() -> None:
@@ -95,6 +99,7 @@ def test_format_line2_is_sorted_json_with_default_separators() -> None:
         "helios-memory 1\n{}\r\n\nb",
         "helios-memory 1\n{} \n\nb",
         'helios-memory 1\n{"a":1}\n\nb',
+        'helios-memory 1\n{"source": "s"}\n\nb',
         'helios-memory 1\n{"b": 1, "a": 2}\n\nb',
         'helios-memory 1\n{"a": 1, "a": 2}\n\nb',
         'helios-memory 1\n{"a": "\\u00e9"}\n\nb',
@@ -118,7 +123,8 @@ def test_format_malformed_prefix_raises_naming_key(text: str) -> None:
 # 2) Key rule and every write refusal.
 
 
-@pytest.mark.parametrize("key", ["a", "a0", "k.e-y_z", "0abc", "a.", "a..", "a.md"])
+@pytest.mark.parametrize("key", ["a", "a0", "k.e-y_z", "0abc", "a.", "a..", "a.md",
+                                 "a..b", "0", "a_b-c.d", "schema-version"])
 def test_key_rule_accepts(tmp_path: Path, key: str) -> None:
     backend = files_backend(tmp_path)
     backend.write(key, sample_header(), "body")
@@ -140,7 +146,7 @@ def test_key_rule_length_boundary(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "key",
     ["a\n", "abc\n", "Key", "A", ".", "..", "a/b", "a\\b", "", " a", "a ",
-     "é", "ａ", "٣", "-a", ".a", "_a", "a*", "x" * 201],
+     "é", "ａ", "٣", "-a", ".a", "_a", "a*", "x" * 201, "schema_version"],
 )
 def test_key_rule_rejects(tmp_path: Path, key: str) -> None:
     backend = files_backend(tmp_path)
@@ -294,7 +300,7 @@ def test_files_backend_exact_bytes_and_missing_key(tmp_path: Path) -> None:
     header = sample_header(status="active", unit="U14")
     backend.write("m1", header, "line1\nline2\n")
     path = tmp_path / "store" / "m1.md"
-    assert path.read_bytes() == canon("m1", header, "line1\nline2\n")
+    assert path.read_bytes() == canon(header, "line1\nline2\n")
     assert backend.read("m1") == mem.Memory(key="m1", header={**header}, body="line1\nline2\n")
     with pytest.raises(KeyError):
         backend.read("nope")
@@ -308,7 +314,7 @@ def test_files_export_import_round_trip_byte_for_byte(tmp_path: Path) -> None:
     dir_a = tmp_path / "a"
     backend.export(dir_a)
     assert sorted(p.name for p in dir_a.iterdir()) == ["a.md", "b.md", "c.md"]
-    (dir_a / "extra.md").write_bytes(canon("extra", {"source": "x#1", "status": "active"}, "kept"))
+    (dir_a / "extra.md").write_bytes(canon({"source": "x#1", "status": "active"}, "kept"))
     backend.export(dir_a)  # never deletes files
     assert (dir_a / "extra.md").is_file()
 
@@ -360,7 +366,7 @@ def test_files_tree_round_trip_bounded(tmp_path: Path) -> None:
 def test_import_canonical_file_is_byte_for_byte(tmp_path: Path) -> None:
     src = tmp_path / "src"
     src.mkdir()
-    raw = canon("k", {"source": "s", "status": "active"}, "b")
+    raw = canon({"source": "s", "status": "active"}, "b")
     (src / "k.md").write_bytes(raw)
     backend = files_backend(tmp_path)
     backend.import_(src)
@@ -394,11 +400,11 @@ def test_import_order_and_scope(tmp_path: Path) -> None:
     src = tmp_path / "src"
     src.mkdir()
     for name in ["b", "a", "a.b", "a-b"]:
-        (src / f"{name}.md").write_bytes(canon(name, {"source": "s", "status": "active"}, name))
+        (src / f"{name}.md").write_bytes(canon({"source": "s", "status": "active"}, name))
     (src / "dir.md").mkdir()
-    (src / "dir.md" / "inner.md").write_bytes(canon("inner", {"source": "s"}, "i"))
+    (src / "dir.md" / "inner.md").write_bytes(canon({"source": "s"}, "i"))
     (src / "broken.md").symlink_to(tmp_path / "nowhere.md")
-    (src / "x.MD").write_bytes(canon("x", {"source": "s"}, "x"))
+    (src / "x.MD").write_bytes(canon({"source": "s"}, "x"))
     (src / "y.md.txt").write_bytes(b"junk")
     (src / ".hidden.md").write_bytes(b"junk")
     order: list[str] = []
@@ -415,8 +421,8 @@ def test_import_order_and_scope(tmp_path: Path) -> None:
 def test_import_bad_file_writes_nothing(tmp_path: Path) -> None:
     src = tmp_path / "src"
     src.mkdir()
-    (src / "a.md").write_bytes(canon("a", {"source": "s", "status": "active"}, "a"))
-    (src / "z.md").write_bytes(canon("z", {"source": "s", "status": "active"}, "z"))
+    (src / "a.md").write_bytes(canon({"source": "s", "status": "active"}, "a"))
+    (src / "z.md").write_bytes(canon({"source": "s", "status": "active"}, "z"))
     (src / "_draft.md").write_bytes(b"helios-memory 1\n{}\n\n")
     backend = files_backend(tmp_path)
     with pytest.raises(ValueError) as excinfo:
@@ -437,11 +443,11 @@ def test_import_non_utf8_names_key(tmp_path: Path) -> None:
 def test_import_ignores_subdirs_and_non_md(tmp_path: Path) -> None:
     src = tmp_path / "src"
     src.mkdir()
-    (src / "ok.md").write_bytes(canon("ok", {"source": "s#1", "status": "active"}, "ok"))
+    (src / "ok.md").write_bytes(canon({"source": "s#1", "status": "active"}, "ok"))
     (src / "notes.txt").write_text("not a memory")
     sub = src / "sub"
     sub.mkdir()
-    (sub / "inner.md").write_bytes(canon("inner", {"source": "s#1", "status": "active"}, "i"))
+    (sub / "inner.md").write_bytes(canon({"source": "s#1", "status": "active"}, "i"))
     backend = files_backend(tmp_path)
     backend.import_(src)
     assert backend.read("ok").body == "ok"
@@ -526,7 +532,7 @@ def test_beads_write_calls_bd_before_export_file(tmp_path: Path) -> None:
     backend = mem.BeadsBackend(fake, export_dir)
     backend.write(KEY, H, "b")
     stored = fake.recall(KEY)
-    assert stored == canon(KEY, {"source": "hel-a02#1", "status": "active"}, "b").decode()
+    assert stored == canon({"source": "hel-a02#1", "status": "active"}, "b").decode()
     assert stored is not None
     assert (export_dir / f"{KEY}.md").read_bytes() == stored.encode()
 
@@ -567,10 +573,10 @@ def test_crash_between_bd_and_file(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     monkeypatch.undo()
     assert backend.read("k").body == "v2"
     assert (tmp_path / "e" / "k.md").read_bytes() != canon(
-        "k", {**H, "status": "active"}, "v2"
+        {**H, "status": "active"}, "v2"
     )
     backend.export(tmp_path / "e")  # healing export into export_dir
-    assert (tmp_path / "e" / "k.md").read_bytes() == canon("k", {**H, "status": "active"}, "v2")
+    assert (tmp_path / "e" / "k.md").read_bytes() == canon({**H, "status": "active"}, "v2")
     assert [p.name for p in (tmp_path / "e").iterdir()] == ["k.md"]
 
 
@@ -594,12 +600,17 @@ def test_beads_export_skips_non_memory_values_on_stderr(
     assert "junk" in capsys.readouterr().err
 
 
-def test_beads_schema_version_key_fake(tmp_path: Path) -> None:
+def test_schema_version_key_refused_everywhere(tmp_path: Path) -> None:
+    """bd hides schema_version from bd memories, so the key rule refuses it."""
     fake = FakeBeads()
-    backend = mem.BeadsBackend(fake, tmp_path / "e")
-    backend.write("schema_version", H, "b")
-    backend.export(tmp_path / "o")
-    assert (tmp_path / "o" / "schema_version.md").exists()
+    for backend in (files_backend(tmp_path), mem.BeadsBackend(fake, tmp_path / "e")):
+        with pytest.raises(ValueError) as excinfo:
+            backend.write("schema_version", H, "b")
+        assert "schema_version" in str(excinfo.value)
+        with pytest.raises(ValueError):
+            backend.read("schema_version")
+    assert fake.argv_log == []
+    assert not (tmp_path / "store").exists() and not (tmp_path / "e").exists()
 
 
 BD = shutil.which("bd")
@@ -748,3 +759,509 @@ def test_open_backend_loaded_config(tmp_path: Path) -> None:
         with pytest.raises(ValueError) as excinfo:
             mem.open_backend(Config(hub=tmp_path, memory=MemoryConfig(backend=bad)))
         assert str(excinfo.value) == f"unknown memory backend '{bad}'"
+
+
+# Round 2: keys on both backends, nothing written on refusal.
+
+
+@pytest.mark.parametrize("key", ["x" * 201, "-a", ".a", "_a", "a\n", "A", "a b", "é", "a/b", ""])
+def test_key_rejected_nothing_written(tmp_path: Path, key: str) -> None:
+    fake = FakeBeads()
+    for backend in (files_backend(tmp_path), mem.BeadsBackend(fake, tmp_path / "e")):
+        with pytest.raises(ValueError) as excinfo:
+            backend.write(key, H, "b")
+        assert repr(key) in str(excinfo.value)
+    assert fake.argv_log == []
+    assert not (tmp_path / "s").exists() and not (tmp_path / "e").exists()
+
+
+# Round 2: body limit at multi-byte boundaries.
+
+
+def _ok_body(ch: str) -> str:
+    return "y" * (60000 - len(ch.encode())) + ch
+
+
+def _over_bodies(ch: str) -> list[str]:
+    n = len(ch.encode())
+    return ["y" * (60001 - n) + ch, "y" * 59999 + ch]
+
+
+@pytest.mark.parametrize("ch", ["é", "€", "😀"])
+def test_body_limit_files_and_fake(tmp_path: Path, ch: str) -> None:
+    fake = FakeBeads()
+    backends = (files_backend(tmp_path), mem.BeadsBackend(fake, tmp_path / "e"))
+    body = _ok_body(ch)
+    assert len(body.encode()) == 60000
+    for backend in backends:
+        backend.write("ok", H, body)
+        assert backend.read("ok").body == body
+    for bad in _over_bodies(ch):
+        assert len(bad.encode()) > 60000
+        for backend in backends:
+            with pytest.raises(ValueError) as excinfo:
+                backend.write("big-key", H, bad)
+            assert "big-key" in str(excinfo.value)
+    assert fake.recall("big-key") is None
+    assert not (tmp_path / "store" / "big-key.md").exists()
+    assert not (tmp_path / "e" / "big-key.md").exists()
+
+
+def test_body_limit_hypothesis(tmp_path: Path) -> None:
+    @settings(max_examples=300, deadline=None)
+    @given(pad=st.integers(59990, 60004), ch=st.sampled_from(["a", "é", "€", "😀", "\u2028"]),
+           tail=st.integers(0, 2))
+    def check(pad: int, ch: str, tail: int) -> None:
+        body = "y" * pad + ch * tail
+        size = len(body.encode())
+        backend = mem.FilesBackend(tmp_path / "h")
+        if size <= 60000:
+            backend.write("hk", H, body)
+            assert backend.read("hk").body == body
+        else:
+            (tmp_path / "h" / "hk.md").unlink(missing_ok=True)
+            with pytest.raises(ValueError, match="hk"):
+                backend.write("hk", H, body)
+            assert not (tmp_path / "h" / "hk.md").exists()
+
+    check()
+
+
+@pytest.mark.parametrize("header,body", [
+    ({"source": "s", "x": "\udcff"}, "b"),
+    ({"source": "s", "\udcff": "v"}, "b"),
+    ({"source": "s", "n": {"k": ["\x00"]}}, "b"),
+    ({"source": "s", "\x00": 1}, "b"),
+    (H, "\ud800"),
+    (H, "ab\x00"),
+])
+def test_nul_and_unencodable_refused_before_write(
+    tmp_path: Path, header: dict[str, Any], body: str
+) -> None:
+    fake = FakeBeads()
+    for backend in (files_backend(tmp_path), mem.BeadsBackend(fake, tmp_path / "e")):
+        with pytest.raises(ValueError, match="nk-1"):
+            backend.write("nk-1", header, body)
+    assert fake.argv_log == []
+    assert not (tmp_path / "store").exists() and not (tmp_path / "e").exists()
+
+
+# Round 2: canonical line 2 details.
+
+
+def test_line2_raw_e_accepted_escape_rejected() -> None:
+    raw = 'helios-memory 1\n{"source": "é", "status": "active"}\n\nb'
+    assert mem.parse("k1", raw).header["source"] == "é"
+    esc = 'helios-memory 1\n{"source": "\\u00e9", "status": "active"}\n\nb'
+    with pytest.raises(ValueError, match="k1"):
+        mem.parse("k1", esc)
+    assert mem.serialize({"s": "\x01\u2028"}, "").split("\n")[1] == '{"s": "\\u0001\u2028"}'
+    mem.parse("k1", mem.serialize({"s": "\x01\x7f", "status": "active"}, ""))
+
+
+def test_line2_escape_file_export_raises_beads_skips(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    esc = 'helios-memory 1\n{"source": "\\u00e9", "status": "active"}\n\nb'
+    store = tmp_path / "s"
+    store.mkdir()
+    (store / "esc.md").write_text(esc)
+    with pytest.raises(ValueError, match="esc"):
+        mem.FilesBackend(store).export(tmp_path / "o")
+    with pytest.raises(ValueError, match="esc"):
+        mem.FilesBackend(store).read("esc")
+    fake = FakeBeads()
+    fake.remember("esc", esc)
+    mem.BeadsBackend(fake, tmp_path / "e").export(tmp_path / "o2")
+    assert "esc" in capsys.readouterr().err
+    assert list((tmp_path / "o2").iterdir()) == []
+
+
+def test_floats_round_trip_canonically(tmp_path: Path) -> None:
+    header = {"source": "s", "a": 1.0, "b": 1, "c": 1e5, "d": -0.0, "e": 1e16, "f": 5e-324,
+              "g": 0.1, "h": 2**64}
+    backend = files_backend(tmp_path)
+    backend.write("fl", header, "b")
+    got = backend.read("fl").header
+    for k in "abcdefgh":
+        assert got[k] == header[k] and type(got[k]) is type(header[k]), k
+    assert str(got["d"]) == "-0.0"
+    raw = (tmp_path / "store" / "fl.md").read_bytes()
+    assert mem.serialize(got, "b").encode() == raw
+    for hand in ('{"c": 1e5, "source": "s", "status": "active"}',
+                 '{"a": 1.00, "source": "s", "status": "active"}',
+                 '{"a": 1E+16, "source": "s", "status": "active"}',
+                 '{"d": -0, "source": "s", "status": "active"}'):
+        text = f"helios-memory 1\n{hand}\n\nb"
+        try:
+            parsed = mem.parse("fk", text)
+        except ValueError as exc:
+            assert "fk" in str(exc)
+        else:
+            assert mem.serialize(parsed.header, parsed.body) == text, hand
+
+
+@pytest.mark.parametrize("line2", [
+    '{"n": ' + "9" * 5000 + ', "source": "s", "status": "active"}',
+    '{"n": ' + "[" * 100000 + "]" * 100000 + ', "source": "s", "status": "active"}',
+])
+def test_pathological_line2_raises_valueerror_naming_key(line2: str) -> None:
+    text = f"helios-memory 1\n{line2}\n\nb"
+    try:
+        mem.parse("path-key", text)
+    except ValueError as exc:
+        assert "path-key" in str(exc), f"ValueError without key: {str(exc)[:120]}"
+    except BaseException as exc:  # noqa: BLE001
+        pytest.fail(f"{type(exc).__name__} instead of ValueError naming the key")
+    else:
+        pytest.fail("accepted")
+
+
+def test_pathological_file_in_files_stale_gets_note(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = tmp_path / "s"
+    store.mkdir()
+    deep = "[" * 100000 + "]" * 100000
+    (store / "deep.md").write_text(
+        f'helios-memory 1\n{{"n": {deep}, "source": "s", "status": "active"}}\n\nb')
+    try:
+        assert mem.FilesBackend(store, labels_of=lambda b: None).stale() == []
+    except RecursionError:
+        pytest.fail("stale() crashed with RecursionError instead of printing the skip note")
+    assert "deep" in capsys.readouterr().err
+
+
+# Round 2: import_ checks every file before writing any.
+
+
+FULL = {"source": "s#1", "status": "active"}
+
+_BAD_LAST = {
+    "noncanonical": ("z.md", b'helios-memory 1\n{"source":"s","status":"active"}\n\nz'),
+    "no-source": ("z.md", canon({"status": "active"}, "z")),
+    "empty-source": ("z.md", canon({"source": "", "status": "active"}, "z")),
+    "bad-status": ("z.md", canon({"source": "s", "status": "bogus"}, "z")),
+    "body-60001": ("z.md", canon(FULL, "y" * 60001)),
+    "body-straddle": ("z.md", canon(FULL, "y" * 59999 + "é")),
+    "nul-body": ("z.md", canon(FULL, "z\x00")),
+    "nul-header": ("z.md", canon({"source": "s\x00", "status": "active"}, "z")),
+    "not-utf8": ("z.md", b"helios-memory 1\n{}\n\n\xff"),
+    "bad-name": ("z_Z.md", canon(FULL, "z")),
+}
+
+
+def _src_with_bad_last(tmp_path: Path, case: str) -> Path:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.md").write_bytes(canon(FULL, "a"))
+    (src / "b.md").write_bytes(canon(FULL, "b"))
+    name, data = _BAD_LAST[case]
+    (src / name).write_bytes(data)
+    return src
+
+
+@pytest.mark.parametrize("case", sorted(_BAD_LAST))
+def test_import_bad_last_files_writes_nothing(tmp_path: Path, case: str) -> None:
+    src = _src_with_bad_last(tmp_path, case)
+    store = tmp_path / "store"
+    with pytest.raises(ValueError) as excinfo:
+        mem.FilesBackend(store).import_(src)
+    assert "z" in str(excinfo.value)
+    written = sorted(p.name for p in store.glob("*")) if store.exists() else []
+    assert written == [], f"{case}: import_ wrote {written} before failing"
+
+
+@pytest.mark.parametrize("case", sorted(_BAD_LAST))
+def test_import_bad_last_fake_bd_writes_nothing(tmp_path: Path, case: str) -> None:
+    src = _src_with_bad_last(tmp_path, case)
+    fake = FakeBeads()
+    with pytest.raises(ValueError):
+        mem.BeadsBackend(fake, tmp_path / "e").import_(src)
+    assert fake.argv_log == [], f"{case}: bd remember called for {[a[2] for a in fake.argv_log]}"
+    assert not (tmp_path / "e").exists() or list((tmp_path / "e").iterdir()) == []
+
+
+def test_missing_status_file_is_bad(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "k.md").write_bytes(canon({"source": "s"}, "b"))
+    with pytest.raises(ValueError) as excinfo:
+        files_backend(tmp_path).import_(src)
+    assert "k" in str(excinfo.value)
+    with pytest.raises(ValueError) as excinfo:
+        mem.parse("k", canon({"source": "s"}, "b").decode())
+    assert "k" in str(excinfo.value)
+
+
+# Round 2: the whole value is at most 65000 bytes.
+
+
+def test_value_size_limit_boundary(tmp_path: Path) -> None:
+    base = mem.serialize({"source": "s", "status": "active", "pad": ""}, "y" * 100)
+    room = 65000 - len(base.encode())
+    assert room > 0
+    backend = files_backend(tmp_path)
+    backend.write("edge", {"source": "s", "status": "active", "pad": "h" * room}, "y" * 100)
+    assert len((tmp_path / "store" / "edge.md").read_bytes()) == 65000
+    fake = FakeBeads()
+    beads_backend = mem.BeadsBackend(fake, tmp_path / "e")
+    with pytest.raises(ValueError) as excinfo:
+        backend.write("over", {"source": "s", "status": "active", "pad": "h" * (room + 1)}, "y" * 100)
+    assert "over" in str(excinfo.value)
+    with pytest.raises(ValueError) as excinfo:
+        beads_backend.write("over", {"source": "s", "status": "active", "pad": "h" * (room + 1)},
+                            "y" * 100)
+    assert "over" in str(excinfo.value)
+    assert fake.recall("over") is None
+    assert not (tmp_path / "store" / "over.md").exists()
+    assert not (tmp_path / "e").exists()
+
+
+# Round 2: stale() narrows KeyError to the missing-bead signal.
+
+
+def test_stale_malformed_show_shapes_propagate(tmp_path: Path) -> None:
+    """A show that returns id-less objects or raises a foreign KeyError is not a miss."""
+    def no_id(bead_id: str) -> Bead:
+        raise KeyError("id")
+
+    def wrong_shape(bead_id: str) -> Bead:
+        raise KeyError(0)
+
+    def boom(bead_id: str) -> Bead:
+        raise RuntimeError("bd not installed")
+
+    for show in (no_id, wrong_shape, boom):
+        backend = mem.FilesBackend(tmp_path / "s", labels_of=mem._labels_from_show(show))
+        backend.write("x", {"source": "hel-1#1"}, "b")
+        with pytest.raises(Exception):
+            backend.stale()
+
+
+# Round 2: real bd coverage.
+
+REAL_BD = shutil.which("bd")
+needs_bd = pytest.mark.skipif(REAL_BD is None, reason="bd not on PATH")
+
+
+def bd_repo(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
+    subprocess.run(["bd", "init", "--non-interactive"], cwd=root, check=True, capture_output=True)
+    return root
+
+
+@pytest.fixture(scope="module")
+def shared_bd(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return bd_repo(tmp_path_factory.mktemp("bdshared"))
+
+
+def _create_bead(repo: Path, labels: list[str]) -> str:
+    argv = ["bd", "create", "--title", "t", "--type", "task", "--silent"]
+    if labels:
+        argv += ["--labels", ",".join(labels)]
+    return subprocess.run(argv, cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture(scope="module")
+def stale_repo(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str, str]:
+    repo = bd_repo(tmp_path_factory.mktemp("bdstale"))
+    wrong = _create_bead(repo, ["truth:wrong"])
+    fine = _create_bead(repo, [])
+    return repo, wrong, fine
+
+
+@needs_bd
+@pytest.mark.parametrize("key", ["x" * 200, "a.", "a..b", "a_b-c.d"])
+def test_key_real_bd_round_trip(shared_bd: Path, tmp_path: Path, key: str) -> None:
+    backend = mem.BeadsBackend(Beads(shared_bd), tmp_path / "e")
+    backend.write(key, H, "body\n")
+    assert backend.read(key).body == "body\n"
+    backend.export(tmp_path / "o")
+    assert (tmp_path / "o" / f"{key}.md").read_bytes() == canon(
+        {**H, "status": "active"}, "body\n")
+
+
+@needs_bd
+@pytest.mark.parametrize("case", ["no-source", "body-60001", "noncanonical"])
+def test_import_bad_last_real_bd_writes_nothing(tmp_path: Path, case: str) -> None:
+    repo = bd_repo(tmp_path / "repo")
+    src = _src_with_bad_last(tmp_path, case)
+    beads = Beads(repo)
+    with pytest.raises(ValueError):
+        mem.BeadsBackend(beads, tmp_path / "e").import_(src)
+    assert beads.memories() == {}, f"{case}: bd holds {sorted(beads.memories())}"
+
+
+@needs_bd
+@pytest.mark.parametrize("ch", ["é", "€", "😀"])
+def test_body_limit_real_bd(shared_bd: Path, tmp_path: Path, ch: str) -> None:
+    beads = Beads(shared_bd)
+    backend = mem.BeadsBackend(beads, tmp_path / "e")
+    key = f"lim-{len(ch.encode())}"
+    body = _ok_body(ch)
+    backend.write(key, H, body)
+    assert backend.read(key).body == body
+    assert beads.memories()[key] == mem.serialize({**H, "status": "active"}, body)
+    for i, bad in enumerate(_over_bodies(ch)):
+        bkey = f"over-{len(ch.encode())}-{i}"
+        with pytest.raises(ValueError, match=bkey):
+            backend.write(bkey, H, bad)
+        assert beads.recall(bkey) is None
+        assert not (tmp_path / "e" / f"{bkey}.md").exists()
+
+
+@needs_bd
+def test_stale_real_bd_exact_and_partial(
+    stale_repo: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    repo, wrong, fine = stale_repo
+    fake_store = FakeBeads()
+    backend = mem.BeadsBackend(
+        fake_store, tmp_path / "e2", labels_of=mem._labels_from_show(Beads(repo).show))
+    suffix = wrong.rsplit("-", 1)[1]
+    backend.write("exact", {"source": f"{wrong}#1"}, "x")
+    backend.write("partial", {"source": f"{suffix}#1"}, "x")
+    backend.write("fine", {"source": f"{fine}#1"}, "x")
+    backend.write("gone", {"source": f"{wrong}#1", "status": "retracted"}, "x")
+    assert Beads(repo).show(suffix).id == wrong  # bd resolves the partial id
+    assert backend.stale() == ["exact"]
+
+
+@needs_bd
+@pytest.mark.parametrize("show_script", [
+    'echo "Error: database is locked" >&2; exit 1',
+    'echo \'{"error": "connection refused", "schema_version": 1}\'; exit 1',
+    'echo "not json"; exit 0',
+    'echo \'[{"labels": ["truth:wrong"]}]\'; exit 0',
+    'echo \'{"error": "boom"}\'; exit 0',
+])
+def test_stale_shim_other_failure_propagates(
+    stale_repo: tuple[Path, str, str], tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, show_script: str
+) -> None:
+    repo, wrong, _ = stale_repo
+    bindir = tmp_path / "shimbin"
+    bindir.mkdir()
+    shim = bindir / "bd"
+    shim.write_text(
+        f'#!/bin/sh\nif [ "$1" = "show" ]; then\n{show_script}\nfi\nexec "{REAL_BD}" "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    backend = mem.open_backend(
+        Config(hub=repo, memory=MemoryConfig(backend="files", export_dir="shim")))
+    backend.write("sh", {"source": f"{wrong}#1"}, "x")
+    with pytest.raises(Exception):
+        backend.stale()
+
+
+@needs_bd
+def test_crash_between_bd_and_export_file_real_bd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = bd_repo(tmp_path / "repo")
+    exp = tmp_path / "e"
+    backend = mem.BeadsBackend(Beads(repo), exp)
+    backend.write("k", H, "v1")
+    real = mem._write_bytes_atomic
+
+    def boom(*a: Any, **kw: Any) -> None:
+        raise OSError("simulated crash after bd remember")
+
+    monkeypatch.setattr(mem, "_write_bytes_atomic", boom)
+    with pytest.raises(OSError):
+        backend.write("k", H, "v2\n")
+    with pytest.raises(OSError):
+        backend.write("new", H, "first")
+    monkeypatch.setattr(mem, "_write_bytes_atomic", real)
+    assert backend.read("k").body == "v2\n"
+    assert backend.read("new").body == "first"
+    assert (exp / "k.md").read_bytes() == canon({**H, "status": "active"}, "v1")
+    assert not (exp / "new.md").exists()
+    backend.export(exp)
+    assert (exp / "k.md").read_bytes() == canon({**H, "status": "active"}, "v2\n")
+    assert (exp / "new.md").read_bytes() == canon({**H, "status": "active"}, "first")
+    assert sorted(p.name for p in exp.iterdir()) == ["k.md", "new.md"]
+    assert mem.BeadsBackend(Beads(repo), tmp_path / "e3").inject(["new", "k"]) == \
+        "### new\n\nfirst\n\n### k\n\nv2\n"
+
+
+@needs_bd
+@pytest.mark.parametrize("n", range(0, 8))
+def test_truncated_echo_real_bd(shared_bd: Path, tmp_path: Path, n: int) -> None:
+    backend = mem.BeadsBackend(Beads(shared_bd), tmp_path / "e")
+    for ch in ("é", "€", "😀"):
+        body = "a" * n + ch * 200
+        key = f"echo-{n}-{len(ch.encode())}"
+        backend.write(key, {"source": "s" * (n + 1)}, body)
+        assert backend.read(key).body == body
+
+
+_TEXT = st.text(alphabet=st.characters(codec="utf-8", exclude_characters="\x00"), max_size=60)
+
+
+@needs_bd
+def test_hypothesis_real_bd_round_trip(shared_bd: Path, tmp_path: Path) -> None:
+    beads = Beads(shared_bd)
+    counter = [0]
+
+    @settings(max_examples=40, deadline=None)
+    @given(header=st.dictionaries(_TEXT.filter(lambda k: k not in ("source", "status")), _TEXT,
+                                  max_size=3),
+           body=st.one_of(_TEXT, st.sampled_from(["", "\n", "\n\n", "\r\n", " \t\n", "-x", "--",
+                                                   "\ufeff\u2028\x1b[0m\x7f"])))
+    def check(header: dict[str, str], body: str) -> None:
+        counter[0] += 1
+        key = f"hyp-{counter[0]}"
+        backend = mem.BeadsBackend(beads, tmp_path / "e")
+        full = {**header, "source": "s#1", "status": "active"}
+        backend.write(key, full, body)
+        got = backend.read(key)
+        assert (got.header, got.body) == (full, body)
+        assert beads.memories()[key] == mem.serialize(full, body)
+        assert (tmp_path / "e" / f"{key}.md").read_bytes() == canon(full, body)
+
+    check()
+
+
+@needs_bd
+@pytest.mark.parametrize("pad", [5000, 70000, 300000])
+def test_large_header_real_bd(shared_bd: Path, tmp_path: Path, pad: int) -> None:
+    """No SPEC limit on header size. A value bd cannot keep must fail loudly, never truncate."""
+    beads = Beads(shared_bd)
+    backend = mem.BeadsBackend(beads, tmp_path / "e")
+    key = f"bighead-{pad}"
+    header = {"source": "s", "pad": "h" * pad}
+    body = "y" * 60000
+    try:
+        backend.write(key, header, body)
+    except Exception as exc:  # noqa: BLE001
+        print(f"write refused loudly: {type(exc).__name__}: {str(exc)[:200]}")
+        full = mem.serialize({**header, "status": "active"}, body)
+        assert beads.recall(key) is None or beads.recall(key) == full
+        return
+    got = backend.read(key)
+    assert got.body == body and got.header["pad"] == header["pad"]
+
+
+@needs_bd
+def test_beads_export_skips_foreign_keys_with_note(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = bd_repo(tmp_path / "repo")
+    for key, value in (("-a", mem.serialize(FULL, "x")), ("Key", mem.serialize(FULL, "x")),
+                       ("plain", "hello")):
+        subprocess.run(["bd", "remember", "--key", key, "--", value], cwd=repo, check=True,
+                       capture_output=True)
+    backend = mem.BeadsBackend(Beads(repo), tmp_path / "e", labels_of=lambda b: None)
+    backend.write("good", H, "g")
+    backend.export(tmp_path / "o")
+    err = capsys.readouterr().err
+    assert [p.name for p in (tmp_path / "o").iterdir()] == ["good.md"]
+    for key in ("-a", "Key", "plain"):
+        assert repr(key) in err
+    backend.stale()
+    err = capsys.readouterr().err
+    for key in ("-a", "Key", "plain"):
+        assert repr(key) in err
