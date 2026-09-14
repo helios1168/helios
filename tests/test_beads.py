@@ -518,6 +518,19 @@ def test_real_bd_add_label_does_not_raise_on_existing_label(tmp_path: Path) -> N
 
 
 @pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_real_bd_set_status_moves_out_of_ready(tmp_path: Path) -> None:
+    """`set_status` (SPEC §11, hel-dgl item 9) via `bd update --status`."""
+    _init_bd_repo(tmp_path)
+    beads = Beads(tmp_path)
+    bead_id = beads.create("probe", labels=[], metadata={})
+    assert beads.show(bead_id).status == "open"
+    assert any(b.id == bead_id for b in beads.ready())
+    beads.set_status(bead_id, "in_progress")
+    assert beads.show(bead_id).status == "in_progress"
+    assert not any(b.id == bead_id for b in beads.ready())
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
 def test_real_bd_gate_list_and_gate_blocks_two_beads(tmp_path: Path) -> None:
     _init_bd_repo(tmp_path)
     beads = Beads(tmp_path)

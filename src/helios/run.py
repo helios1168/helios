@@ -1586,6 +1586,15 @@ def _run_one_inner(
                     except (OSError, ValueError, KeyError):
                         pass
 
+        # Once preflight has passed and before launch: a bead that does not
+        # close (SPEC §7.5) would otherwise stay `open`, a SPEC §11 `next`
+        # candidate that `helios run` would launch again. Never for
+        # --dry-run (handled above) and never for a closed bead (checked at
+        # the top of this function), so this only ever moves open -> in
+        # progress; setting it again is a no-op (item 9).
+        if bead.status != "in_progress":
+            beads.set_status(bead_id, "in_progress")
+
         info = worktree_mod.prepare(
             hub=hub,
             bead=bead_id,

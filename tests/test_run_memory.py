@@ -1,10 +1,11 @@
-"""``helios run`` tests for hel-dgl acceptance items 1-3, 6 and 7.
+"""``helios run`` tests for hel-dgl acceptance items 1-3, 6, 7 and 9.
 
 1) input.json (SPEC §7.1 step 6). 2) the stop-requested marker (SPEC §4.4,
 §7.1, §9.2). 3) a verify worktree starting at the parent's output_commit
 (SPEC §7.1, §7.3). 6) memory injection into the prompt and input.json (SPEC
 §7.2 item 5, §13). 7) the SIGINT reentry guard and the memory lookup failure
-message (SPEC §7.1, round 7 fixes).
+message (SPEC §7.1, round 7 fixes). 9) helios run moves a bead to
+in_progress once preflight passes and before launch (SPEC §7.5, §11).
 """
 
 from __future__ import annotations
@@ -364,3 +365,62 @@ def test_memory_lookup_failure_message_has_no_preflight_prefix(
     err = capsys.readouterr().err
     assert rc == 2
     assert err == "helios: memory lookup failed for m1: boom\n"
+
+
+# --------------------------------------------------------------------- item 9
+
+
+BLOCKED_SCRIPT = {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s1",
+                  "report": {"status": "blocked", "summary": "cannot proceed"}}
+
+
+def test_run_sets_in_progress_before_launch_fakebeads(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    assert beads.show("b1").status == "open"
+    set_fake(monkeypatch, write_script(tmp_path, BLOCKED_SCRIPT))
+    cfg = config_mod.load(hub)
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 3
+    assert beads.show("b1").status == "in_progress"
+    assert not any(b.id == "b1" for b in beads.ready())
+
+
+def test_run_dry_run_leaves_status_open(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    set_fake(monkeypatch, write_script(tmp_path, DONE_SCRIPT))
+    cfg = config_mod.load(hub)
+    rc = run_mod.run_one(
+        "b1", hub=hub, beads=beads, config=cfg, harness_override="fake", dry_run=True
+    )
+    assert rc == 0
+    assert beads.show("b1").status == "open"
+
+
+def test_run_never_reopens_a_closed_bead(tmp_path: Path) -> None:
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1", status="closed")])
+    cfg = config_mod.load(hub)
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 2
+    assert beads.show("b1").status == "closed"
+    assert beads.argv_log == []
+
+
+@pytest.mark.skipif(BD is None, reason="bd is not on PATH")
+def test_run_sets_in_progress_real_bd(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    subprocess.run(
+        ["bd", "init", "--non-interactive", "--prefix", "t", "--skip-agents", "--quiet"],
+        cwd=hub, check=True, capture_output=True,
+    )
+    real = beads_mod.Beads(hub)
+    bead_id = real.create("do it", labels=[], metadata={"kind": "impl", "files": ["src/"], "test": "true"})
+    assert real.show(bead_id).status == "open"
+    set_fake(monkeypatch, write_script(tmp_path, BLOCKED_SCRIPT))
+    cfg = config_mod.load(hub)
+    rc = run_mod.run_one(bead_id, hub=hub, beads=real, config=cfg, harness_override="fake")
+    assert rc == 3
+    assert real.show(bead_id).status == "in_progress"
+    assert not any(b.id == bead_id for b in real.ready())

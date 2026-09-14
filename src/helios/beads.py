@@ -297,6 +297,7 @@ class BeadsLike(Protocol):
     def set_metadata(self, bead_id: str, metadata: dict[str, str]) -> None: ...
     def close(self, bead_id: str, reason: str) -> None: ...
     def set_state(self, bead_id: str, dimension: str, value: str, reason: str) -> None: ...
+    def set_status(self, bead_id: str, status: str) -> None: ...
     def list(self, *, labels: list[str] = [], status: str | None = None) -> list[Bead]: ...
     def ready(self, *, labels: list[str] = []) -> list[Bead]: ...
     def add_label(self, bead_id: str, label: str) -> None: ...
@@ -386,6 +387,10 @@ class Beads:
 
     def set_state(self, bead_id: str, dimension: str, value: str, reason: str) -> None:
         self._run(["set-state", bead_id, f"{dimension}={value}", "--reason", reason])
+
+    def set_status(self, bead_id: str, status: str) -> None:
+        """`bd update <bead_id> --status <status>` (SPEC §11, hel-dgl item 9)."""
+        self._run(["update", bead_id, "--status", status])
 
     def create(
         self,
@@ -563,6 +568,10 @@ class FakeBeads:
     def set_state(self, bead_id: str, dimension: str, value: str, reason: str) -> None:
         self.argv_log.append(["set-state", bead_id, dimension, value, reason])
         self.states.setdefault(bead_id, {})[dimension] = value
+
+    def set_status(self, bead_id: str, status: str) -> None:
+        self.argv_log.append(["update", bead_id, "--status", status])
+        self.beads[bead_id].status = status
 
     def create(
         self,
