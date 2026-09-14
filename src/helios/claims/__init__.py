@@ -62,24 +62,28 @@ class Claim:
 _CLAIMS: list[Claim] = []
 
 
-def _caller_module(frame: FrameType | None) -> str:
+def _caller_module(frame: FrameType | None) -> str | None:
     """The module attributed to a `claim(...)` call (SPEC §15.2, decided).
 
-    Walk outward from the direct caller of `claim` to the first frame whose
-    code name is "<module>" and return its `__name__`; if none is found, use
-    the direct caller's own `f_globals["__name__"]`. Never func.__module__,
+    Walk outward from the direct caller of `claim` over every frame whose code
+    name is "<module>", and return the first one whose `__name__` is present
+    and non-empty. A `<module>` frame with no `__name__` (an
+    `exec(SRC, {"claim": claim})` call inside a package module, for example)
+    is skipped rather than returned, so the claim is attributed to the
+    enclosing named module, not the anonymous exec frame. Returns None when no
+    `<module>` frame in the whole chain has a name, so registration can raise
+    instead of silently collecting nothing. Never func.__module__,
     __qualname__, co_firstlineno or repr: a factory, a pair of
     functools.wraps wrappers or a pair of exec blocks can all give a func
     that collides on those, even across distinct claims.
     """
-    direct = frame
     while frame is not None:
         if frame.f_code.co_name == "<module>":
-            return str(frame.f_globals.get("__name__", ""))
+            name = frame.f_globals.get("__name__")
+            if name:
+                return str(name)
         frame = frame.f_back
-    if direct is None:
-        return ""
-    return str(direct.f_globals.get("__name__", ""))
+    return None
 
 
 def claim(
@@ -96,8 +100,10 @@ def claim(
 
     `name` must match ``^[A-Za-z0-9_][A-Za-z0-9._-]{0,199}$``; otherwise this
     raises ValueError at registration (decided). A record's module is the
-    module-level frame that called `claim(...)` (see `_caller_module`); a
-    record is keyed by (module, claim name). Every call appends a record;
+    nearest named module-level frame that called `claim(...)` (see
+    `_caller_module`); a record is keyed by (module, claim name). When no
+    frame in the chain has a module name, this raises ValueError instead of
+    registering a claim no module owns. Every call appends a record;
     `forget_claims` clears stale ones before a fresh import, and duplicate
     names among collected records are a step 1 problem, not resolved here.
     Callable instances and `functools.partial` objects are valid claims.
@@ -105,6 +111,8 @@ def claim(
     if not CLAIM_NAME_RE.fullmatch(name):
         raise ValueError(f"invalid claim name {name!r}")
     module = _caller_module(sys._getframe(1))
+    if module is None:
+        raise ValueError(f"claim {name}: cannot determine owning module")
 
     def decorator(func: Callable[[], Any]) -> Callable[[], Any]:
         _CLAIMS.append(
@@ -336,7 +344,9 @@ STDOUT_CAP = 16 * 1024 * 1024
 STDERR_CAP = 64 * 1024
 
 
-def _pump(fd: int, buf: bytearray, cap: int, keep_tail: bool, overflow: list[bool]) -> None:
+def _pump(
+    fd: int, buf: bytearray, cap: int, keep_tail: bool, overflow: list[bool], stop: threading.Event
+) -> None:
     """Read a raw fd to EOF in a background daemon thread, unbuffered.
 
     Reading os.read(fd, ...) directly, instead of a buffered stream object,
@@ -351,10 +361,18 @@ def _pump(fd: int, buf: bytearray, cap: int, keep_tail: bool, overflow: list[boo
     and `overflow[0]` is set once more than that has been read (used for
     stdout, the protocol channel), so more than the cap is never mistaken for
     an unparsable protocol line without a note.
+
+    `stop` is checked right after every `os.read` returns, before the data is
+    buffered or the loop continues. The main thread sets it once a pump is
+    abandoned past the collection bound, so a grandchild still writing to a
+    held-open pipe (a setsid `yes`, say) stops this thread at its next read
+    instead of buffering and looping for the rest of the CLI process.
     """
     try:
         while True:
             data = os.read(fd, 65536)
+            if stop.is_set():
+                return
             if not data:
                 break
             if keep_tail:
@@ -384,9 +402,12 @@ def run_claim(
     EOF (a grandchild may hold the pipes). Output is pumped on background
     daemon threads reading the raw fds; after exit or timeout the group is
     SIGKILLed and output collected with a bounded wait. Past that bound the
-    threads and fds are abandoned, never closed from this thread, so no
-    grandchild in the runner's process group survives collection but one that
-    left the group through its own new session may. Status is timeout,
+    threads and fds are abandoned, never closed from this thread, but a
+    reader still alive at the bound has its stop event set, so it exits at
+    its next return from os.read instead of burning CPU on a grandchild that
+    still holds the pipe open (a setsid `yes`, say). No grandchild in the
+    runner's process group survives collection but one that left the group
+    through its own new session may. Status is timeout,
     overflow (stdout passed STDOUT_CAP), ok (payload is a bool), finding
     (payload is a dict), other (payload is a type name), error (payload is a
     traceback string), exited (payload is the exit code) or unparsable.
@@ -409,16 +430,20 @@ def run_claim(
     err_buf = bytearray()
     out_overflow = [False]
     err_overflow = [False]
+    out_stop = threading.Event()
+    err_stop = threading.Event()
     readers = [
         threading.Thread(
             target=_pump,
-            args=(proc.stdout.fileno(), out_buf, STDOUT_CAP, False, out_overflow),
+            args=(proc.stdout.fileno(), out_buf, STDOUT_CAP, False, out_overflow, out_stop),
             daemon=True,
+            name="helios-pump-stdout",
         ),
         threading.Thread(
             target=_pump,
-            args=(proc.stderr.fileno(), err_buf, STDERR_CAP, True, err_overflow),
+            args=(proc.stderr.fileno(), err_buf, STDERR_CAP, True, err_overflow, err_stop),
             daemon=True,
+            name="helios-pump-stderr",
         ),
     ]
     for reader in readers:
@@ -433,6 +458,9 @@ def run_claim(
     deadline = time.monotonic() + COLLECT_S
     for reader in readers:
         reader.join(timeout=max(0.0, deadline - time.monotonic()))
+    for reader, stop in ((readers[0], out_stop), (readers[1], err_stop)):
+        if reader.is_alive():
+            stop.set()
     if timed_out:
         try:
             proc.wait(timeout=COLLECT_S)

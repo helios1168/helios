@@ -1166,7 +1166,7 @@ def test_pump_caps_stdout_head_and_flags_overflow() -> None:
 
     t = threading.Thread(target=writer, daemon=True)
     t.start()
-    claims_lib._pump(r, buf, claims_lib.STDOUT_CAP, False, overflow)
+    claims_lib._pump(r, buf, claims_lib.STDOUT_CAP, False, overflow, threading.Event())
     t.join(10)
     os.close(r)
     assert len(buf) == claims_lib.STDOUT_CAP
@@ -1193,7 +1193,7 @@ def test_pump_caps_stderr_to_last_bytes() -> None:
 
     t = threading.Thread(target=writer, daemon=True)
     t.start()
-    claims_lib._pump(r, buf, claims_lib.STDERR_CAP, True, overflow)
+    claims_lib._pump(r, buf, claims_lib.STDERR_CAP, True, overflow, threading.Event())
     t.join(10)
     os.close(r)
     assert len(buf) == claims_lib.STDERR_CAP
@@ -1219,6 +1219,136 @@ def test_setsid_yes_grandchild_output_capped(
     assert code == 0, err
     assert json.loads(lines[0])["verdict"] == "verified"
     assert secs < 5, secs
+    try:
+        os.kill(int(pidfile.read_text()), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+# ============================================================ round 5 review fixes
+
+
+def test_exec_bare_namespace_in_package_module_collected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """exec(SRC, {"claim": claim}) inside a package module is still collected.
+
+    The exec frame's globals lack __name__; _caller_module must skip that
+    frame and keep walking outward to the enclosing named package module
+    (decided) instead of attributing the claim to module name "".
+    """
+    hub = make_hub(tmp_path, "exb", BASE_PROG, "")
+    (hub / "clm_exb.py").unlink()
+    (hub / "clm_exb").mkdir()
+    body = f'@claim("exb1", {DECL})\ndef f():\n    return False\n'
+    (hub / "clm_exb" / "__init__.py").write_text(
+        HEADER + f"exec({body!r}, {{'claim': claim}})\n"
+    )
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 3
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 1
+    finding = json.loads(out[0])
+    assert (finding["id"], finding["verdict"]) == ("exb1", "refuted")
+
+
+def test_exec_namespace_with_module_name_still_collected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """exec(SRC, {"claim": claim, "__name__": <module>}) still works (regression)."""
+    hub = make_hub(tmp_path, "exn", BASE_PROG, "")
+    (hub / "clm_exn.py").unlink()
+    (hub / "clm_exn").mkdir()
+    body = f'@claim("exn1", {DECL})\ndef f():\n    return True\n'
+    (hub / "clm_exn" / "__init__.py").write_text(
+        HEADER + f"exec({body!r}, {{'claim': claim, '__name__': __name__}})\n"
+    )
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 1
+    finding = json.loads(out[0])
+    assert (finding["id"], finding["verdict"]) == ("exn1", "verified")
+
+
+def test_pump_stops_after_next_read_once_signaled() -> None:
+    """A pump exits at its next return from os.read once stop is set.
+
+    No further buffering or looping happens afterward: buf stops growing past
+    whatever size it held right when the flag was noticed (the abandoned-pump
+    CPU fix).
+    """
+    r, w = os.pipe()
+    buf = bytearray()
+    overflow = [False]
+    stop = threading.Event()
+    keep_writing = threading.Event()
+    keep_writing.set()
+
+    def writer() -> None:
+        while keep_writing.is_set():
+            try:
+                os.write(w, b"y" * 4096)
+            except OSError:
+                return
+
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    writer_thread.start()
+    pump = threading.Thread(
+        target=claims_lib._pump, args=(r, buf, 1 << 20, True, overflow, stop), daemon=True
+    )
+    pump.start()
+    time.sleep(0.05)
+    stop.set()
+    pump.join(timeout=1.0)
+    assert not pump.is_alive()
+    size_at_stop = len(buf)
+    time.sleep(0.2)
+    assert len(buf) == size_at_stop
+    keep_writing.clear()
+    writer_thread.join(timeout=2.0)
+    os.close(w)
+    os.close(r)
+
+
+def test_abandoned_pump_stops_burning_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """An abandoned pump reading a setsid `yes` on inherited stderr exits soon after the
+    collection bound, and a later claim in the same invocation still runs correctly.
+
+    Thread instances are captured at creation (a monkeypatched Thread subclass), not
+    found afterward by scanning threading.enumerate(), so the assertion holds even
+    when a pump has already exited by the time the check below runs.
+    """
+    pidfile = tmp_path / "burn.pid"
+    monkeypatch.setenv("VERIFY_PIDFILE", str(pidfile))
+    body_yes = (
+        'p = subprocess.Popen(["yes"], start_new_session=True)\n'
+        'open(os.environ["VERIFY_PIDFILE"], "w").write(str(p.pid))\n'
+        "time.sleep(0.2)\nreturn True"
+    )
+    src = claim_src("burn_yes", body_yes)
+    src += claim_src("burn_after", "return True").split("\n", 2)[2]
+    hub = make_hub(tmp_path, "burn", BASE_PROG, src)
+
+    created: list[threading.Thread] = []
+    real_thread = threading.Thread
+
+    class RecordingThread(real_thread):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            if kwargs.get("name", "").startswith("helios-pump-"):
+                created.append(self)
+
+    monkeypatch.setattr(claims_lib.threading, "Thread", RecordingThread)
+    code, lines, err = run_check(hub, monkeypatch, capsys)
+    assert code == 0, err
+    assert verdicts_of(lines) == {"burn_yes": "verified", "burn_after": "verified"}
+    assert len(created) >= 2, "expected pump threads for both claims"
+    for t in created:
+        t.join(timeout=1.0)
+        assert not t.is_alive(), t.name
     try:
         os.kill(int(pidfile.read_text()), signal.SIGKILL)
     except ProcessLookupError:
