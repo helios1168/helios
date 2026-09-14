@@ -6,7 +6,7 @@ import fcntl
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from helios.beads import Bead, BeadsLike, comment_has
 from helios.config import ProjectConfig
@@ -106,6 +106,23 @@ def _remove_worktree(hub: Path, path: Path, branch: str) -> None:
             raise MergeError(proc.stderr.strip() or "branch removal failed", 4)
 
 
+def _finish_step7(
+    hub: Path,
+    worktree: Path,
+    branch: str,
+    beads: BeadsLike,
+    bead_id: str,
+    marker: str,
+) -> None:
+    if "origin" in _git_output(hub, "remote").splitlines():
+        pushed = _git(hub, "push", "origin", "main")
+        if pushed.returncode:
+            raise MergeError(pushed.stderr.strip() or "push failed", 4)
+        _comment(beads, bead_id, marker + "pushed]", "pushed")
+    _remove_worktree(hub, worktree, branch)
+    _comment(beads, bead_id, marker + "removed]", "removed")
+
+
 def merge_bead(
     hub: Path,
     bead_id: str,
@@ -128,18 +145,20 @@ def merge_bead(
         except OSError as exc:
             raise MergeError("merge lock is held", 2) from exc
         _verify_evidence(hub, project.runs, bead, beads, input_hashes)
-        worktree = hub / project.worktrees / bead_id
+        worktree = (hub / project.worktrees / bead_id).resolve()
         branch_check = _git(hub, "symbolic-ref", "--short", "HEAD")
         if branch_check.returncode or branch_check.stdout.strip() != "main":
             raise MergeError("hub is not on main")
-        if not worktree.is_dir() or not _clean(hub) or not _clean(worktree):
+        if not _clean(hub) or (worktree.exists() and not _clean(worktree)):
             raise MergeError("hub or worktree is dirty")
         branch = f"worktree-{bead_id}"
         merge_commit = bead.metadata.get("merge_commit")
         if merge_commit and _git(hub, "merge-base", "--is-ancestor", str(merge_commit), "main").returncode == 0:
+            main_before = str(bead.metadata.get("merge_main_before", _git_output(hub, "rev-parse", "main")))
+            marker = f"[{bead_id}@{main_before}:"
             if dry_run:
                 return 0, "would recover and remove worktree"
-            _remove_worktree(hub, worktree, branch)
+            _finish_step7(hub, worktree, branch, beads, bead_id, marker)
             return 0, "recovered"
         main_before = _git_output(hub, "rev-parse", "main")
         marker = f"[{bead_id}@{main_before}:"
@@ -149,6 +168,7 @@ def merge_bead(
         rebase = _git(worktree, "rebase", "main")
         if rebase.returncode:
             _git(worktree, "rebase", "--abort")
+            beads.set_state(bead_id, "run", "conflict", "rebase conflict")
             _comment(beads, bead_id, marker + "conflict]", "conflict")
             raise MergeError("rebase conflict", 3)
         _comment(beads, bead_id, marker + "rebased]", "rebased")
@@ -166,13 +186,7 @@ def merge_bead(
         if merged.returncode:
             raise MergeError(merged.stderr.strip() or "fast-forward merge failed", 4)
         _comment(beads, bead_id, marker + "merged]", "merged")
-        if "origin" in _git_output(hub, "remote").splitlines():
-            pushed = _git(hub, "push", "origin", "main")
-            if pushed.returncode:
-                raise MergeError(pushed.stderr.strip() or "push failed", 4)
-            _comment(beads, bead_id, marker + "pushed]", "pushed")
-        _remove_worktree(hub, worktree, branch)
-        _comment(beads, bead_id, marker + "removed]", "removed")
+        _finish_step7(hub, worktree, branch, beads, bead_id, marker)
         return 0, "merged"
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
