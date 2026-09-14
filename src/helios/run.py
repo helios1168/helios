@@ -36,12 +36,17 @@ _RUNNING: dict[str, subprocess.Popen[str]] = {}
 _RUNNING_LOCK = threading.Lock()
 _INTERRUPT = threading.Event()
 _RUN_ACTIVE = threading.Event()
+_SEQ_THREADS: list[threading.Thread] = []
+_SEQ_DONE: set[int] = set()
+_SEQ_LOCK = threading.Lock()
 
 
 def _reg_add(key: str, proc: subprocess.Popen[str]) -> None:
     """Register a running child; always through ``_RUNNING_LOCK``."""
     with _RUNNING_LOCK:
         _RUNNING[key] = proc
+    if _INTERRUPT.is_set():
+        _start_sequence(proc)
 
 
 def _reg_remove(key: str) -> None:
@@ -54,6 +59,27 @@ def _reg_snapshot() -> list[subprocess.Popen[str]]:
     """The currently running children."""
     with _RUNNING_LOCK:
         return list(_RUNNING.values())
+
+
+def _start_sequence(proc: subprocess.Popen[str]) -> threading.Thread | None:
+    """Start one stop-sequence thread for a group, once per pgid (SPEC §7.1)."""
+    with _SEQ_LOCK:
+        if proc.pid in _SEQ_DONE:
+            return None
+        _SEQ_DONE.add(proc.pid)
+        thread = threading.Thread(
+            target=_stop_sequence, args=(proc, proc.pid),
+            name="stopper-seq", daemon=True,
+        )
+        _SEQ_THREADS.append(thread)
+    thread.start()
+    return thread
+
+
+def _seq_threads() -> list[threading.Thread]:
+    """A snapshot of the stop-sequence threads so far."""
+    with _SEQ_LOCK:
+        return list(_SEQ_THREADS)
 _RUN_DEPTH = 0
 _RUN_DEPTH_LOCK = threading.Lock()
 _PREV_SIGINT: Callable[[int, FrameType | None], object] | int | None = None
@@ -70,26 +96,19 @@ def _handle_sigint(signum: int, frame: FrameType | None) -> None:
 
 
 def _stopper_main() -> None:
-    """Stop every running child group while the run is active (SPEC §7.1).
+    """Start one stop-sequence thread per running group (SPEC §7.1).
 
-    Blocks in ``Event.wait()``, then runs the stop sequences of all
-    running groups concurrently so each gets its SIGINT at once. Groups
-    registered after the flag (a check that raced it) are picked up on
-    the next sweep; the thread exits only when the run ends with no
-    groups left.
+    Blocks in ``Event.wait()`` with no timeout and wakes once when the
+    flag is set. Every group registered at that point gets its own
+    stop-sequence thread at once; groups that register later get theirs
+    immediately at registration (see ``_reg_add``). The thread then
+    returns; ``run_many`` joins it and every sequence thread.
     """
-    while True:
-        flagged = _INTERRUPT.wait(timeout=0.5)
-        procs = _reg_snapshot()
-        active = _RUN_ACTIVE.is_set()
-        if not active and not procs:
-            return
-        if not flagged or not procs:
-            continue
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=len(procs), thread_name_prefix="stopper-seq"
-        ) as pool:
-            list(pool.map(lambda p: _stop_sequence(p, p.pid), procs))
+    _INTERRUPT.wait()
+    if not _RUN_ACTIVE.is_set():
+        return
+    for proc in _reg_snapshot():
+        _start_sequence(proc)
 
 
 def _run_depth_enter() -> int:
@@ -1614,6 +1633,7 @@ def run_many(
     again: bool = False,
     dry_run: bool = False,
     max_parallel: int = 3,
+    memory_has: Callable[[str], bool] | None = None,
 ) -> int:
     """Run beads, up to ``max_parallel`` at once; preflight first (SPEC §7.1)."""
     from helios import preflight as preflight_mod
@@ -1623,6 +1643,9 @@ def run_many(
     stopper: threading.Thread | None = None
     if outermost:
         _INTERRUPT.clear()
+        with _SEQ_LOCK:
+            _SEQ_THREADS.clear()
+            _SEQ_DONE.clear()
         if _install_handler():
             _RUN_ACTIVE.set()
             stopper = threading.Thread(
@@ -1635,7 +1658,7 @@ def run_many(
         loaded = [beads.show(bid) for bid in bead_ids]
         ctx = preflight_mod.PreflightContext(
             hub=hub,
-            memory_has=lambda key: False,
+            memory_has=memory_has if memory_has is not None else (lambda key: False),
             runs_rel=cfg.project.runs,
             units_dir=cfg.project.units,
         )
@@ -1708,6 +1731,9 @@ def run_many(
         if outermost:
             _RUN_ACTIVE.clear()
             if stopper is not None:
+                _INTERRUPT.set()
                 stopper.join()
+            for thread in _seq_threads():
+                thread.join()
             _restore_handler()
         _run_depth_exit()

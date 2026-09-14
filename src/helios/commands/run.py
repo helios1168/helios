@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 from pathlib import Path
 
 from helios import beads as beads_mod
@@ -25,6 +26,23 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def memory_has_for(
+    beads: beads_mod.Beads | beads_mod.FakeBeads, cfg: config_mod.Config
+) -> Callable[[str], bool]:
+    """Build the preflight memory lookup from the configured backend (§13)."""
+    if cfg.memory.backend == "files":
+        export = cfg.hub / cfg.memory.export_dir
+        return lambda key: (export / f"{key}.md").is_file()
+
+    def has(key: str) -> bool:
+        try:
+            return beads.recall(key) is not None
+        except Exception:
+            return False
+
+    return has
+
+
 def run(args: argparse.Namespace) -> int:
     """Load config, read beads, and run the pipeline (SPEC §7.1)."""
     hub = config_mod.find_hub(Path.cwd())
@@ -40,4 +58,5 @@ def run(args: argparse.Namespace) -> int:
         again=args.again,
         dry_run=args.dry_run,
         max_parallel=args.max_parallel,
+        memory_has=memory_has_for(beads, cfg),
     )

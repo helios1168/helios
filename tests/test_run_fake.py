@@ -1188,6 +1188,7 @@ def test_sigint_during_preflight_creates_nothing(
 
 def test_handler_restored_and_flag_cleared(tmp_path: Path, monkeypatch) -> None:
     import signal as _signal
+    import threading as _threading
 
     hub = make_hub(tmp_path)
     beads = beads_mod.FakeBeads([make_bead("b1")])
@@ -1199,7 +1200,8 @@ def test_handler_restored_and_flag_cleared(tmp_path: Path, monkeypatch) -> None:
                             config=config_mod.load(hub),
                             harness_override="fake") == 0
     assert _signal.getsignal(_signal.SIGINT) is before
-    assert not run_mod._INTERRUPT.is_set()
+    assert not [t for t in _threading.enumerate()
+                if t.name.startswith("_stopper") and t.is_alive()]
 
 
 def test_sigint_during_prepare_no_launch(tmp_path: Path) -> None:
@@ -1832,6 +1834,36 @@ def test_session_survives_crash_before_envelope(
     assert rc == 0
     assert read_envelope(hub, "b1", 1)["session_id"] == "s7"
     assert beads.beads["b1"].metadata["session"] == "fake:s7"
+
+
+def test_memory_lookup_gates_preflight(tmp_path: Path, monkeypatch) -> None:
+    from helios.commands import run as run_cmd
+
+    hub = make_hub(tmp_path)
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "done", "summary": "s"}}))
+    beads = beads_mod.FakeBeads([make_bead("b1", memories=["m1"])])
+    cfg = config_mod.load(hub)
+    assert run_mod.run_many(["b1"], hub=hub, beads=beads, config=cfg,
+                            harness_override="fake") == 2
+    beads2 = beads_mod.FakeBeads([make_bead("b1", memories=["m1"])])
+    assert run_mod.run_many(["b1"], hub=hub, beads=beads2, config=cfg,
+                            harness_override="fake",
+                            memory_has=lambda key: key == "m1") == 0
+    assert "b1" in beads2.closed
+
+
+def test_memory_has_for_backends(tmp_path: Path) -> None:
+    from helios.commands import run as run_cmd
+
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([])
+    assert run_cmd.memory_has_for(beads, cfg)("anything") is False
+    beads.remember("m1", "v")
+    assert run_cmd.memory_has_for(beads, cfg)("m1") is True
+    assert run_cmd.memory_has_for(beads, cfg)("nope") is False
 
 
 def test_lock_refusal_second_process(tmp_path: Path) -> None:
