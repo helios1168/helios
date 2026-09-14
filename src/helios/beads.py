@@ -208,7 +208,9 @@ def plan_writeback(
         metadata["verdict"] = verdict
     if output_commit is not None:
         metadata["output_commit"] = output_commit
-    comments = [f"event: [{attempt_id}] {execution_status} {report_status} {report_summary}"]
+    status_text = report_status if report_status else "-"
+    summary_text = report_summary if report_summary else "-"
+    comments = [f"event: [{attempt_id}] {execution_status} {status_text} {summary_text}"]
     for i, line in enumerate(learned, 1):
         comments.append(f"learned: [{attempt_id}#{i}] {line}")
     for i, line in enumerate(missing_context, 1):
@@ -295,6 +297,7 @@ class BeadsLike(Protocol):
     def set_metadata(self, bead_id: str, metadata: dict[str, str]) -> None: ...
     def close(self, bead_id: str, reason: str) -> None: ...
     def set_state(self, bead_id: str, dimension: str, value: str, reason: str) -> None: ...
+    def list(self, *, labels: list[str] = [], status: str | None = None) -> list[Bead]: ...
     def ready(self, *, labels: list[str] = []) -> list[Bead]: ...
     def add_label(self, bead_id: str, label: str) -> None: ...
     def gate_list(self) -> list[dict[str, Any]]: ...
@@ -488,7 +491,9 @@ class Beads:
         itself ends in a newline. The JSON `value` field is the exact stored text. bd
         exits 1 (still printing a well-formed `{"found": false, ...}` body) for a missing
         key, so this reads stdout directly rather than through `_run_json`, which would
-        raise on that nonzero exit.
+        raise on that nonzero exit. A payload that parses but is not a JSON object (`[]`,
+        `null`, a string, a number) raises `ValueError` naming the payload, rather than
+        letting `.get` fail with `AttributeError`.
         """
         proc = subprocess.run(
             [self.binary, "recall", key, "--json"],
@@ -496,7 +501,10 @@ class Beads:
             capture_output=True,
             check=False,
         )
-        payload = json.loads(proc.stdout.decode("utf-8"))
+        out = proc.stdout.decode("utf-8")
+        payload = json.loads(out)
+        if not isinstance(payload, dict):
+            raise ValueError(f"bd recall returned an unexpected payload: {out!r}")
         return payload["value"] if payload.get("found") else None
 
     def memories(self) -> dict[str, str]:

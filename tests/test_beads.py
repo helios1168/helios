@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ from helios.beads import (
     Bead,
     BeadNotFound,
     Beads,
+    BeadsLike,
     Comment,
     FakeBeads,
     apply_writeback,
@@ -70,6 +72,21 @@ def test_bead_from_show_renders_non_string_scalars_as_json_text() -> None:
     assert bead.author == "false"
 
 
+def test_beads_and_fakebeads_provide_every_beadslike_method() -> None:
+    """`BeadsLike` is the interface control.py and others depend on; both concrete
+    implementations must still provide each of its methods (hel-f8w item 1).
+    """
+    protocol_methods = [
+        name
+        for name, _ in inspect.getmembers(BeadsLike, predicate=inspect.isfunction)
+        if not name.startswith("_")
+    ]
+    assert "list" in protocol_methods
+    for name in protocol_methods:
+        assert callable(getattr(Beads, name, None)), name
+        assert callable(getattr(FakeBeads, name, None)), name
+
+
 def test_replay_skips_existing_kind_and_marker() -> None:
     fake = FakeBeads([Bead(id="b1")])
     plan = plan_writeback(
@@ -124,6 +141,59 @@ def test_non_closing_plan_records_run_state() -> None:
     apply_writeback(fake, "b2", plan)
     assert "b2" not in fake.closed
     assert fake.states["b2"]["run"] == "waiting"
+
+
+def test_event_comment_writes_dash_for_missing_status_and_summary() -> None:
+    """SPEC §7.5: `event: [id] <execution_status> <status> <summary>`; a missing
+    report status or summary writes `-`, never the literal `None` (hel-f8w item 3).
+    """
+    plan = plan_writeback(
+        attempt_id="b#1",
+        bead_kind="impl",
+        harness="codex",
+        session_id=None,
+        worktree="/wt",
+        attempt=1,
+        execution_status="crashed",
+        verdict=None,
+        output_commit=None,
+        report_status=None,
+        report_summary="",
+        learned=[],
+        missing_context=[],
+        followups=[],
+        question=None,
+        checks_passed=False,
+    )
+    assert plan.comments[0] == "event: [b#1] crashed - -"
+
+
+def test_event_comment_replay_recognizes_old_format_marker() -> None:
+    """A comment written before this change (with the literal `None`) still counts
+    as the same `[id]` marker, so replay after it writes nothing new for `event`.
+    """
+    fake = FakeBeads([Bead(id="b1")])
+    fake.add_comment("b1", "event: [b1#1] crashed None None")
+    plan = plan_writeback(
+        attempt_id="b1#1",
+        bead_kind="impl",
+        harness="codex",
+        session_id=None,
+        worktree="/wt",
+        attempt=1,
+        execution_status="crashed",
+        verdict=None,
+        output_commit=None,
+        report_status=None,
+        report_summary="",
+        learned=[],
+        missing_context=[],
+        followups=[],
+        question=None,
+        checks_passed=False,
+    )
+    assert apply_writeback(fake, "b1", plan) == 0
+    assert len(fake.comments("b1")) == 1
 
 
 def test_comment_has_matches_kind_and_marker() -> None:
@@ -342,6 +412,17 @@ def test_shim_bd_show_raises_runtime_error_for_malformed_success_payload(
     beads = Beads(tmp_path, binary=shim)
     with pytest.raises(RuntimeError):
         beads.show("any-id")
+
+
+@pytest.mark.parametrize("payload", ["[]", "null", '"x"', "1"])
+def test_recall_raises_value_error_for_non_object_payload(tmp_path: Path, payload: str) -> None:
+    """bd recall --json normally prints an object; a non-object payload ([], null,
+    a string, a number) must raise ValueError, not AttributeError (hel-f8w item 2).
+    """
+    shim = _write_shim_bd(tmp_path, f"echo '{payload}'\n")
+    beads = Beads(tmp_path, binary=shim)
+    with pytest.raises(ValueError, match="unexpected payload"):
+        beads.recall("any-key")
 
 
 @pytest.mark.skipif(BD is None, reason="bd is not on PATH")
