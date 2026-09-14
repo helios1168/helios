@@ -1,12 +1,13 @@
 """Run one claim and print one JSON protocol line (SPEC §15.2 step 3).
 
-Usage: python -m helios.claims.runner <module> <ident_module> <ident_qualname> <ident_lineno>
+Usage: python -m helios.claims.runner <module> <name>
 
-The identity triple names the exact registered claim to run (module, qualname,
-first source line), looked up among the claims owned by <module> and its
-submodules. helios never runs the last claim registered under a name (SPEC
-§15.2 step 3, decided): a claim registered by a foreign module must never
-shadow the one the parent validated.
+The runner imports <module> fresh (forgetting it, its submodules and their
+claim registrations first, so collection here sees exactly one import pass,
+same as the check/attack process), then looks up the single collected record
+named <name> under <module> or its submodules. Zero or more than one match is
+an error naming the claim (SPEC §15.2, decided): a claim registered by a
+foreign module must never shadow the one the parent validated.
 
 File descriptor 1 is redirected to file descriptor 2 while the claim module is
 imported and the claim runs, so claim output never reaches the protocol
@@ -24,14 +25,15 @@ import sys
 import traceback
 
 
-def run_claim(module_name: str, ident: tuple[str, str, int]) -> str:
-    """Import the module, run the identified claim, return the protocol line."""
-    from helios.claims import claim_by_identity
+def run_claim(module_name: str, name: str) -> str:
+    """Import the module, run the named claim, return the protocol line."""
+    from helios.claims import claim_for, reset_claims_module
 
+    reset_claims_module(module_name)
     importlib.import_module(module_name)
-    func = claim_by_identity(module_name, ident).func
+    func = claim_for(module_name, name).func
     if func is None:
-        raise ValueError(f"claim {ident!r} has no callable")
+        raise ValueError(f"claim {name!r} has no callable")
     result = func()
     from helios.envelope import Finding
 
@@ -61,7 +63,7 @@ def flush_c_stdio() -> None:
 
 def main(argv: list[str]) -> None:
     module_name = argv[1]
-    ident = (argv[2], argv[3], int(argv[4]))
+    name = argv[2]
     hub = os.getcwd()
     sys.path.insert(0, hub)
     sys.path.insert(0, os.path.join(hub, "src"))
@@ -70,7 +72,7 @@ def main(argv: list[str]) -> None:
     saved = os.dup(1)
     os.dup2(2, 1)
     try:
-        line = run_claim(module_name, ident)
+        line = run_claim(module_name, name)
     except BaseException:
         line = json.dumps({"error": traceback.format_exc()})
     flush_c_stdio()

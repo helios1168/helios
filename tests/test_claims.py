@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import signal
+import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -908,12 +910,12 @@ def test_setsid_grandchild_timeout_returns_fast(
         pass
 
 
-def test_reimport_replaces_identity_not_duplicate(tmp_path: Path) -> None:
-    """A re-import of the same claim (same module, qualname, source line) replaces silently."""
+def test_reimport_clears_stale_records(tmp_path: Path) -> None:
+    """Re-loading the same claims module forgets its stale records first (SPEC §15.2, decided)."""
     hub = make_hub(tmp_path, "reim", BASE_PROG, claim_src("c_reim", "return True"))
     claims_lib.load_claims(hub, "clm_reim")
     claims_lib.load_claims(hub, "clm_reim")
-    assert len(claims_lib._CLAIMS["c_reim"]) == 1
+    assert len(claims_lib.records_for("clm_reim")) == 1
 
 
 def test_duplicate_detected_before_filters(
@@ -989,3 +991,235 @@ def test_invalid_claim_name_rejected(
     assert cli.main(["claims", "check"]) == 2
     err = capsys.readouterr().err
     assert err.startswith(f"helios: cannot import clm_{tag}: ValueError: "), err
+
+
+# ============================================================ round 4 review fixes
+
+
+DECL = 'covers=("b1",), backend="prover", method="proof", scope="universal"'
+
+
+def verdicts_of(lines: list[str]) -> dict[str, str]:
+    return {(f := json.loads(line))["id"]: f["verdict"] for line in lines}
+
+
+def test_one_line_lambdas_same_name_is_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Two lambdas on one line sharing a claim name are the step 1 duplicate (decided)."""
+    src = (
+        f"{HEADER}"
+        f'claim("la", {DECL})(lambda: True)\n'
+        f'claim("la", {DECL})(lambda: False)\n'
+    )
+    hub = make_hub(tmp_path, "lam", BASE_PROG, src)
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 2
+    assert capsys.readouterr().err == "la: duplicate claim name\n"
+
+
+def test_one_line_lambdas_distinct_names_both_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Two lambdas on one line with distinct names both run (module is the call site)."""
+    src = (
+        f"{HEADER}"
+        f'claim("la2", {DECL})(lambda: True)\n'
+        f'claim("lb2", {DECL})(lambda: False)\n'
+    )
+    hub = make_hub(tmp_path, "lam2", BASE_PROG, src)
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 3
+    assert verdicts_of(capsys.readouterr().out.splitlines()) == {
+        "la2": "verified",
+        "lb2": "refuted",
+    }
+
+
+def test_factory_same_name_is_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A factory called twice with the same claim name is a duplicate (decided).
+
+    func.__qualname__ and co_firstlineno are identical for both inner
+    functions; the module is the call site, keyed only with the claim name.
+    """
+    src = HEADER + textwrap.dedent(
+        f"""\
+        def make(name, value):
+            @claim(name, {DECL})
+            def f():
+                return value
+            return f
+        make("fs", False)
+        make("fs", True)
+        """
+    )
+    hub = make_hub(tmp_path, "facs", BASE_PROG, src)
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 2
+    assert capsys.readouterr().err == "fs: duplicate claim name\n"
+
+
+def test_factory_distinct_names_both_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A factory producing distinct names works with the right verdicts (decided)."""
+    src = HEADER + textwrap.dedent(
+        f"""\
+        def make(name, value):
+            @claim(name, {DECL})
+            def f():
+                return value
+            return f
+        make("fa", True)
+        make("fb", False)
+        """
+    )
+    hub = make_hub(tmp_path, "fac", BASE_PROG, src)
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 3
+    assert verdicts_of(capsys.readouterr().out.splitlines()) == {
+        "fa": "verified",
+        "fb": "refuted",
+    }
+
+
+def test_wraps_pair_same_name_is_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Two functools.wraps wrappers of functions named check sharing a name are duplicates."""
+    src = HEADER + "import functools\n" + textwrap.dedent(
+        f"""\
+        def logged(fn):
+            @functools.wraps(fn)
+            def wrapper():
+                return fn()
+            return wrapper
+
+        @claim("wd", {DECL})
+        @logged
+        def check():
+            return False
+
+        @claim("wd", {DECL})
+        @logged
+        def check():
+            return True
+        """
+    )
+    hub = make_hub(tmp_path, "wrpd", BASE_PROG, src)
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 2
+    assert capsys.readouterr().err == "wd: duplicate claim name\n"
+
+
+def test_exec_pair_same_name_is_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Two exec blocks registering the same claim name are duplicates (decided)."""
+    ea = f'@claim("ea2", {DECL})\ndef f():\n    return True\n'
+    eb = f'@claim("ea2", {DECL})\ndef f():\n    return False\n'
+    src = HEADER + f"exec({ea!r}, globals())\nexec({eb!r}, globals())\n"
+    hub = make_hub(tmp_path, "exed", BASE_PROG, src)
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 2
+    assert capsys.readouterr().err == "ea2: duplicate claim name\n"
+
+
+def test_callable_instance_and_partial_are_valid_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A callable instance and a functools.partial each run with the right verdict (decided)."""
+    src = HEADER + "import functools\n" + textwrap.dedent(
+        f"""\
+        class Check:
+            def __call__(self):
+                return True
+        claim("inst2", {DECL})(Check())
+        def g(v):
+            return v
+        claim("part2", {DECL})(functools.partial(g, True))
+        """
+    )
+    hub = make_hub(tmp_path, "inst2", BASE_PROG, src)
+    monkeypatch.chdir(hub)
+    assert cli.main(["claims", "check"]) == 0
+    assert verdicts_of(capsys.readouterr().out.splitlines()) == {
+        "inst2": "verified",
+        "part2": "verified",
+    }
+
+
+def test_pump_caps_stdout_head_and_flags_overflow() -> None:
+    """Stdout (the protocol channel) keeps at most STDOUT_CAP bytes past which overflow is set."""
+    r, w = os.pipe()
+    buf = bytearray()
+    overflow = [False]
+    data = b"x" * (claims_lib.STDOUT_CAP + 4096)
+
+    def writer() -> None:
+        written = 0
+        while written < len(data):
+            written += os.write(w, data[written:])
+        os.close(w)
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    claims_lib._pump(r, buf, claims_lib.STDOUT_CAP, False, overflow)
+    t.join(10)
+    os.close(r)
+    assert len(buf) == claims_lib.STDOUT_CAP
+    assert overflow[0] is True
+
+
+def test_pump_caps_stderr_to_last_bytes() -> None:
+    """Stderr keeps only the last STDERR_CAP bytes, never growing past it (SPEC §15.2, decided)."""
+    r, w = os.pipe()
+    buf = bytearray()
+    overflow = [False]
+    chunk = b"y" * claims_lib.STDERR_CAP
+    tail = b"z" * 100
+
+    def writer() -> None:
+        for _ in range(3):
+            written = 0
+            while written < len(chunk):
+                written += os.write(w, chunk[written:])
+        written = 0
+        while written < len(tail):
+            written += os.write(w, tail[written:])
+        os.close(w)
+
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    claims_lib._pump(r, buf, claims_lib.STDERR_CAP, True, overflow)
+    t.join(10)
+    os.close(r)
+    assert len(buf) == claims_lib.STDERR_CAP
+    assert bytes(buf).endswith(tail)
+    assert overflow[0] is False
+
+
+def test_setsid_yes_grandchild_output_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A setsid `yes` writing to inherited stdout and stderr must not balloon memory (decided)."""
+    pidfile = tmp_path / "yes.pid"
+    monkeypatch.setenv("VERIFY_PIDFILE", str(pidfile))
+    body = (
+        'p = subprocess.Popen(["yes"], start_new_session=True)\n'
+        'open(os.environ["VERIFY_PIDFILE"], "w").write(str(p.pid))\n'
+        "time.sleep(0.5)\nreturn True"
+    )
+    hub = make_hub(tmp_path, "yesgc", BASE_PROG, claim_src("yesgc", body))
+    start = time.monotonic()
+    code, lines, err = run_check(hub, monkeypatch, capsys, "--timeout", "30")
+    secs = time.monotonic() - start
+    assert code == 0, err
+    assert json.loads(lines[0])["verdict"] == "verified"
+    assert secs < 5, secs
+    try:
+        os.kill(int(pidfile.read_text()), signal.SIGKILL)
+    except ProcessLookupError:
+        pass

@@ -425,10 +425,13 @@ def module_relpath(module_name: str) -> str:
 
 
 _CHILD_SCRIPT = (
-    # Import everything the script itself needs before sys.path is replaced,
-    # so a committed module of the same name (json.py, say) in the extracted
-    # tree can never shadow it (SPEC §15.3, decided).
+    # Import everything the script itself needs, and helios.program (so every
+    # module it depends on: dataclasses, pathlib, typing and the rest, are
+    # already cached), before sys.path is replaced, so a committed module of
+    # the same name (json.py, dataclasses.py, ...) in the extracted tree can
+    # never shadow one already imported (SPEC §15.3, decided).
     "import sys, os, importlib, json\n"
+    "import helios.program\n"
     "name, root, out, helios_dir, stdlib, platstdlib, sitepkgs = sys.argv[1:8]\n"
     "extra = sitepkgs.split(os.pathsep) if sitepkgs else []\n"
     "sys.path[:] = [root + '/src', root, helios_dir, stdlib, platstdlib] + extra\n"

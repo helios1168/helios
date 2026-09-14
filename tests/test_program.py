@@ -643,6 +643,39 @@ def test_program_diff_child_stdlib_named_sibling(
     assert capsys.readouterr().out == "+b\n"
 
 
+@pytest.mark.parametrize("mod", ["dataclasses", "pathlib", "typing"])
+def test_program_diff_tree_shadow_of_helios_program_dependency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, mod: str
+) -> None:
+    """A tree file named after a helios.program dependency must not break the diff child.
+
+    The child imports helios.program (so dataclasses, pathlib, typing, ...
+    are already cached) before it replaces sys.path (SPEC §15.3, decided).
+    `program show` never replaces sys.path at all, so it is unaffected either
+    way; this test focuses on the diff child that does.
+    """
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    write_hub(hub, f"shprog_{mod}", "")
+    git(hub, "init", "-q")
+    reg_src = (
+        "from helios.program import Block, Registry\nREGISTRY = Registry()\n"
+        "REGISTRY.add(Block('a', 'set', 'x'))\n"
+    )
+    (hub / f"shprog_{mod}.py").write_text(reg_src)
+    (hub / f"{mod}.py").write_text("SHADOW = True\n")
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r1")
+    rev1 = git(hub, "rev-parse", "HEAD")
+    (hub / f"shprog_{mod}.py").write_text(reg_src + "REGISTRY.add(Block('b', 'set', 'x'))\n")
+    git(hub, "add", "-A")
+    git(hub, "commit", "-qm", "r2")
+    rev2 = git(hub, "rev-parse", "HEAD")
+    monkeypatch.chdir(hub)
+    assert cli.main(["program", "diff", rev1, rev2]) == 0
+    assert capsys.readouterr().out == "+b\n"
+
+
 def test_program_diff_child_imports_third_party(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:

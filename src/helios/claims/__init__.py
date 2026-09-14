@@ -13,6 +13,7 @@ import time
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import FrameType
 from typing import Any, Callable, TextIO
 
 from helios import program as prog
@@ -58,28 +59,27 @@ class Claim:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-_CLAIMS: dict[str, list[Claim]] = {}
+_CLAIMS: list[Claim] = []
 
 
-def identity(c: Claim) -> tuple[str, str, int]:
-    """A claim record's identity: (module, qualname, first source line).
+def _caller_module(frame: FrameType | None) -> str:
+    """The module attributed to a `claim(...)` call (SPEC §15.2, decided).
 
-    Registering the same identity again (a re-import) replaces the record
-    silently; two records with the same claim name and different identities
-    are duplicates, even in one module (SPEC §15.2, decided).
+    Walk outward from the direct caller of `claim` to the first frame whose
+    code name is "<module>" and return its `__name__`; if none is found, use
+    the direct caller's own `f_globals["__name__"]`. Never func.__module__,
+    __qualname__, co_firstlineno or repr: a factory, a pair of
+    functools.wraps wrappers or a pair of exec blocks can all give a func
+    that collides on those, even across distinct claims.
     """
-    func: Any = c.func
-    try:
-        qual = func.__qualname__
-    except AttributeError:
-        qual = repr(func)
-    if not isinstance(qual, str):
-        qual = repr(func)
-    try:
-        lineno = func.__code__.co_firstlineno
-    except AttributeError:
-        lineno = -1
-    return (c.module, qual, lineno)
+    direct = frame
+    while frame is not None:
+        if frame.f_code.co_name == "<module>":
+            return str(frame.f_globals.get("__name__", ""))
+        frame = frame.f_back
+    if direct is None:
+        return ""
+    return str(direct.f_globals.get("__name__", ""))
 
 
 def claim(
@@ -95,61 +95,84 @@ def claim(
     """Register a zero-argument claim callable (SPEC §15.2).
 
     `name` must match ``^[A-Za-z0-9_][A-Za-z0-9._-]{0,199}$``; otherwise this
-    raises ValueError at registration (decided). Registering the same identity
-    again (module, qualname, first source line) replaces the existing record
-    in place, so a re-import never creates a duplicate.
+    raises ValueError at registration (decided). A record's module is the
+    module-level frame that called `claim(...)` (see `_caller_module`); a
+    record is keyed by (module, claim name). Every call appends a record;
+    `forget_claims` clears stale ones before a fresh import, and duplicate
+    names among collected records are a step 1 problem, not resolved here.
+    Callable instances and `functools.partial` objects are valid claims.
     """
     if not CLAIM_NAME_RE.fullmatch(name):
         raise ValueError(f"invalid claim name {name!r}")
+    module = _caller_module(sys._getframe(1))
 
     def decorator(func: Callable[[], Any]) -> Callable[[], Any]:
-        record = Claim(
-            name=name,
-            covers=tuple(covers),
-            backend=backend,
-            method=method,
-            scope=scope,
-            bound=bound,
-            artifact=artifact,
-            redundant=tuple(redundant),
-            func=func,
-            module=func.__module__,
+        _CLAIMS.append(
+            Claim(
+                name=name,
+                covers=tuple(covers),
+                backend=backend,
+                method=method,
+                scope=scope,
+                bound=bound,
+                artifact=artifact,
+                redundant=tuple(redundant),
+                func=func,
+                module=module,
+            )
         )
-        records = _CLAIMS.setdefault(name, [])
-        ident = identity(record)
-        for i, existing in enumerate(records):
-            if identity(existing) == ident:
-                records[i] = record
-                return func
-        records.append(record)
         return func
 
     return decorator
 
 
 def claim_by_name(name: str) -> Claim:
-    """Return the latest registered claim, raising KeyError when unknown."""
-    try:
-        return _CLAIMS[name][-1]
-    except (KeyError, IndexError):
-        raise KeyError(name) from None
+    """Return the most recently registered claim, raising KeyError when unknown."""
+    for record in reversed(_CLAIMS):
+        if record.name == name:
+            return record
+    raise KeyError(name)
 
 
-def claim_by_identity(module_name: str, ident: tuple[str, str, int]) -> Claim:
-    """Look up a claim owned by module_name (or a submodule) by identity.
-
-    Never the global last registration by name: a claim registered by a
-    module outside the configured package is not collected and never shadows
-    a collected one (SPEC §15.2 step 3, decided).
-    """
+def records_for(module_name: str) -> list[Claim]:
+    """Collected records whose module is module_name or under its package prefix."""
     prefix = module_name + "."
-    for records in _CLAIMS.values():
-        for record in records:
-            if record.module != module_name and not record.module.startswith(prefix):
-                continue
-            if identity(record) == ident:
-                return record
-    raise KeyError(ident)
+    return [r for r in _CLAIMS if r.module == module_name or r.module.startswith(prefix)]
+
+
+def forget_claims(module_name: str) -> None:
+    """Drop every record whose module is module_name or under its package prefix."""
+    prefix = module_name + "."
+    _CLAIMS[:] = [
+        r for r in _CLAIMS if r.module != module_name and not r.module.startswith(prefix)
+    ]
+
+
+def reset_claims_module(module_name: str) -> None:
+    """Forget module_name and its submodules from sys.modules and the registry.
+
+    So the next import of it is exactly one fresh pass (SPEC §15.2, decided).
+    The check/attack process and the runner both call this before importing
+    the configured module.
+    """
+    prog.forget_module(module_name)
+    forget_claims(module_name)
+
+
+def claim_for(module_name: str, name: str) -> Claim:
+    """Return the single record named `name` under module_name or its submodules.
+
+    Zero or more than one match raises ValueError naming the claim: the
+    runner never falls back to a global last registration by name, and a
+    claim registered by a module outside the configured package is never
+    collected here (SPEC §15.2 step 3, decided).
+    """
+    matches = [r for r in records_for(module_name) if r.name == name]
+    if len(matches) != 1:
+        raise ValueError(
+            f"claim {name!r} under {module_name!r}: {len(matches)} matching records"
+        )
+    return matches[0]
 
 
 @dataclass
@@ -194,20 +217,17 @@ def load_backends(hub: Path) -> dict[str, Backend]:
 def load_claims(hub: Path, module_name: str | None) -> list[Claim]:
     """Import the claims module and return every owned registration.
 
-    Claims modules may be packages: a claim is owned when its function module is
-    the configured module or starts with `<module>.`. Re-imports append
-    duplicate records; selection dedupes them (SPEC §15.2).
+    Claims modules may be packages: a claim is owned when its module is the
+    configured module or starts with `<module>.`. The module and its
+    submodules are forgotten, from sys.modules and the registry, before the
+    fresh import, so collection sees exactly one import pass (SPEC §15.2,
+    decided).
     """
     if not module_name:
         raise ValueError("project.claims is not configured")
+    reset_claims_module(module_name)
     module = prog.load_module(module_name, hub)
-    prefix = module.__name__ + "."
-    return [
-        record
-        for records in _CLAIMS.values()
-        for record in records
-        if record.module == module.__name__ or record.module.startswith(prefix)
-    ]
+    return records_for(module.__name__)
 
 
 def select_claims(
@@ -222,9 +242,7 @@ def select_claims(
     groups: dict[str, list[Claim]] = {}
     for c in records:
         groups.setdefault(c.name, []).append(c)
-    dupes = sorted(
-        name for name, group in groups.items() if len({identity(c) for c in group}) > 1
-    )
+    dupes = sorted(name for name, group in groups.items() if len(group) > 1)
     if dupes:
         return [], dupes
     claims = []
@@ -314,7 +332,11 @@ def kill_group(pid: int) -> None:
         pass
 
 
-def _pump(fd: int, chunks: list[bytes]) -> None:
+STDOUT_CAP = 16 * 1024 * 1024
+STDERR_CAP = 64 * 1024
+
+
+def _pump(fd: int, buf: bytearray, cap: int, keep_tail: bool, overflow: list[bool]) -> None:
     """Read a raw fd to EOF in a background daemon thread, unbuffered.
 
     Reading os.read(fd, ...) directly, instead of a buffered stream object,
@@ -322,14 +344,29 @@ def _pump(fd: int, chunks: list[bytes]) -> None:
     escaped the runner's process group and still holds the pipe open) never
     holds a lock a main-thread close() would wait on. The main thread never
     closes these fds; it abandons the thread and continues (SPEC §15.2,
-    decided).
+    decided). The fd is drained to the end of the collection bound either way,
+    so a producer ignoring backpressure cannot block on a full pipe; only
+    memory is bounded, to at most `cap` bytes. `keep_tail` keeps the last
+    `cap` bytes (used for stderr); otherwise the first `cap` bytes are kept
+    and `overflow[0]` is set once more than that has been read (used for
+    stdout, the protocol channel), so more than the cap is never mistaken for
+    an unparsable protocol line without a note.
     """
     try:
         while True:
             data = os.read(fd, 65536)
             if not data:
                 break
-            chunks.append(data)
+            if keep_tail:
+                buf.extend(data)
+                if len(buf) > cap:
+                    del buf[: len(buf) - cap]
+            else:
+                room = cap - len(buf)
+                if room > 0:
+                    buf.extend(data[:room])
+                if len(data) > room:
+                    overflow[0] = True
     except OSError:
         pass
 
@@ -337,11 +374,11 @@ def _pump(fd: int, chunks: list[bytes]) -> None:
 def run_claim(
     hub: Path,
     module_name: str,
-    ident: tuple[str, str, int],
+    name: str,
     timeout: float,
     omit: str | None = None,
 ) -> tuple[str, Any]:
-    """Run one identified claim in a subprocess; return (status, payload) (SPEC §15.2 step 3).
+    """Run one named claim in a subprocess; return (status, payload) (SPEC §15.2 step 3).
 
     The runner's exit ends the claim: wait for the process itself, not for pipe
     EOF (a grandchild may hold the pipes). Output is pumped on background
@@ -349,10 +386,10 @@ def run_claim(
     SIGKILLed and output collected with a bounded wait. Past that bound the
     threads and fds are abandoned, never closed from this thread, so no
     grandchild in the runner's process group survives collection but one that
-    left the group through its own new session may. Status is timeout, ok
-    (payload is a bool), finding (payload is a dict), other (payload is a type
-    name), error (payload is a traceback string), exited (payload is the exit
-    code) or unparsable.
+    left the group through its own new session may. Status is timeout,
+    overflow (stdout passed STDOUT_CAP), ok (payload is a bool), finding
+    (payload is a dict), other (payload is a type name), error (payload is a
+    traceback string), exited (payload is the exit code) or unparsable.
     """
     env = dict(os.environ)
     if omit is None:
@@ -360,7 +397,7 @@ def run_claim(
     else:
         env[prog.OMIT_ENV] = omit
     proc = subprocess.Popen(
-        [sys.executable, "-m", "helios.claims.runner", module_name, *ident[:2], str(ident[2])],
+        [sys.executable, "-m", "helios.claims.runner", module_name, name],
         cwd=hub,
         env=env,
         stdout=subprocess.PIPE,
@@ -368,11 +405,21 @@ def run_claim(
         start_new_session=True,
     )
     assert proc.stdout is not None and proc.stderr is not None
-    out_chunks: list[bytes] = []
-    err_chunks: list[bytes] = []
+    out_buf = bytearray()
+    err_buf = bytearray()
+    out_overflow = [False]
+    err_overflow = [False]
     readers = [
-        threading.Thread(target=_pump, args=(proc.stdout.fileno(), out_chunks), daemon=True),
-        threading.Thread(target=_pump, args=(proc.stderr.fileno(), err_chunks), daemon=True),
+        threading.Thread(
+            target=_pump,
+            args=(proc.stdout.fileno(), out_buf, STDOUT_CAP, False, out_overflow),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_pump,
+            args=(proc.stderr.fileno(), err_buf, STDERR_CAP, True, err_overflow),
+            daemon=True,
+        ),
     ]
     for reader in readers:
         reader.start()
@@ -394,7 +441,9 @@ def run_claim(
         kill_group(proc.pid)
         return ("timeout", None)
     kill_group(proc.pid)
-    return interpret_runner(code, b"".join(out_chunks).decode("utf-8", "replace"))
+    if out_overflow[0]:
+        return ("overflow", None)
+    return interpret_runner(code, bytes(out_buf).decode("utf-8", "replace"))
 
 
 def interpret_runner(returncode: int | None, stdout: str) -> tuple[str, Any]:
@@ -578,7 +627,7 @@ def run_selected(
     hub: Path, module_name: str, c: Claim, backends: dict[str, Backend], timeout: float
 ) -> Finding:
     """Run one non-manual claim and map the runner outcome to a finding."""
-    status, payload = run_claim(hub, module_name, identity(c), timeout)
+    status, payload = run_claim(hub, module_name, c.name, timeout)
     if status == "ok" and payload is True:
         return verified_finding(c)
     if status == "ok":
@@ -593,6 +642,8 @@ def run_selected(
         return inconclusive_finding(c, f"claim raised; traceback saved to {artifact}", artifact)
     if status == "timeout":
         return inconclusive_finding(c, timeout_note(timeout))
+    if status == "overflow":
+        return inconclusive_finding(c, "runner output over 16 MiB")
     if status == "other":
         return inconclusive_finding(c, f"claim returned {payload}")
     if status == "exited":
@@ -640,8 +691,7 @@ def _attack_claim(
         print(f"{name}: unknown claim", file=stderr)
         return 2
     c = wanted[0]
-    ident = identity(c)
-    status, payload = run_claim(hub, claims, ident, timeout)
+    status, payload = run_claim(hub, claims, c.name, timeout)
     if status != "ok" or payload is not True:
         print("baseline did not pass", file=stderr)
         return 2
@@ -651,7 +701,7 @@ def _attack_claim(
         if is_requirement(covered) or covered not in active_ids:
             continue
         expected = "may_pass" if covered in c.redundant else "must_fail"
-        status, payload = run_claim(hub, claims, ident, timeout, omit=covered)
+        status, payload = run_claim(hub, claims, c.name, timeout, omit=covered)
         if status == "ok" and payload is True:
             outcome = "passed"
         elif status == "ok":
