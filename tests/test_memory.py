@@ -279,6 +279,47 @@ def test_body_size_limit(tmp_path: Path) -> None:
     assert not (tmp_path / "e" / "big.md").exists()
 
 
+# hel-j31 item 2: a header value json cannot serialize (TypeError from
+# json.dumps) raises ValueError naming the key, on every backend.
+
+
+class _Unserializable:
+    pass
+
+
+@pytest.mark.parametrize("bad_value", [{1, 2}, b"bytes", _Unserializable()])
+def test_header_unserializable_value_raises_valueerror(tmp_path: Path, bad_value: Any) -> None:
+    fake = FakeBeads()
+    for backend in (files_backend(tmp_path), mem.BeadsBackend(fake, tmp_path / "e")):
+        with pytest.raises(ValueError) as excinfo:
+            backend.write("bad-ser", {"source": "s", "x": bad_value}, "b")
+        assert "bad-ser" in str(excinfo.value)
+    assert fake.argv_log == []
+    assert not (tmp_path / "store").exists() and not (tmp_path / "e").exists()
+
+
+# hel-j31 item 3: a non-str dict key anywhere in the header is refused
+# instead of silently stringified, on every backend.
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        {"source": "s", "n": {1: "a"}},
+        {"source": "s", "n": {"a": 1, 2: "b"}},
+        {"source": "s", "n": {(1, 2): "v"}},
+    ],
+)
+def test_header_nonstr_dict_key_refused(tmp_path: Path, header: dict[str, Any]) -> None:
+    fake = FakeBeads()
+    for backend in (files_backend(tmp_path), mem.BeadsBackend(fake, tmp_path / "e")):
+        with pytest.raises(ValueError) as excinfo:
+            backend.write("nsk", header, "b")
+        assert "nsk" in str(excinfo.value)
+    assert fake.argv_log == []
+    assert not (tmp_path / "store").exists() and not (tmp_path / "e").exists()
+
+
 def test_nul_in_body_or_header_raises_naming_key(tmp_path: Path) -> None:
     backend = files_backend(tmp_path)
     with pytest.raises(ValueError) as excinfo:
@@ -448,6 +489,61 @@ def test_import_hidden_broken_and_dir_md_checked(
     assert fake.argv_log == []
 
 
+# hel-j31 item 4: export and stale use the same entry listing and
+# regular-file check as import_, instead of silently skipping a dotfile or a
+# non-regular x.md entry ahead of time.
+
+
+@pytest.mark.parametrize(
+    "kind,bad_name",
+    [("hidden", ".hidden"), ("broken-symlink", "c"), ("dir", "dir")],
+)
+def test_export_hidden_broken_and_dir_md_checked(
+    tmp_path: Path, kind: str, bad_name: str
+) -> None:
+    store = tmp_path / f"store-{kind}"
+    store.mkdir()
+    (store / "a.md").write_bytes(canon({"source": "s", "status": "active"}, "a"))
+    (store / "b.md").write_bytes(canon({"source": "s", "status": "active"}, "b"))
+    if kind == "hidden":
+        (store / ".hidden.md").write_bytes(b"junk")
+    elif kind == "broken-symlink":
+        (store / "c.md").symlink_to(tmp_path / "nowhere.md")
+    else:
+        (store / "dir.md").mkdir()
+    backend = mem.FilesBackend(store)
+    out = tmp_path / f"out-{kind}"
+    with pytest.raises(ValueError) as excinfo:
+        backend.export(out)
+    assert bad_name in str(excinfo.value)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize(
+    "kind,bad_name",
+    [("hidden", ".hidden"), ("broken-symlink", "c"), ("dir", "dir")],
+)
+def test_stale_hidden_broken_and_dir_md_skipped_with_note(
+    tmp_path: Path, kind: str, bad_name: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = tmp_path / f"store-{kind}"
+    store.mkdir()
+    backend = mem.FilesBackend(
+        store, labels_of=lambda bead_id: {"b1": ["truth:wrong"]}.get(bead_id)
+    )
+    backend.write("m1", {"source": "b1#1"}, "x")
+    backend.write("m2", {"source": "b2#1"}, "x")
+    if kind == "hidden":
+        (store / ".hidden.md").write_bytes(b"junk")
+    elif kind == "broken-symlink":
+        (store / "c.md").symlink_to(tmp_path / "nowhere.md")
+    else:
+        (store / "dir.md").mkdir()
+    assert backend.stale() == ["m1"]
+    err = capsys.readouterr().err
+    assert bad_name in err
+
+
 def test_import_bad_file_writes_nothing(tmp_path: Path) -> None:
     src = tmp_path / "src"
     src.mkdir()
@@ -512,6 +608,29 @@ def test_files_backend_reads_by_exact_case(tmp_path: Path) -> None:
     assert os.listdir(store2) == ["a.md"]
     fb2.write("a", {"source": "s"}, "updated")
     assert fb2.read("a").body == "updated"
+
+
+# hel-j31 item 1: write beside a differently-cased file refuses instead of
+# silently keeping the old name.
+
+
+def test_write_beside_differently_cased_file_raises(tmp_path: Path) -> None:
+    probe = tmp_path / "CaseProbe.tmp"
+    probe.write_text("x")
+    if not (tmp_path / "caseprobe.tmp").exists():
+        pytest.skip("filesystem is case-sensitive")
+    store = tmp_path / "s"
+    store.mkdir()
+    (store / "A.md").write_bytes(canon({"source": "s", "status": "active"}, "upper"))
+    fb = mem.FilesBackend(store)
+    with pytest.raises(ValueError) as excinfo:
+        fb.write("a", H, "lower")
+    assert "'a'" in str(excinfo.value)
+    assert "A.md" in str(excinfo.value)
+    assert (store / "A.md").read_bytes() == canon({"source": "s", "status": "active"}, "upper")
+    assert os.listdir(store) == ["A.md"]
+    with pytest.raises(KeyError):
+        fb.read("a")
 
 
 def test_export_symlink_target_not_followed(tmp_path: Path) -> None:

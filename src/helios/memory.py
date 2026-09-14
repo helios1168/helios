@@ -155,6 +155,10 @@ def _check_header_strings(key: str, value: Any) -> None:
                 ) from exc
         elif isinstance(item, dict):
             for entry_key, entry_value in item.items():
+                if not isinstance(entry_key, str):
+                    raise ValueError(
+                        f"memory {key!r}: header dict key {entry_key!r} is not a string"
+                    )
                 _walk(entry_key)
                 _walk(entry_value)
         elif isinstance(item, (list, tuple)):
@@ -228,7 +232,7 @@ def _normalize_header(key: str, header: dict[str, Any], body: str) -> dict[str, 
     _check_finite(key, out)
     try:
         size = len(serialize(out, body).encode("utf-8"))
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"memory {key!r}: cannot serialize header: {exc}") from exc
     if size > _VALUE_LIMIT_BYTES:
         raise ValueError(
@@ -276,22 +280,6 @@ def _exact_file(directory: Path, name: str) -> Path | None:
         return None
     path = directory / name
     return path if path.is_file() else None
-
-
-def _candidate_files(directory: Path) -> list[Path]:
-    """The ``*.md`` files directly in the directory, in sorted name order (SPEC §13).
-
-    Hidden names are skipped like a shell glob skips dotfiles; anything else
-    that is not a regular file is not a memory file. Order is by key (stem)
-    then file name, so ``import_`` writes in sorted key order.
-    """
-    if not directory.is_dir():
-        return []
-    return [
-        path
-        for path in sorted(directory.iterdir(), key=lambda p: (p.stem, p.name))
-        if not path.name.startswith(".") and path.is_file() and path.suffix == ".md"
-    ]
 
 
 def _bead_id_of(source: str) -> str:
@@ -356,10 +344,26 @@ class FilesBackend:
         self._labels_of = labels_of
 
     def write(self, key: str, header: dict[str, Any], body: str) -> None:
-        """Validate the header, then store the value atomically (SPEC §13)."""
+        """Validate the header, then store the value atomically (SPEC §13).
+
+        A differently-cased name already in the directory listing (``A.md``
+        for key ``a``) is refused: writing beside it would keep the old
+        name, and a later exact-name read would raise KeyError (SPEC §13,
+        decided).
+        """
         normalized = _normalize_header(key, header, body)
+        name = f"{key}.md"
+        try:
+            entries = os.listdir(self.directory)
+        except OSError:
+            entries = []
+        for entry in entries:
+            if entry != name and entry.lower() == name.lower():
+                raise ValueError(
+                    f"memory {key!r}: existing file {entry!r} collides case-insensitively"
+                )
         _write_bytes_atomic(
-            self.directory / f"{key}.md", serialize(normalized, body).encode("utf-8")
+            self.directory / name, serialize(normalized, body).encode("utf-8")
         )
 
     def read(self, key: str) -> Memory:
@@ -373,13 +377,18 @@ class FilesBackend:
     def stale(self) -> list[str]:
         """Active memories whose source bead carries truth:wrong, sorted by key.
 
-        Values that do not parse get the same stderr note as the beads
-        backend; only the listing skips them.
+        Uses the same entry listing and regular-file check as import_
+        (SPEC §13, decided): a dotfile, a broken symlink, or a directory
+        named like a memory file gets the same stderr skip note as a value
+        that does not parse, naming the entry, and the rest are still
+        checked.
         """
         found: list[str] = []
-        for path in _candidate_files(self.directory):
+        for path in _import_entries(self.directory):
             key = path.stem
             try:
+                if not path.is_file():
+                    raise ValueError(f"memory {key!r}: not a regular file")
                 _check_key(key)
                 mem = parse(key, _read_text(key, path))
             except ValueError:
@@ -395,17 +404,25 @@ class FilesBackend:
     def export(self, directory: Path | str) -> None:
         """Copy each memory to ``<directory>/<key>.md``; never deletes files.
 
-        A store value that does not parse raises ValueError naming the key;
-        only the beads backend reading ``bd memories`` skips those (SPEC §13).
+        Uses the same entry listing and regular-file check as import_
+        (SPEC §13, decided): every store entry is checked before any file is
+        written, so a dotfile, a broken symlink, a directory named like a
+        memory file, or a value that does not parse raises ValueError naming
+        it and nothing is written; only the beads backend reading
+        ``bd memories`` skips such values instead.
         """
         target = Path(directory)
-        target.mkdir(parents=True, exist_ok=True)
-        for path in _candidate_files(self.directory):
+        memories: list[Memory] = []
+        for path in _import_entries(self.directory):
             key = path.stem
+            if not path.is_file():
+                raise ValueError(f"memory {key!r}: not a regular file")
             _check_key(key)
-            mem = parse(key, _read_text(key, path))
+            memories.append(parse(key, _read_text(key, path)))
+        target.mkdir(parents=True, exist_ok=True)
+        for mem in memories:
             _write_bytes_atomic(
-                target / f"{key}.md", serialize(mem.header, mem.body).encode("utf-8")
+                target / f"{mem.key}.md", serialize(mem.header, mem.body).encode("utf-8")
             )
 
     def import_(self, directory: Path | str) -> None:
@@ -512,10 +529,10 @@ class BeadsBackend:
 def _import_entries(directory: Path) -> list[Path]:
     """Every directory entry whose name ends in ``.md``, dotfiles included.
 
-    Sorted by key (stem) then file name. Unlike ``_candidate_files`` (used by
-    ``export`` and ``stale``), nothing is filtered out ahead of time here: a
-    bad name or a non-regular-file entry is caught in the check pass in
-    ``_load_dir``, before anything is written (SPEC §13, decided).
+    Sorted by key (stem) then file name. Nothing is filtered out ahead of
+    time here: a bad name or a non-regular-file entry is caught in the check
+    pass in ``_load_dir``, ``FilesBackend.export`` and ``FilesBackend.stale``,
+    before anything is written (SPEC §13, decided).
     """
     if not directory.is_dir():
         return []
