@@ -88,6 +88,25 @@ def test_say_cli_unexecutable_bd_is_failed_comment_exit_1(
     assert not (tmp_path / ".helios" / "events.jsonl").exists()
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission bits")
+def test_say_cli_unreadable_bead_directory_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    bad = tmp_path / ".helios" / "runs" / "b1"
+    bad.mkdir(parents=True)
+    bad.chmod(0o000)
+    try:
+        monkeypatch.chdir(tmp_path)
+        assert cli.main(["say", "b1", "hi"]) == 1
+        err = capsys.readouterr().err
+        assert err.startswith("helios: ") and "Traceback" not in err
+        assert len(err.splitlines()) == 1
+    finally:
+        bad.chmod(0o755)
+    assert list(bad.iterdir()) == []
+    assert not (tmp_path / ".helios" / "events.jsonl").exists()
+
+
 @pytest.mark.parametrize("payload", [
     '{"a": 1}',
     "null",
@@ -217,6 +236,37 @@ def test_ps_text_escapes_backslash_control_and_surrogate_exactly(tmp_path: Path)
     assert columns[3] == _expected_cell("back\\slash")
     assert columns[5] == _expected_cell("b1#\ud800")
     assert columns[8] == _expected_cell("back\\slash:s\t1\n2")
+
+
+def test_ps_ascii_stdout_encoding_escapes_non_ascii_harness(tmp_path: Path) -> None:
+    directory = _attempt(tmp_path)
+    _input(directory, harness="héllo", worktree="/wt")
+    env = dict(os.environ, PYTHONIOENCODING="ascii")
+    proc = subprocess.run(
+        [sys.executable, "-c", "import sys; from helios.cli import main; sys.exit(main(['ps']))"],
+        cwd=tmp_path, capture_output=True, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    lines = proc.stdout.decode("ascii").splitlines()
+    assert len(lines) == 2
+    columns = lines[1].split("\t")
+    assert columns[3] == "h\\xe9llo"
+
+
+def test_ps_text_escapes_line_boundary_characters(tmp_path: Path) -> None:
+    boundary = "\x0b\x0c\x1c\x1d\x1e\x85  "
+    _attempt(tmp_path)
+    _input(tmp_path / ".helios" / "runs" / "b1" / "attempt-1", harness=boundary, worktree="/wt")
+    proc = subprocess.run(
+        [sys.executable, "-c", "import sys; from helios.cli import main; sys.exit(main(['ps']))"],
+        cwd=tmp_path, capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    stdout = proc.stdout.decode("utf-8")
+    lines = stdout.splitlines()
+    assert len(lines) == 2
+    columns = lines[1].split("\t")
+    assert columns[3] == "\\x0b\\x0c\\x1c\\x1d\\x1e\\x85\\u2028\\u2029"
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission bits")

@@ -25,7 +25,12 @@ def run(args) -> int:
         print(f"helios: {exc}", file=sys.stderr)
         return 2
     runs = cfg.hub / cfg.project.runs
-    if sessions.latest(runs, args.bead) is None:
+    try:
+        directory = sessions.latest(runs, args.bead)
+    except OSError as exc:
+        print(f"helios: {exc}", file=sys.stderr)
+        return 1
+    if directory is None:
         print(f"helios: no runs directory for {args.bead}", file=sys.stderr)
         return 2
     try:
