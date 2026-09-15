@@ -1176,6 +1176,49 @@ def test_live_refusal_message_and_lock(tmp_path: Path, monkeypatch, capsys) -> N
         live.wait()
 
 
+def test_run_int_pid_start_with_live_group_refuses(tmp_path: Path, monkeypatch) -> None:
+    """A pid_start that is not a string reads as null (SPEC §8.3), so the
+    recovery classification path in run.py falls back to the process-group
+    test alone and still refuses a live attempt (hel-lpw)."""
+    hub = make_hub(tmp_path)
+    live = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        cfg, info, att = setup_attempt(hub, "launched", pid=live.pid)
+        attempt_mod.write_state(
+            att.dir, attempt_id=att.attempt_id, state="launched",
+            pid=live.pid, pid_start=123,  # type: ignore[arg-type]
+        )
+        set_fake(monkeypatch, write_script(
+            tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+        beads = beads_mod.FakeBeads([make_bead("b1")])
+        rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+        assert rc == 2
+        assert not (hub / ".helios" / "runs" / "b1" / "attempt-2").exists()
+    finally:
+        live.kill()
+        live.wait()
+
+
+@pytest.mark.parametrize("bad_pid", [2**31, "123", 0, True, -1, 1.5])
+def test_run_bad_pid_values_recover_instead_of_refusing(
+    tmp_path: Path, monkeypatch, bad_pid: object
+) -> None:
+    """Each bad-shaped pid (hel-lpw) must never raise in run.py's recovery
+    classification and must read as not live, so a dead, launched attempt
+    recovers (crash_and_new) instead of refusing as still running."""
+    hub = make_hub(tmp_path)
+    cfg, info, att = setup_attempt(hub, "launched", pid=bad_pid)
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"report": {"status": "done", "summary": "ok"}}))
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 0
+    log = (att.dir / "state.log").read_text()
+    order = [json.loads(line)["state"] for line in log.splitlines()]
+    assert order.index("crashed") < order.index("finalized")
+    assert (hub / ".helios" / "runs" / "b1" / "attempt-2").exists()
+
+
 def test_sigint_during_preflight_creates_nothing(
     tmp_path: Path, monkeypatch
 ) -> None:

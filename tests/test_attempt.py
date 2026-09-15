@@ -73,6 +73,56 @@ def test_recovery_classification() -> None:
     assert att.classify_recovery("interrupted", pid_alive=True) == "refuse"
 
 
+@pytest.mark.parametrize(
+    "raw_pid,expected_pid",
+    [
+        (2**31, None),
+        ("123", None),
+        (0, None),
+        (True, None),
+        (-1, None),
+        (1.5, None),
+        (4242, 4242),
+    ],
+)
+def test_latest_state_normalizes_pid(
+    tmp_path: Path, raw_pid: object, expected_pid: int | None
+) -> None:
+    hub = make_repo(tmp_path / "hub")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    a, _ = att.allocate(hub=hub, runs_rel=".helios/runs", bead="b1", worktree=worktree)
+    att.transition(a.dir, "launched", pid=raw_pid)  # type: ignore[arg-type]
+    latest = att.latest_state(hub, ".helios/runs", "b1")
+    assert latest is not None
+    assert latest["pid"] == expected_pid
+    # The raw, unnormalized value is still what read_state hands back.
+    assert att.read_state(a.dir)["pid"] == raw_pid
+
+
+@pytest.mark.parametrize(
+    "raw_pid_start,expected_pid_start",
+    [(123, None), (True, None), (12.5, None), ("Mon Sep 14 00:00:00 2026", "Mon Sep 14 00:00:00 2026")],
+)
+def test_latest_state_normalizes_pid_start(
+    tmp_path: Path, raw_pid_start: object, expected_pid_start: str | None
+) -> None:
+    hub = make_repo(tmp_path / "hub")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    a, _ = att.allocate(hub=hub, runs_rel=".helios/runs", bead="b1", worktree=worktree)
+    att.transition(a.dir, "launched", pid=4242, pid_start=raw_pid_start)  # type: ignore[arg-type]
+    latest = att.latest_state(hub, ".helios/runs", "b1")
+    assert latest is not None
+    assert latest["pid_start"] == expected_pid_start
+    assert latest["pid"] == 4242
+
+
+def test_latest_state_none_without_attempts(tmp_path: Path) -> None:
+    hub = make_repo(tmp_path / "hub")
+    assert att.latest_state(hub, ".helios/runs", "b1") is None
+
+
 def test_is_stale_on_hashes_and_ancestry(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     (repo / "f").write_text("a")

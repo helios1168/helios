@@ -434,3 +434,45 @@ def test_preflight_unfinalized_attempt(tmp_path: Path, monkeypatch: pytest.Monke
     att.transition(reused.dir, "launched", pid_start="original-start-time")
     monkeypatch.setattr(att, "read_pid_start", lambda pid: "a-different-start-time")
     assert check([bead], ctx) == []
+
+
+def test_preflight_int_pid_start_with_live_group_refuses(tmp_path: Path) -> None:
+    """A pid_start that is not a string (SPEC §8.3) reads as null, so liveness
+    falls back to the process-group test alone: same outcome as a live group
+    with a genuinely null pid_start (hel-lpw)."""
+    import sys
+
+    from helios import attempt as att
+
+    hub = make_hub(tmp_path)
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}))
+    bead = impl_bead()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    try:
+        live, _ = att.allocate(
+            hub=hub, runs_rel=".helios/runs", bead="b1", worktree=tmp_path, pid=proc.pid
+        )
+        att.transition(live.dir, "launched", pid_start=123)  # type: ignore[arg-type]
+        errors = check([bead], ctx)
+        assert any("helios attach b1" in e and "helios stop b1" in e for e in errors)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.parametrize("bad_pid", [2**31, "123", 0, True, -1, 1.5])
+def test_preflight_bad_pid_values_never_raise_and_are_not_live(
+    tmp_path: Path, bad_pid: object
+) -> None:
+    """Each of these bad-shaped pids (hel-lpw) must never raise inside
+    preflight and must read as not live, so preflight does not refuse."""
+    from helios import attempt as att
+
+    hub = make_hub(tmp_path)
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}))
+    bead = impl_bead()
+    launched, _ = att.allocate(hub=hub, runs_rel=".helios/runs", bead="b1", worktree=tmp_path)
+    att.transition(launched.dir, "launched", pid=bad_pid)  # type: ignore[arg-type]
+    assert check([bead], ctx) == []

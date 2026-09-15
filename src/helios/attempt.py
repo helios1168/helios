@@ -229,12 +229,34 @@ def transition(
     )
 
 
+def _normalize_liveness_fields(record: dict[str, Any]) -> dict[str, Any]:
+    """Normalize ``pid`` and ``pid_start`` the way SPEC §8.3 reads them.
+
+    ``pid`` is kept only when it is an int, not a bool, with
+    ``0 < pid < 2**31``, else null; ``pid_start`` is kept only when it is a
+    str, else null. Every value normalized this way is safe to pass straight
+    to ``is_pid_alive`` (mirrors the rule ``sessions.safe_state`` applies).
+    """
+    pid = record.get("pid")
+    if not (isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 2**31):
+        pid = None
+    pid_start = record.get("pid_start")
+    if not isinstance(pid_start, str):
+        pid_start = None
+    return {**record, "pid": pid, "pid_start": pid_start}
+
+
 def latest_state(hub: Path, runs_rel: str, bead: str) -> dict[str, Any] | None:
-    """The state record of the highest attempt, or None when there is none."""
+    """The state record of the highest attempt, or None when there is none.
+
+    ``pid`` and ``pid_start`` are normalized (SPEC §8.3) before return, so
+    every caller can pass them straight to ``is_pid_alive`` without
+    re-validating them.
+    """
     numbers = existing_attempts(runs_dir(hub, runs_rel, bead))
     if not numbers:
         return None
-    return read_state(attempt_dir(hub, runs_rel, bead, numbers[-1]))
+    return _normalize_liveness_fields(read_state(attempt_dir(hub, runs_rel, bead, numbers[-1])))
 
 
 def classify_recovery(state: str | None, *, pid_alive: bool) -> RecoveryAction:
