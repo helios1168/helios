@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,8 @@ from helios import config as config_mod
 from helios import envelope as envelope_mod
 from helios import resume as resume_mod
 from helios import run as run_mod
+from helios import worktree as worktree_mod
+from helios.commands import resume as resume_command
 from helios.harness import fake as fake_mod
 
 
@@ -744,3 +747,149 @@ def test_resume_null_session_stops_silently_with_that_turns_code(
     assert rc == 3
     assert not (runs / "b1" / "attempt-3").exists()
     assert (runs / "b1" / "acks" / msg_id).exists()
+
+
+# --------------------------------------------------------------- hel-u3r item 1
+
+
+def _run_resume_command(
+    hub: Path, cfg: config_mod.Config, beads: beads_mod.FakeBeads, bead_id: str, monkeypatch
+) -> int:
+    monkeypatch.setattr(resume_command.config_mod, "load", lambda _path: cfg)
+    monkeypatch.setattr(resume_command.beads_mod, "Beads", lambda _hub: beads)
+    return resume_command.run(Namespace(bead=bead_id, text=None))
+
+
+def test_resume_command_worktree_on_another_branch_exits_2_no_traceback(
+    tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC §9.2, hel-u3r item 1: a worktree on another branch is a
+    ``WorktreeError`` the command layer must catch, not an uncaught
+    traceback. Exit 2, ``helios: <message>`` on stderr, nothing allocated."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    wt = hub / cfg.project.worktrees / "b1"
+    subprocess.run(["git", "checkout", "-b", "other"], cwd=wt, check=True, capture_output=True)
+
+    rc = _run_resume_command(hub, cfg, beads, "b1", monkeypatch)
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert err == (
+        f"helios: worktree {wt} is on branch 'other', expected 'worktree-b1'\n"
+    )
+    assert not (hub / cfg.project.runs / "b1" / "attempt-2").exists()
+    assert not (hub / cfg.project.runs / "b1" / "acks").exists()
+
+
+def test_resume_command_worktree_detached_exits_2_no_traceback(
+    tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC §9.2, hel-u3r item 1: a detached worktree is refused the same
+    way, exit 2, no traceback, nothing allocated."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    wt = hub / cfg.project.worktrees / "b1"
+    subprocess.run(["git", "checkout", "--detach"], cwd=wt, check=True, capture_output=True)
+
+    rc = _run_resume_command(hub, cfg, beads, "b1", monkeypatch)
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert err == f"helios: worktree {wt} is on branch 'HEAD', expected 'worktree-b1'\n"
+    assert not (hub / cfg.project.runs / "b1" / "attempt-2").exists()
+    assert not (hub / cfg.project.runs / "b1" / "acks").exists()
+
+
+# --------------------------------------------------------------- hel-u3r item 2
+
+
+def test_run_turn_checks_interrupt_immediately_before_allocating(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """SPEC §9.2, hel-u3r item 2: a SIGINT landing after the caller's own
+    pre-turn check but before ``run_turn`` allocates must still allocate
+    nothing. Simulated by setting the interrupt flag from inside
+    ``run_turn``, right before the allocation call (the harness lookup runs
+    immediately before it), and asserting the attempts directory and
+    ``attempt_mod.allocate`` are both untouched."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    bead = beads.show("b1")
+    worktree_path = hub / cfg.project.worktrees / "b1"
+
+    from helios import harness as harness_pkg
+
+    real_get = harness_pkg.get
+
+    def get_and_interrupt(name: str):
+        run_mod._INTERRUPT.set()
+        return real_get(name)
+
+    monkeypatch.setattr(harness_pkg, "get", get_and_interrupt)
+
+    def explode(**_kw):
+        raise AssertionError("attempt_mod.allocate must not run once interrupted")
+
+    monkeypatch.setattr(run_mod.attempt_mod, "allocate", explode)
+
+    try:
+        result = run_mod.run_turn(
+            "b1",
+            hub=hub,
+            beads=beads,
+            config=cfg,
+            bead=bead,
+            harness_name="fake",
+            worktree_path=worktree_path,
+            resume_session="s1",
+            text="go on",
+            msg_id=None,
+            resumed_from="b1#1",
+        )
+    finally:
+        run_mod._INTERRUPT.clear()
+
+    assert result == (4, "interrupted")
+    runs = hub / cfg.project.runs / "b1"
+    assert sorted(p.name for p in runs.iterdir() if p.name.startswith("attempt-")) == [
+        "attempt-1"
+    ]
+
+
+def test_run_turn_allocates_normally_when_no_interrupt(tmp_path: Path, monkeypatch) -> None:
+    """The unchanged case (item 3): with no interrupt set, ``run_turn``
+    still allocates and runs a turn as before."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    bead = beads.show("b1")
+    worktree_path = hub / cfg.project.worktrees / "b1"
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s2",
+                   "report": {"status": "done", "summary": "d"}},
+    ))
+
+    assert not run_mod._INTERRUPT.is_set()
+    code, status = run_mod.run_turn(
+        "b1",
+        hub=hub,
+        beads=beads,
+        config=cfg,
+        bead=bead,
+        harness_name="fake",
+        worktree_path=worktree_path,
+        resume_session="s1",
+        text="go on",
+        msg_id=None,
+        resumed_from="b1#1",
+    )
+    assert (code, status) == (0, "completed")
+    assert (hub / cfg.project.runs / "b1" / "attempt-2").exists()

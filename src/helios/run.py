@@ -2013,6 +2013,11 @@ def run_turn(
     effective_timeout = (
         timeout_s if timeout_s is not None else (harness_cfg.timeout_s if harness_cfg else 3600)
     )
+    # SPEC §9.2: the interrupt is checked immediately before an attempt is
+    # allocated, so a SIGINT landing after the caller's own pre-turn check
+    # (still between it and this allocation) still allocates nothing.
+    if _INTERRUPT.is_set():
+        return 4, envelope_mod.ExecutionStatus.INTERRUPTED.value
     attempt_obj, alloc_notes = attempt_mod.allocate(
         hub=hub, runs_rel=config.project.runs, bead=bead_id, worktree=worktree_path
     )

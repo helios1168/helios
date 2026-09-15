@@ -9,6 +9,7 @@ from helios import beads as beads_mod
 from helios import config as config_mod
 from helios import resume as resume_mod
 from helios import sessions
+from helios import worktree as worktree_mod
 
 NAME = "resume"
 HELP = "Resume a session with delivered messages or text (SPEC §9.2)."
@@ -27,7 +28,7 @@ def run(args) -> int:
         cfg = config_mod.load(Path.cwd())
         beads = beads_mod.Beads(cfg.hub)
         return resume_mod.resume(args.bead, args.text, hub=cfg.hub, beads=beads, config=cfg)
-    except resume_mod.ResumeRefusal as exc:
+    except (resume_mod.ResumeRefusal, worktree_mod.WorktreeError) as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2
     except (OSError, TypeError, ValueError, RecursionError) as exc:
