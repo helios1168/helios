@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -2142,3 +2143,223 @@ def test_sigint_storm_on_empty_run_many_no_exception(tmp_path: Path) -> None:
         capture_output=True, text=True, timeout=30,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# --------------------------------------------------------------- hel-q3d
+
+
+def _finalize_first_attempt(
+    tmp_path: Path,
+    hub: Path,
+    beads: beads_mod.FakeBeads,
+    cfg: config_mod.Config,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    bead_id: str = "b1",
+    session_id: str = "s1",
+) -> None:
+    """Run one turn through the normal pipeline so attempt-1 is finalized,
+    leaving a session ``run_turn`` (the second launch site) can resume."""
+    set_fake(monkeypatch, write_script(
+        tmp_path,
+        {"exit_code": 0, "sleep_s": 0, "stdout": "ok", "session_id": session_id,
+         "report": {"status": "done", "summary": "first"}},
+    ))
+    rc = run_mod.run_one(bead_id, hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 0
+    assert (
+        attempt_mod.read_state(hub / cfg.project.runs / bead_id / "attempt-1")["state"]
+        == "finalized"
+    )
+
+
+def test_run_one_records_launched_pid_before_slow_pid_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC §7.1 step 7 (hel-q3d): ``launched`` with the child pid is written
+    before ``read_pid_start`` runs, so a slow ``ps`` never delays the pid
+    record. A background thread runs the launch while the main thread waits
+    for the slow read to start, then inspects ``state.json`` mid-run, before
+    releasing it, proving the pid write already happened."""
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "done", "summary": "ok"}}))
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow(pid: int) -> str | None:
+        started.set()
+        release.wait(timeout=10)
+        return "Mon Jan 01 00:00:00 2026"
+
+    monkeypatch.setattr(attempt_mod, "read_pid_start", slow)
+    result: dict[str, int] = {}
+
+    def target() -> None:
+        result["rc"] = run_mod.run_one(
+            "b1", hub=hub, beads=beads, config=config_mod.load(hub), harness_override="fake"
+        )
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    try:
+        assert started.wait(timeout=10)
+        a1 = hub / ".helios" / "runs" / "b1" / "attempt-1"
+        mid = attempt_mod.read_state(a1)
+        assert mid["state"] == "launched"
+        assert isinstance(mid["pid"], int) and mid["pid"] > 0
+        assert mid["pid_start"] is None
+    finally:
+        release.set()
+        thread.join(timeout=15)
+    assert result["rc"] == 0
+    final = attempt_mod.read_state(a1)
+    assert final["pid"] == mid["pid"]
+    assert final["pid_start"] == "Mon Jan 01 00:00:00 2026"
+
+
+def test_run_one_launched_pid_recorded_when_pid_start_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``read_pid_start`` that raises still leaves the attempt ``launched``
+    with the pid recorded, and the run continues with ``pid_start`` null
+    (hel-q3d item 2)."""
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "done", "summary": "ok"}}))
+    a1 = hub / ".helios" / "runs" / "b1" / "attempt-1"
+    mid: dict[str, object] = {}
+
+    def boom(pid: int) -> str | None:
+        mid.update(attempt_mod.read_state(a1))
+        raise RuntimeError("ps exploded")
+
+    monkeypatch.setattr(attempt_mod, "read_pid_start", boom)
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    assert rc == 0
+    assert mid["state"] == "launched"
+    assert isinstance(mid["pid"], int) and mid["pid"] > 0
+    assert mid["pid_start"] is None
+    final = attempt_mod.read_state(a1)
+    assert final["state"] == "finalized"
+    assert final["pid"] == mid["pid"]
+    assert final["pid_start"] is None
+
+
+def test_run_turn_records_launched_pid_before_slow_pid_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same ordering guarantee as above for the second launch site,
+    ``run_turn`` (used by ``helios resume``)."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    _finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    bead = beads.show("b1")
+    worktree_path = hub / cfg.project.worktrees / "b1"
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s2",
+                   "report": {"status": "done", "summary": "second"}}, name="script2.json"))
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow(pid: int) -> str | None:
+        started.set()
+        release.wait(timeout=10)
+        return "Mon Jan 01 00:00:00 2026"
+
+    monkeypatch.setattr(attempt_mod, "read_pid_start", slow)
+    result: dict[str, tuple[int, str]] = {}
+
+    def target() -> None:
+        result["code_status"] = run_mod.run_turn(
+            "b1", hub=hub, beads=beads, config=cfg, bead=bead,
+            harness_name="fake", worktree_path=worktree_path,
+            resume_session="s1", text="go on", msg_id=None, resumed_from="b1#1",
+        )
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    try:
+        assert started.wait(timeout=10)
+        a2 = hub / cfg.project.runs / "b1" / "attempt-2"
+        mid = attempt_mod.read_state(a2)
+        assert mid["state"] == "launched"
+        assert isinstance(mid["pid"], int) and mid["pid"] > 0
+        assert mid["pid_start"] is None
+    finally:
+        release.set()
+        thread.join(timeout=15)
+    assert result["code_status"] == (0, "completed")
+    final = attempt_mod.read_state(a2)
+    assert final["pid"] == mid["pid"]
+    assert final["pid_start"] == "Mon Jan 01 00:00:00 2026"
+
+
+def test_run_turn_launched_pid_recorded_when_pid_start_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``read_pid_start`` that raises during ``run_turn`` still leaves the
+    attempt ``launched`` with the pid recorded, and the turn continues with
+    ``pid_start`` null (hel-q3d item 2, second launch site)."""
+    hub = make_hub(tmp_path)
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    _finalize_first_attempt(tmp_path, hub, beads, cfg, monkeypatch)
+    bead = beads.show("b1")
+    worktree_path = hub / cfg.project.worktrees / "b1"
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s2",
+                   "report": {"status": "done", "summary": "second"}}, name="script2.json"))
+    a2 = hub / cfg.project.runs / "b1" / "attempt-2"
+    mid: dict[str, object] = {}
+
+    def boom(pid: int) -> str | None:
+        mid.update(attempt_mod.read_state(a2))
+        raise RuntimeError("ps exploded")
+
+    monkeypatch.setattr(attempt_mod, "read_pid_start", boom)
+    code, status = run_mod.run_turn(
+        "b1", hub=hub, beads=beads, config=cfg, bead=bead,
+        harness_name="fake", worktree_path=worktree_path,
+        resume_session="s1", text="go on", msg_id=None, resumed_from="b1#1",
+    )
+    assert (code, status) == (0, "completed")
+    assert mid["state"] == "launched"
+    assert isinstance(mid["pid"], int) and mid["pid"] > 0
+    assert mid["pid_start"] is None
+    final = attempt_mod.read_state(a2)
+    assert final["state"] == "finalized"
+    assert final["pid"] == mid["pid"]
+    assert final["pid_start"] is None
+
+
+def test_run_one_launch_adds_exactly_one_extra_state_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Happy path (hel-q3d item 3): pid_start is recorded exactly as before,
+    with no extra state transitions beyond the added write. ``state.log``
+    holds exactly two ``launched`` entries: the first with the pid and a
+    null pid_start, the second with the same pid plus pid_start."""
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "sleep_s": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "done", "summary": "ok"}}))
+    rc = run_mod.run_one("b1", hub=hub, beads=beads,
+                         config=config_mod.load(hub), harness_override="fake")
+    assert rc == 0
+    a1 = hub / ".helios" / "runs" / "b1" / "attempt-1"
+    log = [json.loads(line) for line in (a1 / "state.log").read_text().splitlines()]
+    assert [r["state"] for r in log][:3] == ["allocated", "launched", "launched"]
+    launched_entries = [r for r in log if r["state"] == "launched"]
+    assert len(launched_entries) == 2
+    assert isinstance(launched_entries[0]["pid"], int) and launched_entries[0]["pid"] > 0
+    assert launched_entries[1]["pid"] == launched_entries[0]["pid"]
+    assert launched_entries[0]["pid_start"] is None
+    assert isinstance(launched_entries[1]["pid_start"], str) and launched_entries[1]["pid_start"]

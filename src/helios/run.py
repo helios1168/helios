@@ -1816,7 +1816,11 @@ def _run_one_inner(
 
         def _record_launched(pid: int) -> None:
             launched_box["fired"] = True
-            pid_start = attempt_mod.read_pid_start(pid)
+            attempt_mod.transition(attempt_obj.dir, "launched", pid=pid)
+            try:
+                pid_start = attempt_mod.read_pid_start(pid)
+            except Exception:
+                pid_start = None
             attempt_mod.transition(attempt_obj.dir, "launched", pid=pid, pid_start=pid_start)
             events_mod.append(
                 hub,
@@ -2077,7 +2081,11 @@ def run_turn(
 
     def _record_launched(pid: int) -> None:
         launched_box["fired"] = True
-        pid_start = attempt_mod.read_pid_start(pid)
+        attempt_mod.transition(attempt_obj.dir, "launched", pid=pid)
+        try:
+            pid_start = attempt_mod.read_pid_start(pid)
+        except Exception:
+            pid_start = None
         attempt_mod.transition(attempt_obj.dir, "launched", pid=pid, pid_start=pid_start)
         events_mod.append(
             hub,
