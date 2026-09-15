@@ -210,8 +210,8 @@ def stop(hub: Path, runs_rel: str, bead: str) -> None:
         except OSError:
             pass
         raise
-    if not isinstance(pid, int):
-        raise ValueError(f"no running attempt for {bead}")
+    # safe_state normalizes pid to an int or None, and the liveness check above
+    # already rejects None, so pid is an int here.
     process_id = cast(int, pid)
     try:
         os.killpg(process_id, signal.SIGINT)

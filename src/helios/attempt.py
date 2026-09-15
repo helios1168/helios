@@ -246,6 +246,15 @@ def _normalize_liveness_fields(record: dict[str, Any]) -> dict[str, Any]:
     return {**record, "pid": pid, "pid_start": pid_start}
 
 
+def normalized_state(dir: Path) -> dict[str, Any]:
+    """``read_state`` with ``pid`` and ``pid_start`` normalized (SPEC §8.3).
+
+    Every value normalized this way is safe to pass straight to
+    ``is_pid_alive`` without re-validating it.
+    """
+    return _normalize_liveness_fields(read_state(dir))
+
+
 def latest_state(hub: Path, runs_rel: str, bead: str) -> dict[str, Any] | None:
     """The state record of the highest attempt, or None when there is none.
 
@@ -256,7 +265,7 @@ def latest_state(hub: Path, runs_rel: str, bead: str) -> dict[str, Any] | None:
     numbers = existing_attempts(runs_dir(hub, runs_rel, bead))
     if not numbers:
         return None
-    return _normalize_liveness_fields(read_state(attempt_dir(hub, runs_rel, bead, numbers[-1])))
+    return normalized_state(attempt_dir(hub, runs_rel, bead, numbers[-1]))
 
 
 def classify_recovery(state: str | None, *, pid_alive: bool) -> RecoveryAction:

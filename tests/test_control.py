@@ -642,6 +642,53 @@ def test_unit_run_command_read_envelope_uses_highest_attempt(
     assert out.startswith("b#2\tcompleted\tdone\t-\tok\n")
 
 
+def test_attempt_state_agrees_between_next_and_unit_run_on_bad_pid_and_missing_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``attempt_state`` in both command modules now reads through
+    ``attempt.normalized_state`` instead of ``attempt.read_state`` (hel-v2m item 2). Both
+    read only the ``state`` field, which normalization never touches, so a ``pid`` that
+    fails validation, or a missing or unreadable ``state.json``, must leave next and unit
+    run agreeing exactly as before (SPEC section 8.3)."""
+    from helios import attempt as att
+    from helios.commands import next as next_command
+    from helios.commands import unit_run as unit_run_command
+
+    (tmp_path / ".agents").mkdir()
+    (tmp_path / ".agents" / "workflow.toml").write_text("")
+    monkeypatch.chdir(tmp_path)
+
+    b = bead("b")
+
+    no_attempt = control.AttemptState(number=0, finalized=False)
+    assert next_command.attempt_state(b) == unit_run_command.attempt_state(b) == no_attempt
+
+    directory = tmp_path / ".helios" / "runs" / "b" / "attempt-1"
+    directory.mkdir(parents=True)
+
+    not_finalized = control.AttemptState(number=1, finalized=False)
+    for bad_pid in (0, "123", True):
+        att.write_state(directory, attempt_id="b#1", state="launched", pid=bad_pid)  # type: ignore[arg-type]
+        assert next_command.attempt_state(b) == not_finalized
+        assert unit_run_command.attempt_state(b) == not_finalized
+
+    # An unreadable state.json falls back to allocated, not finalized (SPEC section 8.3).
+    (directory / "state.json").write_text("not json")
+    assert next_command.attempt_state(b) == not_finalized
+    assert unit_run_command.attempt_state(b) == not_finalized
+
+    # A missing state.json falls back the same way.
+    (directory / "state.json").unlink()
+    assert next_command.attempt_state(b) == not_finalized
+    assert unit_run_command.attempt_state(b) == not_finalized
+
+    # A finalized attempt still reads as finalized regardless of the pid's shape.
+    att.write_state(directory, attempt_id="b#1", state="finalized", pid=True)  # type: ignore[arg-type]
+    finalized = control.AttemptState(number=1, finalized=True)
+    assert next_command.attempt_state(b) == finalized
+    assert unit_run_command.attempt_state(b) == finalized
+
+
 # ---- round 3 item 2: memory_has wired into run_many (a missing kwarg always refused) ----
 
 

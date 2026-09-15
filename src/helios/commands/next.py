@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from helios import control
-from helios.attempt import attempt_dir, existing_attempts, read_state, runs_dir
+from helios.attempt import attempt_dir, existing_attempts, normalized_state, runs_dir
 from helios.beads import Beads, Bead
 from helios.config import load
 from helios.envelope import Envelope
@@ -81,5 +81,5 @@ def attempt_state(bead: Bead) -> control.AttemptState:
     if not numbers:
         return control.AttemptState(number=0, finalized=False)
     n = numbers[-1]
-    state = read_state(attempt_dir(config.hub, config.project.runs, bead.id, n))
+    state = normalized_state(attempt_dir(config.hub, config.project.runs, bead.id, n))
     return control.AttemptState(number=n, finalized=state.get("state") == "finalized")

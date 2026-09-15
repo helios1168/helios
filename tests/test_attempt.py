@@ -123,6 +123,26 @@ def test_latest_state_none_without_attempts(tmp_path: Path) -> None:
     assert att.latest_state(hub, ".helios/runs", "b1") is None
 
 
+@pytest.mark.parametrize(
+    "raw_pid,expected_pid",
+    [(0, None), ("123", None), (True, None), (4242, 4242)],
+)
+def test_normalized_state_normalizes_pid_and_latest_state_agrees(
+    tmp_path: Path, raw_pid: object, expected_pid: int | None
+) -> None:
+    """``latest_state`` is now a thin wrapper over ``normalized_state`` on the highest
+    attempt directory (hel-v2m item 2): the two must always agree."""
+    hub = make_repo(tmp_path / "hub")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    a, _ = att.allocate(hub=hub, runs_rel=".helios/runs", bead="b1", worktree=worktree)
+    att.transition(a.dir, "launched", pid=raw_pid)  # type: ignore[arg-type]
+    normalized = att.normalized_state(a.dir)
+    assert normalized["pid"] == expected_pid
+    assert normalized["state"] == "launched"
+    assert normalized == att.latest_state(hub, ".helios/runs", "b1")
+
+
 def test_is_stale_on_hashes_and_ancestry(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     (repo / "f").write_text("a")
