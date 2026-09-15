@@ -1367,10 +1367,11 @@ def test_real_bd_hand_fix_after_check_failure_refuses(tmp_path: Path) -> None:
     assert str(error2.value).startswith("worktree HEAD")
 
 
-# ---------------------------------------------------------------- h3c-fix6 item 1:
-# a commit's fingerprint is a SHA-256 of Python-normalized `git show` bytes, never
-# `git patch-id`: ambient diff config can no longer hide a change, and the mode/
-# NUL/rename quirks that fooled patch-id no longer matter.
+# ---------------------------------------------------------------- h3c-fix6 item 1,
+# superseded by h3c-fix7 item 1: the verified-commit check replays the verified
+# range with `git merge-tree` and compares trees, never a diff or a fingerprint.
+# Ambient diff config cannot hide a change because no diff is taken at all, and
+# the mode/NUL/rename quirks that fooled patch-id are just part of the tree.
 
 
 def _apply_ops(cwd: Path, ops: list[tuple]) -> None:
@@ -1528,32 +1529,32 @@ def test_rename_to_different_target_refuses(tmp_path: Path) -> None:
     _fp_case_refuses(tmp_path / "after-exit5", base_ops, verified_ops, tamper_ops, after_exit5=True)
 
 
-@pytest.mark.parametrize("global_config", [False, True])
-def test_hand_rebase_with_varied_changes_merges(tmp_path: Path, monkeypatch, global_config: bool) -> None:
-    """A true positive: a verified commit that edits a mid-file line, changes a
-    mode, adds a binary file and renames a file, plus a commit adding an empty
-    file, still merges after a hand rebase onto a main that added lines at the
-    top of the same file -- with and without a global diff config that reshapes
-    prefixes, order, algorithm, renames, submodules and signatures.
+def test_hand_rebase_with_varied_changes_merges(tmp_path: Path, monkeypatch) -> None:
+    """A true positive: a two-commit verified range (a mid-file edit, a mode
+    change, a binary add and a rename, then an empty-file commit) still merges
+    after a hand rebase onto a main that added lines at the top of the same
+    file, under a hostile global diff config that reshapes prefixes, order,
+    algorithm, renames, submodules and signatures. Trees do not depend on git
+    config (h3c-fix7 item 1), so the config matrix shrinks to this one hostile
+    case; an empty config is not tested separately.
     """
-    if global_config:
-        order_file = tmp_path / "orderfile"
-        order_file.write_text("*\n")
-        _set_global_git_config(
-            monkeypatch,
-            tmp_path,
-            {
-                "diff.noprefix": "true",
-                "diff.mnemonicPrefix": "true",
-                "diff.algorithm": "histogram",
-                "diff.renames": "copies",
-                "diff.orderFile": str(order_file),
-                "diff.submodule": "log",
-                "diff.ignoreSubmodules": "all",
-                "diff.relative": "true",
-                "log.showSignature": "true",
-            },
-        )
+    order_file = tmp_path / "orderfile"
+    order_file.write_text("*\n")
+    _set_global_git_config(
+        monkeypatch,
+        tmp_path,
+        {
+            "diff.noprefix": "true",
+            "diff.mnemonicPrefix": "true",
+            "diff.algorithm": "histogram",
+            "diff.renames": "copies",
+            "diff.orderFile": str(order_file),
+            "diff.submodule": "log",
+            "diff.ignoreSubmodules": "all",
+            "diff.relative": "true",
+            "log.showSignature": "true",
+        },
+    )
 
     original = b"".join(b"line %02d\n" % i for i in range(60))
     lines = original.splitlines(keepends=True)
@@ -1581,6 +1582,157 @@ def test_hand_rebase_with_varied_changes_merges(tmp_path: Path, monkeypatch, glo
     _git(hub, "commit", "-m", "advance main")
 
     _git(worktree, "rebase", "main")
+    assert _run(beads, hub) == (0, "merged")
+
+
+# ---------------------------------------------------------------- h3c-fix7 item 1:
+# the fingerprint rule is blind to position; the replay rule (git merge-tree) is
+# not. (a)-(d) are refusals a fingerprint compare missed or wrongly produced;
+# (e)-(g) are true positives a fingerprint compare wrongly refused.
+
+
+def test_edit_moved_to_identical_twin_block_refuses(tmp_path: Path) -> None:
+    """(a) Two identical 7-line blocks: the verified commit sets `value = 2` in the
+    first block, the worktree instead sets it in the second. A diff fingerprint
+    with `@@` headers collapsed sees the same bytes either way; a tree replay does
+    not, because the two resulting trees differ.
+    """
+    block = b"a\nb\nc\nvalue = 1\nd\ne\nf\n"
+    edited_block = b"a\nb\nc\nvalue = 2\nd\ne\nf\n"
+    base_ops = [("write", "twin.txt", block + block)]
+    verified_ops = [("write", "twin.txt", edited_block + block)]
+    tamper_ops = [("write", "twin.txt", block + edited_block)]
+    _fp_case_refuses(tmp_path / "fresh", base_ops, verified_ops, tamper_ops)
+    _fp_case_refuses(tmp_path / "after-exit5", base_ops, verified_ops, tamper_ops, after_exit5=True)
+
+
+def test_addition_moved_elsewhere_with_zero_context_refuses(tmp_path: Path) -> None:
+    """(b) A pure addition (one new line) moved to a different position in the
+    same file, with `diff.context=0` set in the hub's own config (the config the
+    review measured this defect under).
+    """
+    base_ops = [("write", "grow.txt", b"L1\nL2\nL3\nL4\nL5\n")]
+    verified_ops = [("write", "grow.txt", b"L1\nL2\nNEW\nL3\nL4\nL5\n")]
+    tamper_ops = [("write", "grow.txt", b"L1\nL2\nL3\nL4\nNEW\nL5\n")]
+    repo_cfg = {"diff.context": "0"}
+    _fp_case_refuses(tmp_path / "fresh", base_ops, verified_ops, tamper_ops, repo_cfg=repo_cfg)
+    _fp_case_refuses(
+        tmp_path / "after-exit5", base_ops, verified_ops, tamper_ops, repo_cfg=repo_cfg, after_exit5=True
+    )
+
+
+def test_extra_file_amended_after_real_rebase_refuses(tmp_path: Path) -> None:
+    """(c) An extra file is amended into the commit after a real `git rebase main`."""
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    (hub / "other.txt").write_text("other\n")
+    _git(hub, "add", "other.txt")
+    _git(hub, "commit", "-m", "advance main")
+    _git(worktree, "rebase", "main")
+    (worktree / "extra.txt").write_text("extra\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "--amend", "--no-edit")
+    new_head = _git(worktree, "rev-parse", "HEAD")
+    old_commit = beads.beads["b1"].metadata["output_commit"]
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == f"worktree HEAD {new_head} is not the verified output_commit {old_commit}"
+
+
+# (d) a conflicting replay (main rewrites the same lines the verified commit
+# changed, worktree HEAD resolved by hand) refuses: already covered by
+# test_hand_resolved_conflict_with_different_patch_refuses above, which runs
+# this exact scenario through `helios merge` and asserts exit 2.
+
+
+def _repo_with_base_content(tmp_path: Path, base_lines: list[str]) -> tuple[Path, Path]:
+    """A hub and worktree that both start from the same multi-line `value.txt`,
+    with no worktree commit yet beyond the shared base (unlike `_repo`, whose
+    worktree already carries a one-line "change" commit).
+    """
+    hub = tmp_path / "repo"
+    hub.mkdir(parents=True)
+    _git(hub, "init", "-b", "main")
+    _git(hub, "config", "user.email", "test@example.com")
+    _git(hub, "config", "user.name", "Test")
+    (hub / "value.txt").write_text("\n".join(base_lines) + "\n")
+    (hub / ".beads").mkdir()
+    (hub / ".beads" / "issues.jsonl").write_text("{}\n")
+    _git(hub, "add", ".")
+    _git(hub, "commit", "-m", "base")
+    worktree = tmp_path / "worktree" / "b1"
+    worktree.parent.mkdir()
+    _git(hub, "worktree", "add", "-b", "worktree-b1", str(worktree), "main")
+    return hub, worktree
+
+
+def test_hand_rebase_edit_two_lines_away_merges(tmp_path: Path) -> None:
+    """(e) A hand rebase where main edits 2 lines away from the verified edit
+    still merges: the verified commit edits line 5, main independently edits
+    line 3 of the same file before the worktree rebases onto it.
+    """
+    base_lines = [f"L{i}" for i in range(1, 11)]
+    hub, worktree = _repo_with_base_content(tmp_path, base_lines)
+    edited_lines = list(base_lines)
+    edited_lines[4] = "L5-EDITED"
+    (worktree / "value.txt").write_text("\n".join(edited_lines) + "\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "verified edit")
+    beads = _beads(hub, worktree)
+
+    hub_lines = list(base_lines)
+    hub_lines[2] = "L3-MAIN"
+    (hub / "value.txt").write_text("\n".join(hub_lines) + "\n")
+    _git(hub, "add", "value.txt")
+    _git(hub, "commit", "-m", "advance main near edit")
+
+    _git(worktree, "rebase", "main")
+    assert _run(beads, hub) == (0, "merged")
+
+
+def test_hand_rebase_main_prepends_ten_lines_merges(tmp_path: Path) -> None:
+    """(f) A hand rebase where main prepends 10 lines to the same file still merges."""
+    base_lines = [f"L{i}" for i in range(1, 6)]
+    hub, worktree = _repo_with_base_content(tmp_path, base_lines)
+    edited_lines = base_lines[:-1] + ["L5-EDITED"]
+    (worktree / "value.txt").write_text("\n".join(edited_lines) + "\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "verified edit")
+    beads = _beads(hub, worktree)
+
+    prefix = [f"TOP{i}" for i in range(1, 11)]
+    (hub / "value.txt").write_text("\n".join(prefix + base_lines) + "\n")
+    _git(hub, "add", "value.txt")
+    _git(hub, "commit", "-m", "prepend ten lines")
+
+    _git(worktree, "rebase", "main")
+    assert _run(beads, hub) == (0, "merged")
+
+
+def test_two_commit_range_squashed_on_new_main_merges(tmp_path: Path) -> None:
+    """(g) A two-commit verified range, replayed as one squashed commit on the
+    new main, still merges.
+    """
+    hub, worktree = _repo(tmp_path)
+    (worktree / "value.txt").write_text("step1\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "--amend", "-m", "step one")
+    (worktree / "extra.txt").write_text("step2\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "step two")
+    beads = _beads(hub, worktree)
+
+    (hub / "other.txt").write_text("other\n")
+    _git(hub, "add", "other.txt")
+    _git(hub, "commit", "-m", "advance main")
+
+    _git(worktree, "reset", "--hard", "main")
+    (worktree / "value.txt").write_text("step1\n")
+    (worktree / "extra.txt").write_text("step2\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "squashed")
+
     assert _run(beads, hub) == (0, "merged")
 
 

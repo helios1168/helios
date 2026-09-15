@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import subprocess
 import unicodedata
 from collections.abc import Callable
@@ -161,14 +160,17 @@ def _worktree_registered(hub: Path, path: Path) -> bool:
     Compared as Unicode NFC: on macOS a directory name holding a non-ASCII
     character can be listed by git in a different normalization form than the
     path helios derives, and a byte-for-byte compare would then miss it (SPEC 12
-    step 2, h3c-fix6 item 3).
+    step 2, h3c-fix6 item 3). Split on a plain `"\n"`, not `str.splitlines`, which
+    also breaks on U+2028, U+0085 and U+001C and would otherwise split a path
+    holding one of those mid-line, reading a registered hub path as unregistered
+    (h3c-fix7 item 3).
     """
     listing = _git_output(hub, "worktree", "list", "--porcelain")
     target = unicodedata.normalize("NFC", str(path))
     prefix = "worktree "
     return any(
         unicodedata.normalize("NFC", line[len(prefix):]) == target
-        for line in listing.splitlines()
+        for line in listing.split("\n")
         if line.startswith(prefix)
     )
 
@@ -196,87 +198,32 @@ def _remove_worktree(hub: Path, path: Path, branch: str) -> None:
             raise MergeError(proc.stderr.strip() or "branch removal failed", 4)
 
 
-def _git_show_diff_bytes(cwd: Path, commit: str) -> bytes:
-    """The raw bytes of `commit`'s diff, immune to ambient diff config (SPEC 12 step 2).
-
-    Every flag that a repo or global config could otherwise use to reshape or hide
-    part of the diff is pinned explicitly: submodule pointers always show short
-    (never `log`, which git config can otherwise turn into un-parseable multi-line
-    text, and never hidden by `ignoreSubmodules`), renames are never folded into a
-    single rename entry, and there is no order file, textconv or external diff.
-    """
-    proc = subprocess.run(
-        [
-            "git",
-            "show",
-            "--binary",
-            "--no-textconv",
-            "--no-ext-diff",
-            "--no-color",
-            "--no-relative",
-            "--no-renames",
-            "--no-show-signature",
-            "--submodule=short",
-            "--ignore-submodules=none",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-            "-O/dev/null",
-            "--format=",
-            commit,
-        ],
-        cwd=cwd,
-        capture_output=True,
-        check=False,
-    )
-    if proc.returncode:
-        raise MergeError(proc.stderr.decode("utf-8", "surrogateescape").strip() or f"git show {commit} failed", 4)
-    return proc.stdout
-
-
-def _commit_fingerprints(cwd: Path, base: str, tip: str) -> list[str] | None:
-    """A SHA-256 fingerprint of each non-merge commit in `base..tip`, oldest first (SPEC 12 step 2).
-
-    Computed in Python from the raw bytes of `git show`, never from `git patch-id`:
-    patch-id can be fooled by a submodule config that reshapes its output, a NUL
-    byte, or a mode change moved to another path.
-    `index ` lines (blob hashes, which change even for a pure rebase) are dropped;
-    `@@ ` hunk headers (line numbers, which shift when an earlier part of the file
-    changes) are collapsed to a bare `@@`, so a clean rebase fingerprints the same.
-    `None` when a merge commit sits in the range: a verified commit or its rebase
-    never contains one (SPEC 12 item 8).
-    """
-    if _git_output(cwd, "rev-list", "--min-parents=2", f"{base}..{tip}"):
-        return None
-    commits = _git_output(cwd, "rev-list", "--reverse", f"{base}..{tip}")
-    fingerprints = []
-    for commit in commits.splitlines() if commits else []:
-        raw = _git_show_diff_bytes(cwd, commit)
-        kept = []
-        for line in raw.split(b"\n"):
-            if line.startswith(b"index "):
-                continue
-            if line.startswith(b"@@ "):
-                kept.append(b"@@")
-                continue
-            kept.append(line)
-        fingerprints.append(hashlib.sha256(b"\n".join(kept)).hexdigest())
-    return fingerprints
-
-
 def _is_verified_commit(hub: Path, head: str, output_commit: str) -> bool:
-    """True when `head` is `output_commit` rebased: the same non-merge commits, in
-    order, by fingerprint, since diverging from main (SPEC 12 step 2).
+    """True when `head` replays the verified work of `output_commit` (SPEC 12 step 2).
 
-    An empty verified range (`output_commit` already on main) never passes here:
-    equality with `output_commit` is the only acceptance route in that case.
+    Not a diff comparison: this replays the non-merge commits of
+    `output_base..output_commit` (where `output_base = merge-base(output_commit, main)`)
+    onto `head_base = merge-base(head, main)` with
+    `git merge-tree --write-tree --merge-base=<output_base> <head_base> <output_commit>`
+    (needs git 2.38 or newer), and compares the resulting tree to `head`'s own tree.
+    A merge commit in either range, an empty verified range (`output_commit` already
+    on main), or a replay conflict all read as unverified rather than raising.
     """
     output_base = _git_output(hub, "merge-base", output_commit, "main")
-    output_fingerprints = _commit_fingerprints(hub, output_base, output_commit)
-    if not output_fingerprints:
-        return False
     head_base = _git_output(hub, "merge-base", head, "main")
-    head_fingerprints = _commit_fingerprints(hub, head_base, head)
-    return head_fingerprints == output_fingerprints
+    if _git_output(hub, "rev-list", "--min-parents=2", f"{head_base}..{head}"):
+        return False
+    if _git_output(hub, "rev-list", "--min-parents=2", f"{output_base}..{output_commit}"):
+        return False
+    if not _git_output(hub, "rev-list", f"{output_base}..{output_commit}"):
+        return False
+    proc = _git(hub, "merge-tree", "--write-tree", f"--merge-base={output_base}", head_base, output_commit)
+    if proc.returncode == 1:
+        return False
+    if proc.returncode != 0:
+        raise MergeError(proc.stderr.strip() or "git merge-tree failed", 4)
+    tree = proc.stdout.split("\n", 1)[0].strip()
+    return tree == _git_output(hub, "rev-parse", f"{head}^{{tree}}")
 
 
 def _finish_step7(
@@ -369,8 +316,8 @@ def merge_bead(
             raise MergeError(f"worktree missing for {bead_id}")
 
         # Only a verified commit merges: the worktree must sit on its own branch,
-        # at exactly the commit the verify evidence covers, or that commit rebased
-        # (same non-merge commits, in order, by fingerprint). Runs on every attempt.
+        # at exactly the commit the verify evidence covers, or a commit that replays
+        # it (git merge-tree, not a diff comparison). Runs on every attempt.
         current_branch = _git(worktree, "symbolic-ref", "--short", "HEAD")
         if current_branch.returncode or current_branch.stdout.strip() != branch:
             raise MergeError(f"worktree is not on branch {branch}")
@@ -385,10 +332,14 @@ def merge_bead(
         # this still lists every path the branch introduces. --no-renames so a
         # rename out of .beads/ still lists its old, .beads/ path. -z (NUL
         # separated, unquoted) so a path holding a non-ASCII byte, a double quote
-        # or a tab is not hidden behind git's default quoting (SPEC 12 step 2).
+        # or a tab is not hidden behind git's default quoting. --ignore-submodules=none
+        # so a global diff.ignoreSubmodules=all cannot hide a .beads/ gitlink change
+        # (SPEC 12 step 2, h3c-fix7 item 2).
         merge_base = _git(hub, "merge-base", "main", branch)
         base_ref = merge_base.stdout.strip() if merge_base.returncode == 0 else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-        diff_proc = _git(hub, "diff", "-z", "--no-renames", "--name-only", base_ref, branch)
+        diff_proc = _git(
+            hub, "diff", "-z", "--no-renames", "--ignore-submodules=none", "--name-only", base_ref, branch
+        )
         if diff_proc.returncode:
             raise MergeError(diff_proc.stderr.strip() or "git diff failed", 4)
         diff_paths = diff_proc.stdout.split("\0")
