@@ -36,7 +36,7 @@ def _git(cwd: Path, *args: str) -> str:
         ["git", *args], cwd=cwd, capture_output=True, text=True, check=False
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+        raise WorktreeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
     return proc.stdout.strip()
 
 
@@ -74,6 +74,10 @@ def prepare(
             )
         actual = current_branch(path)
         if actual != branch:
+            if actual == "HEAD":
+                raise WorktreeError(
+                    f"worktree {path} is detached, expected branch {branch}"
+                )
             raise WorktreeError(
                 f"worktree {path} is on branch {actual!r}, expected {branch!r}"
             )

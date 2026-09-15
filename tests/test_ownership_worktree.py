@@ -136,6 +136,43 @@ def test_worktree_prepare_creates_reuses_and_refuses(tmp_path: Path) -> None:
         worktree.prepare(hub=hub, bead="b2")
 
 
+def test_worktree_prepare_raises_worktree_error_on_corrupted_git_file(
+    tmp_path: Path,
+) -> None:
+    """hel-xqx item 1: a git failure inside ``prepare`` raises ``WorktreeError``,
+    not a bare ``RuntimeError``, with the same message text."""
+    hub = make_repo(tmp_path / "hub")
+    info = worktree.prepare(hub=hub, bead="b4")
+    (info.path / ".git").write_text("gitdir: /nonexistent\n")
+    with pytest.raises(worktree.WorktreeError, match=r"^git .+ failed: .+$"):
+        worktree.prepare(hub=hub, bead="b4")
+
+
+def test_worktree_detached_message_says_detached(tmp_path: Path) -> None:
+    """hel-xqx item 2: a detached worktree names itself detached instead of
+    reporting the pseudo-branch 'HEAD'."""
+    hub = make_repo(tmp_path / "hub")
+    info = worktree.prepare(hub=hub, bead="b5")
+    subprocess.run(
+        ["git", "checkout", "--detach"], cwd=info.path, check=True, capture_output=True
+    )
+    with pytest.raises(worktree.WorktreeError) as excinfo:
+        worktree.prepare(hub=hub, bead="b5")
+    assert str(excinfo.value) == f"worktree {info.path} is detached, expected branch worktree-b5"
+
+
+def test_worktree_other_branch_message_unchanged(tmp_path: Path) -> None:
+    """A worktree on another (non-detached) branch keeps its current message."""
+    hub = make_repo(tmp_path / "hub")
+    info = worktree.prepare(hub=hub, bead="b6")
+    subprocess.run(
+        ["git", "checkout", "-b", "other"], cwd=info.path, check=True, capture_output=True
+    )
+    with pytest.raises(worktree.WorktreeError) as excinfo:
+        worktree.prepare(hub=hub, bead="b6")
+    assert str(excinfo.value) == f"worktree {info.path} is on branch 'other', expected 'worktree-b6'"
+
+
 def test_worktree_prepare_starts_from_given_commit(tmp_path: Path) -> None:
     hub = make_repo(tmp_path / "hub")
     start_commit = head(hub)

@@ -787,8 +787,9 @@ def test_resume_command_worktree_on_another_branch_exits_2_no_traceback(
 def test_resume_command_worktree_detached_exits_2_no_traceback(
     tmp_path: Path, monkeypatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """SPEC §9.2, hel-u3r item 1: a detached worktree is refused the same
-    way, exit 2, no traceback, nothing allocated."""
+    """SPEC §9.2, hel-xqx item 2: a detached worktree is refused the same
+    way, exit 2, no traceback, nothing allocated, and the message says
+    detached rather than "is on branch 'HEAD'"."""
     hub = make_hub(tmp_path)
     cfg = config_mod.load(hub)
     beads = beads_mod.FakeBeads([make_bead("b1")])
@@ -800,7 +801,7 @@ def test_resume_command_worktree_detached_exits_2_no_traceback(
 
     err = capsys.readouterr().err
     assert rc == 2
-    assert err == f"helios: worktree {wt} is on branch 'HEAD', expected 'worktree-b1'\n"
+    assert err == f"helios: worktree {wt} is detached, expected branch worktree-b1\n"
     assert not (hub / cfg.project.runs / "b1" / "attempt-2").exists()
     assert not (hub / cfg.project.runs / "b1" / "acks").exists()
 
