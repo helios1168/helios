@@ -579,6 +579,52 @@ def test_stop_signals_group_after_leader_reaped(tmp_path: Path) -> None:
             pass
 
 
+def test_stop_signals_group_when_leader_exists_but_ps_read_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A compare read that times out or fails while the leader still exists
+    (no reading) falls back to the process-group test alone, the same rule
+    `attempt.is_pid_alive` uses, rather than reading the attempt as dead
+    (SPEC 9.2)."""
+    process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        pid_start = attempt.read_pid_start(process.pid)
+        assert isinstance(pid_start, str) and pid_start
+        directory = _attempt(tmp_path, state="launched", pid=process.pid, pid_start=pid_start)
+        monkeypatch.setattr(attempt, "read_pid_start", lambda pid: None)
+        sessions.stop(tmp_path, ".helios/runs", "b1")
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\n", (directory / "stop-requested").read_text())
+        process.wait(timeout=5)
+        assert process.returncode != 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def test_stop_mismatched_pid_start_sends_no_signal_to_real_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A leader pid whose start time no longer matches is a reused pid, so
+    `stop` must refuse and never signal the real process group it is
+    attached to (SPEC 9.2)."""
+    process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        pid_start = attempt.read_pid_start(process.pid)
+        assert isinstance(pid_start, str) and pid_start
+        directory = _attempt(tmp_path, state="launched", pid=process.pid, pid_start=pid_start)
+        monkeypatch.setattr(attempt, "read_pid_start", lambda pid: "a-different-start-time")
+        monkeypatch.setattr(sessions.os, "killpg", lambda *args: pytest.fail("killpg called"))
+        with pytest.raises(ValueError, match="no running attempt for b1"):
+            sessions.stop(tmp_path, ".helios/runs", "b1")
+        assert not (directory / "stop-requested").exists()
+        assert process.poll() is None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
 def test_cli_dispatches_all_four_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     monkeypatch.chdir(tmp_path)
     assert cli.main(["ps"]) == 0
