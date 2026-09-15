@@ -416,7 +416,12 @@ These apply to claude, codex, opencode and agy.
      over-approximates on purpose: a false overlap only means the beads run separately;
    - `skills/<kind>/SKILL.md` exists in the hub for the bead kind;
    - the bead is not closed;
-   - the latest attempt of the bead is finalized, unless recovery (§8.4) applies.
+   - the latest attempt of the bead is finalized, unless recovery (§8.4) applies;
+   - the hub's `.gitignore` ignores `.helios/` and `.claude/worktrees/`, checked once per
+     preflight call, not once per bead, before any attempt: `git check-ignore -q` is run on a
+     probe path under each (`<path>probe`). Exit 0 means ignored; exit 1 is the preflight error
+     `.gitignore must ignore <path>`; any other exit code, or an `OSError` from launching git, is
+     its own error naming git's stderr or the exception message.
 3. Resolve the harness (§5). `--harness` overrides. Then, unless the bead is already closed
    (which helios never reopens), set its status to `in_progress`.
 4. Prepare the worktree (§7.3).
@@ -432,8 +437,9 @@ These apply to claude, codex, opencode and agy.
    stdout=stdout file, stderr=stderr.log, start_new_session=True)`, environment plus
    `HELIOS_BEAD`, `HELIOS_ATTEMPT`, `HELIOS_HARNESS`, `HELIOS_HUB`, `HELIOS_REPORT`. Record
    `launched` with the child pid in `state.json` as soon as `Popen` returns, before waiting, and
-   read the leader's start time right after with `ps -o lstart= -p <pid>` stripped, stored as
-   `pid_start`; null when that read fails. Every signal goes to the child's process group
+   read the leader's start time right after with `ps -o lstart= -p <pid>` under environment
+   `LC_ALL=C`, `LANG=C`, `LC_TIME=C`, `TZ=UTC0` and a 5 second timeout, stripped, stored as
+   `pid_start`; null when that read times out or fails. Every signal goes to the child's process group
    (`os.killpg`). The stop sequence is SIGINT,
    wait up to 10 s, SIGTERM, wait up to 5 s, SIGKILL. A wait ends early only when the whole
    group is gone (`os.killpg(pgid, 0)` raises `ProcessLookupError`), not when the leader exits.
@@ -648,7 +654,8 @@ happen only under the lock. The lock dies with its process, so it never goes sta
 `n` is one more than the highest existing `attempt-<n>` directory. The directory is created with
 an exclusive `mkdir`; if it already exists (a concurrent run took `n`), helios tries `n + 1`.
 `state.json` is written right after the `mkdir`, but a process can die between the two. Every
-reader (preflight, recovery, `helios ps`) treats an attempt directory whose `state.json` is
+reader (preflight, recovery, `helios ps`, `helios resume`) treats an attempt directory whose
+`state.json` is
 missing or unreadable (empty, not valid JSON, not an object, or without a string `state`) as
 state `allocated` with `pid` null, `pid_start` null, `session_id` null and `execution_status`
 null, and takes the attempt id `<bead>#<n>` from the directory name. In a readable file, a `pid`
@@ -792,11 +799,15 @@ exit 2, before any filesystem or `bd` access.
   delivers: delivery belongs to `helios resume`.
 - `helios stop <bead>`: exits 2 with `helios: no running attempt for <bead>` unless the highest
   attempt is live. Live means state `launched`, a `pid` that reads as non-null under §8.3, and
-  the process itself live: its leader pid exists and its current `ps -o lstart=` text equals the
-  attempt's `pid_start`, or, when the leader no longer exists, `os.killpg(pid, 0)` succeeds or
-  raises `PermissionError`. A leader pid whose start time differs from `pid_start` is a reused
-  pid: the attempt counts as not live, and helios never signals that pid. A null `pid_start`
-  falls back to the process-group test alone. It writes `attempt-<n>/stop-requested` holding the
+  the process itself live: its leader pid exists and its current `ps -o lstart=` text, read
+  under the same `LC_ALL=C`, `LANG=C`, `LC_TIME=C`, `TZ=UTC0` environment and 5 second timeout
+  as the launch read (§7.1 step 7), equals the attempt's `pid_start`, or, when the leader no
+  longer exists, `os.killpg(pid, 0)` succeeds or raises `PermissionError`. A leader pid whose
+  start time differs from `pid_start` is a reused pid: the attempt counts as not live, and
+  helios never signals that pid. A null `pid_start`, or a compare read that times out or fails
+  while the leader still exists (no reading), falls back to the process-group test alone, the
+  same `os.killpg(pid, 0)` check, rather than counting the attempt as dead. It writes
+  `attempt-<n>/stop-requested` holding the
   UTC time (`yyyy-mm-ddThh:mm:ssZ` and a newline) with a temp file and `os.replace`, then
   signals the process group (`os.killpg(pid, SIGINT)`) whenever the attempt is live by this
   rule, including after the leader has exited, and exits 0, also when the group is already gone.
@@ -807,7 +818,10 @@ exit 2, before any filesystem or `bd` access.
 - `helios resume <bead> ["<text>"]`: before taking the bead lock, resume checks only that the
   bead has an attempt, exiting 2 with a message on stderr when it does not. It then takes the
   bead lock (§8.3), exiting 2 with a message on stderr when it is held; once taken, it re-reads
-  the highest attempt and applies the other refusals, exiting 2 with a message on stderr: the
+  the highest attempt and, before any liveness test, validates its `pid` (an int with
+  `0 < pid < 2**31`, a bool excluded, else null) and `pid_start` (a string, else null) from
+  `state.json` the same way `sessions.safe_state` does (§8.3), then applies the other refusals,
+  exiting 2 with a message on stderr: the
   bead is closed, the highest attempt is live or not finalized, or its `session_id` is null.
   Still under the lock and before allocating, it also refuses when the
   §7.3 worktree directory is missing (`helios: worktree <path> is missing`) or the worktree is
@@ -1021,17 +1035,25 @@ the order 1, 2, 8, 3, 4, 5, 6, 7.
    Step 2 runs on every invocation, before recovery (step 8). Refuse unless the worktree is on
    branch `worktree-<bead>` (`git -C <worktree> symbolic-ref --short HEAD`, else
    `helios: worktree is not on branch worktree-<bead>`). Refuse also when
-   `git diff --no-renames --name-only <main>...worktree-<bead>` lists any path under `.beads/`
+   `git diff -z --no-renames --name-only <main>...worktree-<bead>`, split on NUL (so a quoted
+   path, non-ASCII, a double quote or a tab, is still seen), lists any path under `.beads/`
    (`helios: branch changes .beads/`). Before any merge-base call, refuse when `output_commit`
    names no commit (`git cat-file -e <sha>^{commit}` fails) with `helios: verified output_commit
-   <sha> is not a commit`, exit 2. The worktree HEAD passes when it equals the impl bead's
-   `output_commit` metadata, checked first, or when the ordered list of patch ids of the
-   non-merge commits in `merge-base(HEAD, main)..HEAD` equals the ordered list for
+   <sha> is not a commit`, exit 2. helios never calls `git patch-id`. The worktree HEAD passes
+   when it equals the impl bead's
+   `output_commit` metadata, checked first, or when the ordered list of commit fingerprints of
+   the non-merge commits in `merge-base(HEAD, main)..HEAD` equals the ordered list for
    `merge-base(output_commit, main)..output_commit` (the verified commits rebased); an empty
-   list for the `output_commit` range never passes this check. A commit's patch id is computed
-   from bytes: `git show --binary --no-textconv --no-ext-diff --no-color --format= <commit>`
-   with stdout read as bytes, piped as bytes to `git patch-id --verbatim`, first field of its
-   output. Otherwise, or when either range contains a merge commit, refuse with `helios:
+   list for the `output_commit` range never passes this check. A commit's fingerprint is
+   computed from bytes: `git show --binary --no-textconv --no-ext-diff --no-color --no-relative
+   --no-renames --no-show-signature --submodule=short --ignore-submodules=none --src-prefix=a/
+   --dst-prefix=b/ -O/dev/null --format= <commit>` with stdout read as bytes, split on `\n`
+   only; every line starting with `index ` is dropped, every line starting with `@@ ` is
+   replaced by `@@`, and the result is joined with `\n`; the fingerprint is the SHA-256 hex
+   digest of those bytes. The pinned flags keep user and repository git config (submodule
+   display, ignored submodules, prefixes, order files, relative diffs) from hiding or splitting
+   a change, and hashing the full bytes keeps NUL bytes and mode lines that `git patch-id`
+   ignores. Otherwise, or when either range contains a merge commit, refuse with `helios:
    worktree HEAD <sha> is not the verified output_commit <sha>`, exit 2; so the commit step 6
    merges, once rebased, is the verified commit. Git output that `helios merge` parses or passes
    back to git is never decoded strictly: text is decoded with `surrogateescape` and printed
