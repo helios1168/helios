@@ -1035,27 +1035,26 @@ the order 1, 2, 8, 3, 4, 5, 6, 7.
    Step 2 runs on every invocation, before recovery (step 8). Refuse unless the worktree is on
    branch `worktree-<bead>` (`git -C <worktree> symbolic-ref --short HEAD`, else
    `helios: worktree is not on branch worktree-<bead>`). Refuse also when
-   `git diff -z --no-renames --name-only <main>...worktree-<bead>`, split on NUL (so a quoted
+   `git diff -z --no-renames --ignore-submodules=none --name-only <main>...worktree-<bead>`, split on NUL (so a quoted
    path, non-ASCII, a double quote or a tab, is still seen), lists any path under `.beads/`
    (`helios: branch changes .beads/`). Before any merge-base call, refuse when `output_commit`
    names no commit (`git cat-file -e <sha>^{commit}` fails) with `helios: verified output_commit
-   <sha> is not a commit`, exit 2. helios never calls `git patch-id`. The worktree HEAD passes
-   when it equals the impl bead's
-   `output_commit` metadata, checked first, or when the ordered list of commit fingerprints of
-   the non-merge commits in `merge-base(HEAD, main)..HEAD` equals the ordered list for
-   `merge-base(output_commit, main)..output_commit` (the verified commits rebased); an empty
-   list for the `output_commit` range never passes this check. A commit's fingerprint is
-   computed from bytes: `git show --binary --no-textconv --no-ext-diff --no-color --no-relative
-   --no-renames --no-show-signature --submodule=short --ignore-submodules=none --src-prefix=a/
-   --dst-prefix=b/ -O/dev/null --format= <commit>` with stdout read as bytes, split on `\n`
-   only; every line starting with `index ` is dropped, every line starting with `@@ ` is
-   replaced by `@@`, and the result is joined with `\n`; the fingerprint is the SHA-256 hex
-   digest of those bytes. The pinned flags keep user and repository git config (submodule
-   display, ignored submodules, prefixes, order files, relative diffs) from hiding or splitting
-   a change, and hashing the full bytes keeps NUL bytes and mode lines that `git patch-id`
-   ignores. Otherwise, or when either range contains a merge commit, refuse with `helios:
-   worktree HEAD <sha> is not the verified output_commit <sha>`, exit 2; so the commit step 6
-   merges, once rebased, is the verified commit. Git output that `helios merge` parses or passes
+   <sha> is not a commit`, exit 2. The worktree HEAD passes when it equals the impl bead's
+   `output_commit`, checked first. Otherwise let `output_base` be `git merge-base <output_commit>
+   main` and `head_base` be `git merge-base <HEAD> main`. Refuse when `git rev-list
+   --min-parents=2` lists a commit in `head_base..HEAD` or in `output_base..output_commit` (a
+   merge commit), and refuse when `git rev-list <output_base>..<output_commit>` is empty (the
+   verified range is empty because `output_commit` is already on main). Then run `git merge-tree
+   --write-tree --merge-base=<output_base> <head_base> <output_commit>` in the hub, which
+   replays the verified range onto the branch's base (`git merge-tree --write-tree
+   --merge-base` requires git 2.38 or newer). Exit 0: the first line of stdout is the replayed
+   tree. Exit 1: a conflict, so HEAD is not the verified work replayed, refuse. Any other exit
+   code is a git failure: print git's stderr prefixed `helios: ` and exit 4. HEAD passes when the
+   replayed tree equals `git rev-parse <HEAD>^{tree}`. Otherwise refuse with the unchanged
+   `helios: worktree HEAD <sha> is not the verified output_commit <sha>`, exit 2; so the commit
+   step 6 merges, once rebased, is the verified commit. A diff comparison cannot tell a hunk's
+   position, so an edit moved to an identical block elsewhere in the file compares equal, while a
+   replay compares the resulting content. Git output that `helios merge` parses or passes
    back to git is never decoded strictly: text is decoded with `surrogateescape` and printed
    with `backslashreplace`.
 3. Record `main_before` as metadata `merge_main_before`. Then in the worktree run
