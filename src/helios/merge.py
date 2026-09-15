@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import subprocess
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO, cast
@@ -31,8 +33,7 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
     A manual decode never raises `UnicodeDecodeError` on a non-UTF-8 path or
     message (SPEC 12 item 2), and, unlike `subprocess.run(text=True)`, never
-    translates a `\\r\\n` in the output: `.encode("utf-8", "surrogateescape")`
-    recovers the exact original bytes, which the patch-id pipeline (item 1) needs.
+    translates a `\\r\\n` in the output.
     """
     proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=False)
     return subprocess.CompletedProcess(
@@ -155,11 +156,21 @@ def _verify_evidence(hub: Path, runs: str, impl: Bead, beads: BeadsLike, hashes:
 
 
 def _worktree_registered(hub: Path, path: Path) -> bool:
-    """True when `git worktree list` still lists `path`, whether or not it exists on disk."""
+    """True when `git worktree list` still lists `path`, whether or not it exists on disk.
+
+    Compared as Unicode NFC: on macOS a directory name holding a non-ASCII
+    character can be listed by git in a different normalization form than the
+    path helios derives, and a byte-for-byte compare would then miss it (SPEC 12
+    step 2, h3c-fix6 item 3).
+    """
     listing = _git_output(hub, "worktree", "list", "--porcelain")
-    target = str(path)
+    target = unicodedata.normalize("NFC", str(path))
     prefix = "worktree "
-    return any(line[len(prefix):] == target for line in listing.splitlines() if line.startswith(prefix))
+    return any(
+        unicodedata.normalize("NFC", line[len(prefix):]) == target
+        for line in listing.splitlines()
+        if line.startswith(prefix)
+    )
 
 
 def _remove_worktree(hub: Path, path: Path, branch: str) -> None:
@@ -185,51 +196,87 @@ def _remove_worktree(hub: Path, path: Path, branch: str) -> None:
             raise MergeError(proc.stderr.strip() or "branch removal failed", 4)
 
 
-def _non_merge_patch_ids(cwd: Path, base: str, tip: str) -> list[str] | None:
-    """`git patch-id --verbatim` of each non-merge commit in `base..tip`, oldest first.
+def _git_show_diff_bytes(cwd: Path, commit: str) -> bytes:
+    """The raw bytes of `commit`'s diff, immune to ambient diff config (SPEC 12 step 2).
 
-    Computed from raw bytes (`--verbatim`, no text decoding), never from git's own
-    whitespace-blind `--stable` mode, so a whitespace-only edit is not silently
-    ignored (SPEC 12 item 1). `None` when a merge commit sits in the range: a
-    verified commit or its rebase never contains one (SPEC 12 item 8).
+    Every flag that a repo or global config could otherwise use to reshape or hide
+    part of the diff is pinned explicitly: submodule pointers always show short
+    (never `log`, which git config can otherwise turn into un-parseable multi-line
+    text, and never hidden by `ignoreSubmodules`), renames are never folded into a
+    single rename entry, and there is no order file, textconv or external diff.
+    """
+    proc = subprocess.run(
+        [
+            "git",
+            "show",
+            "--binary",
+            "--no-textconv",
+            "--no-ext-diff",
+            "--no-color",
+            "--no-relative",
+            "--no-renames",
+            "--no-show-signature",
+            "--submodule=short",
+            "--ignore-submodules=none",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "-O/dev/null",
+            "--format=",
+            commit,
+        ],
+        cwd=cwd,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode:
+        raise MergeError(proc.stderr.decode("utf-8", "surrogateescape").strip() or f"git show {commit} failed", 4)
+    return proc.stdout
+
+
+def _commit_fingerprints(cwd: Path, base: str, tip: str) -> list[str] | None:
+    """A SHA-256 fingerprint of each non-merge commit in `base..tip`, oldest first (SPEC 12 step 2).
+
+    Computed in Python from the raw bytes of `git show`, never from `git patch-id`:
+    patch-id can be fooled by a submodule config that reshapes its output, a NUL
+    byte, or a mode change moved to another path.
+    `index ` lines (blob hashes, which change even for a pure rebase) are dropped;
+    `@@ ` hunk headers (line numbers, which shift when an earlier part of the file
+    changes) are collapsed to a bare `@@`, so a clean rebase fingerprints the same.
+    `None` when a merge commit sits in the range: a verified commit or its rebase
+    never contains one (SPEC 12 item 8).
     """
     if _git_output(cwd, "rev-list", "--min-parents=2", f"{base}..{tip}"):
         return None
     commits = _git_output(cwd, "rev-list", "--reverse", f"{base}..{tip}")
-    ids = []
+    fingerprints = []
     for commit in commits.splitlines() if commits else []:
-        patch = _git(cwd, "show", "--binary", "--no-textconv", "--no-ext-diff", "--no-color", "--format=", commit)
-        if patch.returncode:
-            raise MergeError(patch.stderr.strip() or f"git show {commit} failed", 4)
-        # `_git` decodes with `surrogateescape`; re-encoding the same way recovers
-        # the exact original bytes for `--verbatim`, which reads raw diff bytes.
-        patch_bytes = patch.stdout.encode("utf-8", "surrogateescape")
-        patch_id = subprocess.run(
-            ["git", "patch-id", "--verbatim"], cwd=cwd, input=patch_bytes, capture_output=True, check=False
-        )
-        if patch_id.returncode:
-            raise MergeError(
-                patch_id.stderr.decode("utf-8", "surrogateescape").strip() or "git patch-id failed", 4
-            )
-        fields = patch_id.stdout.split()
-        ids.append(fields[0].decode("ascii") if fields else "")
-    return ids
+        raw = _git_show_diff_bytes(cwd, commit)
+        kept = []
+        for line in raw.split(b"\n"):
+            if line.startswith(b"index "):
+                continue
+            if line.startswith(b"@@ "):
+                kept.append(b"@@")
+                continue
+            kept.append(line)
+        fingerprints.append(hashlib.sha256(b"\n".join(kept)).hexdigest())
+    return fingerprints
 
 
 def _is_verified_commit(hub: Path, head: str, output_commit: str) -> bool:
     """True when `head` is `output_commit` rebased: the same non-merge commits, in
-    order, by patch-id, since diverging from main (SPEC 12 item 8).
+    order, by fingerprint, since diverging from main (SPEC 12 step 2).
 
     An empty verified range (`output_commit` already on main) never passes here:
-    equality with `output_commit` is the only acceptance route in that case (item 3).
+    equality with `output_commit` is the only acceptance route in that case.
     """
     output_base = _git_output(hub, "merge-base", output_commit, "main")
-    output_ids = _non_merge_patch_ids(hub, output_base, output_commit)
-    if not output_ids:
+    output_fingerprints = _commit_fingerprints(hub, output_base, output_commit)
+    if not output_fingerprints:
         return False
     head_base = _git_output(hub, "merge-base", head, "main")
-    head_ids = _non_merge_patch_ids(hub, head_base, head)
-    return head_ids == output_ids
+    head_fingerprints = _commit_fingerprints(hub, head_base, head)
+    return head_fingerprints == output_fingerprints
 
 
 def _finish_step7(
@@ -323,7 +370,7 @@ def merge_bead(
 
         # Only a verified commit merges: the worktree must sit on its own branch,
         # at exactly the commit the verify evidence covers, or that commit rebased
-        # (same non-merge commits, in order, by patch-id). Runs on every attempt.
+        # (same non-merge commits, in order, by fingerprint). Runs on every attempt.
         current_branch = _git(worktree, "symbolic-ref", "--short", "HEAD")
         if current_branch.returncode or current_branch.stdout.strip() != branch:
             raise MergeError(f"worktree is not on branch {branch}")
@@ -336,10 +383,17 @@ def merge_bead(
         # Diff against the merge base, falling back to git's well-known empty tree
         # hash when the branch shares no history with main (an orphan branch), so
         # this still lists every path the branch introduces. --no-renames so a
-        # rename out of .beads/ still lists its old, .beads/ path.
+        # rename out of .beads/ still lists its old, .beads/ path. -z (NUL
+        # separated, unquoted) so a path holding a non-ASCII byte, a double quote
+        # or a tab is not hidden behind git's default quoting (SPEC 12 step 2).
         merge_base = _git(hub, "merge-base", "main", branch)
         base_ref = merge_base.stdout.strip() if merge_base.returncode == 0 else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-        diff_paths = _git_output(hub, "diff", "--no-renames", "--name-only", base_ref, branch).splitlines()
+        diff_proc = _git(hub, "diff", "-z", "--no-renames", "--name-only", base_ref, branch)
+        if diff_proc.returncode:
+            raise MergeError(diff_proc.stderr.strip() or "git diff failed", 4)
+        diff_paths = diff_proc.stdout.split("\0")
+        if diff_paths and diff_paths[-1] == "":
+            diff_paths = diff_paths[:-1]
         if any(p == ".beads" or p.startswith(".beads/") for p in diff_paths):
             raise MergeError("branch changes .beads/")
 

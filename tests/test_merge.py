@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import fcntl
 import shutil
+import unicodedata
 from argparse import Namespace
 from pathlib import Path
 
@@ -1364,3 +1365,268 @@ def test_real_bd_hand_fix_after_check_failure_refuses(tmp_path: Path) -> None:
         merge_bead(hub, impl, project=project, beads=beads, input_hashes=lambda _b: {})
     assert error2.value.code == 2
     assert str(error2.value).startswith("worktree HEAD")
+
+
+# ---------------------------------------------------------------- h3c-fix6 item 1:
+# a commit's fingerprint is a SHA-256 of Python-normalized `git show` bytes, never
+# `git patch-id`: ambient diff config can no longer hide a change, and the mode/
+# NUL/rename quirks that fooled patch-id no longer matter.
+
+
+def _apply_ops(cwd: Path, ops: list[tuple]) -> None:
+    for kind, path, value in ops:
+        if kind == "write":
+            target = cwd / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(value)
+            _git(cwd, "add", "--", path)
+        elif kind == "chmod":
+            (cwd / path).chmod(value)
+            _git(cwd, "add", "--", path)
+        elif kind == "mv":
+            _git(cwd, "mv", path, value)
+        elif kind == "gitlink":
+            (cwd / path).mkdir(exist_ok=True)  # an empty dir is an unpopulated submodule, not dirt
+            _git(cwd, "update-index", "--add", "--cacheinfo", f"160000,{value},{path}")
+        else:
+            raise AssertionError(kind)
+
+
+def _fp_repo(tmp_path: Path, base_ops: list[tuple], repo_cfg: dict[str, str] | None = None) -> tuple[Path, Path]:
+    hub = tmp_path / "repo"
+    hub.mkdir(parents=True)
+    _git(hub, "init", "-b", "main")
+    _git(hub, "config", "user.email", "test@example.com")
+    _git(hub, "config", "user.name", "Test")
+    (hub / ".beads").mkdir()
+    (hub / ".beads" / "issues.jsonl").write_text("{}\n")
+    _git(hub, "add", ".beads")
+    _apply_ops(hub, base_ops)
+    _git(hub, "commit", "-m", "base")
+    for key, value in (repo_cfg or {}).items():
+        _git(hub, "config", key, value)
+    worktree = tmp_path / "worktree" / "b1"
+    worktree.parent.mkdir()
+    _git(hub, "worktree", "add", "-b", "worktree-b1", str(worktree), "main")
+    return hub, worktree
+
+
+def _fp_case_refuses(
+    tmp_path: Path,
+    base_ops: list[tuple],
+    verified_ops: list[tuple],
+    tamper_ops: list[tuple],
+    *,
+    repo_cfg: dict[str, str] | None = None,
+    after_exit5: bool = False,
+) -> None:
+    """A commit built from `verified_ops` is recorded as the verified output; the
+    worktree HEAD is then replaced (same parent) by one built from `tamper_ops`.
+    The fingerprint check must refuse the tampered head, fresh or after an exit 5.
+    """
+    hub, worktree = _fp_repo(tmp_path, base_ops, repo_cfg=repo_cfg)
+    _apply_ops(worktree, verified_ops)
+    _git(worktree, "commit", "-m", "verified")
+    beads = _beads(hub, worktree)
+    if after_exit5:
+        with pytest.raises(MergeError) as check_error:
+            _run(beads, hub, runner=lambda _c, _w: 1)
+        assert check_error.value.code == 5
+    _git(worktree, "reset", "--hard", "HEAD~1")
+    _apply_ops(worktree, tamper_ops)
+    _git(worktree, "commit", "-m", "tampered")
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value).startswith("worktree HEAD")
+
+
+def _set_global_git_config(monkeypatch, tmp_path: Path, pairs: dict[str, str]) -> Path:
+    cfg = tmp_path / "gitconfig-global"
+    cfg.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for key, value in pairs.items():
+        subprocess.run(["git", "config", "--file", str(cfg), key, value], check=True)
+    return cfg
+
+
+SUBMODULE_CONFIGS: dict[str, dict] = {
+    "global-diff.submodule=log": {"global": {"diff.submodule": "log"}},
+    "repo-diff.submodule=diff": {"repo": {"diff.submodule": "diff"}},
+    "global-diff.ignoreSubmodules=all": {"global": {"diff.ignoreSubmodules": "all"}},
+    "gitmodules-ignore=all": {"gitmodules": True},
+}
+
+
+@pytest.mark.parametrize("tamper_kind", ["pointer", "extra-file"])
+@pytest.mark.parametrize("config_name", list(SUBMODULE_CONFIGS))
+def test_submodule_config_cannot_hide_an_unverified_change(
+    tmp_path: Path, monkeypatch, config_name: str, tamper_kind: str
+) -> None:
+    spec = SUBMODULE_CONFIGS[config_name]
+    base_ops = [("write", "a.txt", b"a\n"), ("write", "z.txt", b"z\n"), ("gitlink", "sub", "1" * 40)]
+    if spec.get("gitmodules"):
+        base_ops.append(
+            ("write", ".gitmodules", b'[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n\tignore = all\n')
+        )
+    repo_cfg = spec.get("repo", {})
+    if spec.get("global"):
+        _set_global_git_config(monkeypatch, tmp_path, spec["global"])
+
+    verified_ops = [("write", "a.txt", b"a2\n"), ("gitlink", "sub", "2" * 40)]
+    if tamper_kind == "pointer":
+        tamper_ops = [("write", "a.txt", b"a2\n"), ("gitlink", "sub", "3" * 40)]
+    else:
+        tamper_ops = [("write", "a.txt", b"a2\n"), ("gitlink", "sub", "2" * 40), ("write", "z.txt", b"EVIL\n")]
+
+    _fp_case_refuses(tmp_path / "fresh", base_ops, verified_ops, tamper_ops, repo_cfg=repo_cfg)
+    _fp_case_refuses(
+        tmp_path / "after-exit5", base_ops, verified_ops, tamper_ops, repo_cfg=repo_cfg, after_exit5=True
+    )
+
+
+def test_nul_byte_after_diff_attribute_refuses(tmp_path: Path) -> None:
+    base_ops = [("write", ".gitattributes", b"*.dat diff\n"), ("write", "x.dat", b"A\x00base\n")]
+    verified_ops = [("write", "x.dat", b"A\x00GOOD\n")]
+    tamper_ops = [("write", "x.dat", b"A\x00EVIL\n")]
+    _fp_case_refuses(tmp_path / "fresh", base_ops, verified_ops, tamper_ops)
+    _fp_case_refuses(tmp_path / "after-exit5", base_ops, verified_ops, tamper_ops, after_exit5=True)
+
+
+def test_nul_byte_after_8200_bytes_refuses(tmp_path: Path) -> None:
+    prefix = b"a\n" * 4100  # 8200 bytes of text before the NUL
+    base_ops = [("write", "big.sh", prefix + b"x\x00base\n")]
+    verified_ops = [("write", "big.sh", prefix + b"x\x00GOOD\n")]
+    tamper_ops = [("write", "big.sh", prefix + b"x\x00EVIL\n")]
+    _fp_case_refuses(tmp_path / "fresh", base_ops, verified_ops, tamper_ops)
+    _fp_case_refuses(tmp_path / "after-exit5", base_ops, verified_ops, tamper_ops, after_exit5=True)
+
+
+def test_binary_change_with_mode_change_on_other_path_refuses(tmp_path: Path) -> None:
+    base_ops = [("write", "a.bin", b"\x00\x01"), ("write", "b.sh", b"b\n"), ("write", "c.sh", b"c\n")]
+    verified_ops = [("write", "a.bin", b"\x00\x02"), ("chmod", "b.sh", 0o755)]
+    tamper_ops = [("write", "a.bin", b"\x00\x02"), ("chmod", "c.sh", 0o755)]
+    _fp_case_refuses(tmp_path / "fresh", base_ops, verified_ops, tamper_ops)
+    _fp_case_refuses(tmp_path / "after-exit5", base_ops, verified_ops, tamper_ops, after_exit5=True)
+
+
+def test_mode_only_change_on_other_path_refuses(tmp_path: Path) -> None:
+    base_ops = [("write", "s.sh", b"echo s\n"), ("write", "t.sh", b"echo t\n")]
+    verified_ops = [("chmod", "s.sh", 0o755)]
+    tamper_ops = [("chmod", "t.sh", 0o755)]
+    _fp_case_refuses(tmp_path / "fresh", base_ops, verified_ops, tamper_ops)
+    _fp_case_refuses(tmp_path / "after-exit5", base_ops, verified_ops, tamper_ops, after_exit5=True)
+
+
+def test_rename_to_different_target_refuses(tmp_path: Path) -> None:
+    content = b"".join(b"line %d\n" % i for i in range(20))
+    base_ops = [("write", "r.txt", content)]
+    verified_ops = [("mv", "r.txt", "r2.txt")]
+    tamper_ops = [("mv", "r.txt", "r3.txt")]
+    _fp_case_refuses(tmp_path / "fresh", base_ops, verified_ops, tamper_ops)
+    _fp_case_refuses(tmp_path / "after-exit5", base_ops, verified_ops, tamper_ops, after_exit5=True)
+
+
+@pytest.mark.parametrize("global_config", [False, True])
+def test_hand_rebase_with_varied_changes_merges(tmp_path: Path, monkeypatch, global_config: bool) -> None:
+    """A true positive: a verified commit that edits a mid-file line, changes a
+    mode, adds a binary file and renames a file, plus a commit adding an empty
+    file, still merges after a hand rebase onto a main that added lines at the
+    top of the same file -- with and without a global diff config that reshapes
+    prefixes, order, algorithm, renames, submodules and signatures.
+    """
+    if global_config:
+        order_file = tmp_path / "orderfile"
+        order_file.write_text("*\n")
+        _set_global_git_config(
+            monkeypatch,
+            tmp_path,
+            {
+                "diff.noprefix": "true",
+                "diff.mnemonicPrefix": "true",
+                "diff.algorithm": "histogram",
+                "diff.renames": "copies",
+                "diff.orderFile": str(order_file),
+                "diff.submodule": "log",
+                "diff.ignoreSubmodules": "all",
+                "diff.relative": "true",
+                "log.showSignature": "true",
+            },
+        )
+
+    original = b"".join(b"line %02d\n" % i for i in range(60))
+    lines = original.splitlines(keepends=True)
+    lines[49] = b"line FIFTY\n"
+    edited = b"".join(lines)
+
+    base_ops = [("write", "sixty.txt", original), ("write", "mode.sh", b"echo hi\n"), ("write", "old.txt", b"old\n")]
+    hub, worktree = _fp_repo(tmp_path, base_ops)
+
+    verified_ops = [
+        ("write", "sixty.txt", edited),
+        ("chmod", "mode.sh", 0o755),
+        ("write", "new.bin", b"\x00\x01\x02"),
+        ("mv", "old.txt", "renamed.txt"),
+    ]
+    _apply_ops(worktree, verified_ops)
+    _git(worktree, "commit", "-m", "verified")
+    _apply_ops(worktree, [("write", "empty.txt", b"")])
+    _git(worktree, "commit", "-m", "empty file")
+    beads = _beads(hub, worktree)
+
+    top = b"top1\ntop2\ntop3\ntop4\ntop5\n"
+    (hub / "sixty.txt").write_bytes(top + original)
+    _git(hub, "add", "sixty.txt")
+    _git(hub, "commit", "-m", "advance main")
+
+    _git(worktree, "rebase", "main")
+    assert _run(beads, hub) == (0, "merged")
+
+
+# ---------------------------------------------------------------- h3c-fix6 item 2:
+# the .beads/ branch diff is parsed with -z, so a quoted path does not escape it.
+
+
+@pytest.mark.parametrize("name", [".beads/café.jsonl", '.beads/a"b.jsonl', ".beads/tab\there.jsonl"])
+def test_beads_diff_with_quoted_path_still_refuses(tmp_path: Path, name: str) -> None:
+    hub, worktree = _repo(tmp_path)
+    path = worktree / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-m", "quoted beads path")
+    beads = _beads(hub, worktree)
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == "branch changes .beads/"
+
+
+# ---------------------------------------------------------------- h3c-fix6 item 3:
+# `_worktree_registered` compares Unicode NFC, so an NFC/NFD mismatch in a listed
+# path does not read as unregistered.
+
+
+def test_worktree_registered_matches_across_unicode_normalization_forms(tmp_path: Path) -> None:
+    import helios.merge as merge_module
+
+    hub_name = unicodedata.normalize("NFD", "hub-café")
+    hub = tmp_path / hub_name
+    hub.mkdir()
+    _git(hub, "init", "-b", "main")
+    _git(hub, "config", "user.email", "test@example.com")
+    _git(hub, "config", "user.name", "Test")
+    (hub / "value.txt").write_text("base\n")
+    _git(hub, "add", ".")
+    _git(hub, "commit", "-m", "base")
+    worktree = hub / ".claude" / "worktrees" / "b1"
+    worktree.parent.mkdir(parents=True)
+    _git(hub, "worktree", "add", "-b", "worktree-b1", str(worktree), "main")
+    _git(hub, "worktree", "lock", "--reason", "keep", str(worktree))
+
+    nfc_query = Path(unicodedata.normalize("NFC", str(worktree)))
+    nfd_query = Path(unicodedata.normalize("NFD", str(worktree)))
+    assert merge_module._worktree_registered(hub, nfc_query) is True
+    assert merge_module._worktree_registered(hub, nfd_query) is True
+    assert merge_module._worktree_registered(hub, hub.parent / "not-there") is False
