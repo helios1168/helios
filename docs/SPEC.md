@@ -1047,7 +1047,14 @@ the order 1, 2, 8, 3, 4, 5, 6, 7.
    rev-list --min-parents=2` lists a commit in `head_base..HEAD` or in
    `output_base..output_commit` (a merge commit), and refuse when `git rev-list
    <output_base>..<output_commit>` is empty (the verified range is empty because `output_commit`
-   is already on main). Start a cursor at `head_base`. For each commit `c` of `git
+   is already on main). Refuse also when `git rev-list <head_base>..<HEAD>` lists more commits
+   than `git rev-list <output_base>..<output_commit>`, with the same `helios: worktree HEAD
+   <sha> is not the verified output_commit <sha>` message and exit 2; fewer commits stay
+   allowed, so a verified range replayed as one squashed commit still merges. Before the
+   replay, `git config --get-regexp '^merge\..*\.driver'` runs in the hub; when it lists
+   anything, refuse with `helios: hub git config defines merge driver <name>`, exit 2 (a helios
+   hub defines none). The replay must depend only on the commits being replayed, never on the
+   machine it runs on. Start a cursor at `head_base`. For each commit `c` of `git
    rev-list --reverse <output_base>..<output_commit>`, in order, run `git merge-tree
    --write-tree --merge-base=<c^> <cursor> <c>` in the hub (`git merge-tree --write-tree
    --merge-base` requires git 2.38 or newer). Exit 1 is a conflict, so HEAD is not the verified
@@ -1059,7 +1066,9 @@ the order 1, 2, 8, 3, 4, 5, 6, 7.
    `git rev-parse <HEAD>^{tree}`. Otherwise refuse with the unchanged `helios: worktree HEAD
    <sha> is not the verified output_commit <sha>`, exit 2; so the commit step 6 merges, once
    rebased, is the verified commit. Every git command in this check runs with
-   `--no-replace-objects`, so a `git replace` ref cannot redirect the replay. A squashed replay
+   `--no-replace-objects`, `GIT_CONFIG_GLOBAL=/dev/null`, and `GIT_CONFIG_NOSYSTEM=1`, so a `git
+   replace` ref cannot redirect the replay and a merge driver defined in the user's global or the
+   system config cannot take part in it. A squashed replay
    cannot see a rename made in one commit and rewritten in the next, so it would refuse work
    that `git rebase` produced cleanly, including work helios rebased itself. Git output that
    `helios merge` parses or passes back to git is never decoded strictly: text is decoded with
