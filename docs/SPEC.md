@@ -194,8 +194,11 @@ errors naming the dotted key. `templates/workflow.toml` is the commented templat
 
 | key | default | meaning |
 | --- | --- | --- |
-| `project.test` | `"uv run pytest -q"` | shell command, run with `bash -c` from the worktree root |
-| `project.typecheck` | `""` | empty disables |
+| `project.test` | `"uv run pytest -q"` | shell command, run with `bash -c` from the worktree root; sugar for `[[project.check]]` when no `[[project.check]]` entry is present (see below) |
+| `project.typecheck` | `""` | empty disables; sugar for `[[project.check]]` when no `[[project.check]]` entry is present (see below) |
+| `project.check[].name` | none | check name, `[a-z0-9_-]{1,32}`, unique in the list (see below) |
+| `project.check[].command` | none | shell command, run with `bash -c` from the worktree root; empty disables the entry |
+| `project.check[].when` | `"both"` | `run`, `merge` or `both` (see below) |
 | `project.units` | `"docs/units"` | unit file directory |
 | `project.verify_artifacts` | `"tools/verify"` | verifier artifact root |
 | `project.experiments` | `"experiments"` | validation run root |
@@ -235,6 +238,38 @@ harness in `agents.verify_order` that differs from the author's harness. The aut
 author `claude:opus` excludes `claude`. When no harness in `agents.verify_order` differs, the
 stage is refused with `helios: no harness in agents.verify_order differs from <harness>`. The
 resolved harness is recorded on the bead.
+
+`[[project.check]]` is an array of tables; each entry is an ordered, named check with keys
+`name` (required), `command` (required), and `when` (optional, default `both`). An array of
+tables is used rather than a table keyed by name because the order of the entries is the order
+the checks run, and a TOML table does not preserve order.
+
+`name` matches `[a-z0-9_-]{1,32}`; a name that does not match is refused with `helios:
+project.check[<i>].name must match [a-z0-9_-]{1,32}`, `<i>` the entry's zero-based index in the
+list, exit 2. Names are unique within the list; a duplicate is refused with `helios: duplicate
+check name <name>`, exit 2. The names `report` and `ownership` are reserved for helios's own
+checks (§7.1 step 9); either is refused with `helios: check name <name> is reserved`, exit 2.
+The name `test` is reserved in a run, because the per-bead test check already uses it, so an
+entry named `test` whose `when` is `run` or `both` is refused with `helios: check "test" cannot
+have when = "<when>"`, exit 2; `name = "test"` with `when = "merge"` is allowed. The log file of
+a check is `checks/<name>.log`, which is why `name` is restricted to those characters. Each
+refusal above is a bad configuration value and exits with the code a bad configuration value
+already exits with (§2.3): 2.
+
+`when` is one of `run`, `merge` or `both`; any other value is refused with `helios:
+project.check[<i>].when must be "run", "merge" or "both"`, exit 2, naming the dotted key. `run`
+means the check runs in `helios run` step 9 (§7.1). `merge` means it runs in `helios merge` step
+4 (§12). `both` means both. An empty `command` disables that entry, the way `typecheck = ""`
+disables the typecheck today.
+
+When no `[[project.check]]` entry is present, `project.test` and `project.typecheck` are read as
+exactly two entries, in this order: `name = "test"` with `when = "merge"`, then `name =
+"typecheck"` with `when = "both"`. Those two `when` values are chosen so the default behaves
+exactly as helios behaves today: `project.test` runs only at merge, `project.typecheck` runs
+both in a run and at merge, and the per-bead `test` is what runs in a run. Setting `project.test`
+or `project.typecheck` together with any `[[project.check]]` entry is refused with `helios:
+project.test and project.typecheck cannot be set with project.check`, exit 2, so there is never
+more than one source of truth.
 
 ## 6. Harness adapters
 
@@ -461,10 +496,14 @@ These apply to claude, codex, opencode and agy.
    record the result in one `state.json` write: the terminal state of §8.2, `execution_status`
    and the parsed `session_id`. A crash before that write leaves `launched`, which recovery
    treats as crashed (§8.4).
-9. Run checks from helios itself: the bead `test` in the worktree (log to `checks/test.log`),
-   `typecheck` when set, ownership (§7.4). When the captured report is missing or fails
-   `AgentReport.model_validate` while `execution_status` is `completed` (only reachable in
-   recovery, §8.4), the check `report` fails with a detail naming the problem.
+9. Run checks from helios itself, in this order: the bead `test` in the worktree (log
+   `checks/test.log`, check name `test`), then every configured check (§5 `project.check`,
+   `project.test` and `project.typecheck` included as sugar) whose `when` is `run` or `both`, in
+   configuration order, each logging to `checks/<name>.log` and recording a check of that name,
+   then ownership (§7.4). Every check runs and every result is recorded; a run does not stop at
+   the first failure. When the captured report is missing or fails `AgentReport.model_validate`
+   while `execution_status` is `completed` (only reachable in recovery, §8.4), the check `report`
+   fails with a detail naming the problem.
 10. If ownership passed, commit the changed paths of §7.4, after its skips, in three calls with
     literal pathspecs, never the whole tree. A path may no longer exist anywhere (a `git mv` or
     `git rm` source, or a file staged and then deleted on disk), and git rejects a pathspec
@@ -1088,7 +1127,9 @@ the order 1, 2, 8, 3, 4, 5, 6, 7.
    only when a rebase is in progress (`git rev-parse --git-path rebase-merge` or `rebase-apply`
    exists in the worktree). Otherwise print `helios: rebase failed:` plus git's stderr lines,
    each prefixed `helios: `, and stop with exit 4, without running abort.
-4. Rerun `project.test` and `project.typecheck` in the worktree; failure stops.
+4. Rerun every configured check (§5 `project.check`, `project.test` and `project.typecheck`
+   included as sugar) whose `when` is `merge` or `both`, in configuration order, in the
+   worktree, stopping at the first failure.
 5. If `main` moved since step 3, stop and say so; a second run starts over.
 6. In the hub run `git merge --ff-only worktree-<bead>`; when it fails because `main` moved,
    exit 3. On success, write metadata `merge_commit` = the worktree HEAD.
@@ -1110,8 +1151,9 @@ rule of §7.5, where `<step>` is one of `rebased` or `conflict` (step 3), `teste
 (step 7). `<main_before>` is always the value of metadata `merge_main_before`, so the markers
 of a recovery run use it too.
 
-Checks (`project.test`, `project.typecheck`) run with stdout and stderr captured, never
-inherited; their output is discarded on success. Captured check output is decoded with
+Configured checks (§5 `project.check`, `project.test` and `project.typecheck` included as
+sugar) run with stdout and stderr captured, never inherited; their output is discarded on
+success. Captured check output is decoded with
 `errors=replace`. On failure it prints
 `helios: <name> failed with exit <code>` then the last 50 lines of the combined captured output,
 each line prefixed `helios: `, and stops with exit 5. Every stderr line `helios merge` prints
@@ -1124,7 +1166,7 @@ A test checks that `bd set-state` on a closed bead does not reopen it. If it doe
 state on closed beads.
 
 Exit codes: 0 merged or recovered; 2 refusal (steps 1 and 2, lock); 3 rebase conflict or `main`
-moved; 5 test or typecheck failed; 4 push, worktree removal, or a rebase failure that is not a
+moved; 5 a configured check failed; 4 push, worktree removal, or a rebase failure that is not a
 conflict. Refusal and error messages go to stderr; success and `--dry-run` text go to stdout.
 
 `--dry-run` runs steps 1 and 2 and the recovery test of step 8, prints the planned steps, and
