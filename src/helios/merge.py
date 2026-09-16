@@ -53,9 +53,25 @@ def _git_output(cwd: Path, *args: str, env: dict[str, str] | None = None) -> str
     return proc.stdout.strip()
 
 
+def _isolated_env() -> dict[str, str]:
+    """A copy of the process environment with the global and system git config
+    disabled (`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`).
+
+    Every git command of the verified-commit check runs with this, so a merge
+    driver defined in the user's global or the system git config cannot take
+    part in the replay (SPEC 12 step 2, hel-cbx). A driver defined in the hub's
+    own repository config is not affected by these two variables and is refused
+    separately, before the replay runs.
+    """
+    env = dict(os.environ)
+    env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    return env
+
+
 def _no_git_ident_env() -> dict[str, str]:
     """A copy of the process environment with every `GIT_AUTHOR_` and
-    `GIT_COMMITTER_` key removed.
+    `GIT_COMMITTER_` key removed, on top of `_isolated_env`.
 
     Git prefers these variables over `-c user.name`/`-c user.email`, so the
     scratch `commit-tree` call in `_is_verified_commit` needs this to keep its
@@ -64,7 +80,7 @@ def _no_git_ident_env() -> dict[str, str]:
     """
     return {
         key: value
-        for key, value in os.environ.items()
+        for key, value in _isolated_env().items()
         if not key.startswith("GIT_AUTHOR_") and not key.startswith("GIT_COMMITTER_")
     }
 
@@ -212,8 +228,11 @@ def _remove_worktree(hub: Path, path: Path, branch: str) -> None:
 def _merge_base(hub: Path, a: str, b: str) -> str | None:
     """`git --no-replace-objects merge-base a b`, or None on failure or empty output
     (unrelated histories, an orphan branch): that is a refusal, not a git failure.
+
+    Runs with `_isolated_env` like every other git command of the verified-commit
+    check (SPEC 12 step 2, hel-cbx).
     """
-    proc = _git(hub, "--no-replace-objects", "merge-base", a, b)
+    proc = _git(hub, "--no-replace-objects", "merge-base", a, b, env=_isolated_env())
     if proc.returncode != 0:
         return None
     result = proc.stdout.strip()
@@ -251,25 +270,66 @@ def _is_verified_commit(hub: Path, head: str, output_commit: str) -> bool:
     otherwise make this scratch commit fail. `--no-replace-objects` guards every
     git call this check runs, so a `git replace` ref on a commit inside the range
     cannot redirect the replay.
+
+    Two more refusals, beside the merge-commit and empty-range checks and before
+    the replay loop (SPEC 12 step 2):
+
+    `head_base..head` holding more commits than `output_base..output_commit` is
+    unverified even when the two ranges' trees agree (hel-nkk): a branch can carry
+    an extra pair of commits whose net tree effect is zero, such as a blob added
+    then reverted, and still replay to the same tree, but that blob still lands in
+    main's history once the branch merges, and no verify bead evidence covers it.
+    Fewer commits than the verified range stays allowed, so a verified range
+    replayed as one squashed commit still merges.
+
+    `git merge-tree` honors a custom merge driver (a `.gitattributes` `merge=`
+    attribute plus a `merge.<name>.driver` git config entry), which can make a
+    replayed commit's merge produce content neither side actually committed
+    (hel-cbx). `_isolated_env` (`GIT_CONFIG_GLOBAL=/dev/null`,
+    `GIT_CONFIG_NOSYSTEM=1`) on every git command of this check keeps a driver
+    defined in the user's global or the system config out of the replay. A
+    worktree shares the hub's own `.git/config`, so a driver defined there is
+    still reachable by a worker; isolating the environment does not hide it, so
+    `git config --get-regexp '^merge\\..*\\.driver'` runs in the hub before the
+    replay and refuses by name when it lists anything.
     """
+    env = _isolated_env()
     output_base = _merge_base(hub, output_commit, "main")
     head_base = _merge_base(hub, head, "main")
     if output_base is None or head_base is None:
         return False
-    if _git_output(hub, "--no-replace-objects", "rev-list", "--min-parents=2", f"{head_base}..{head}"):
+    if _git_output(hub, "--no-replace-objects", "rev-list", "--min-parents=2", f"{head_base}..{head}", env=env):
         return False
-    if _git_output(hub, "--no-replace-objects", "rev-list", "--min-parents=2", f"{output_base}..{output_commit}"):
+    if _git_output(
+        hub, "--no-replace-objects", "rev-list", "--min-parents=2", f"{output_base}..{output_commit}", env=env
+    ):
         return False
     commits = _git_output(
-        hub, "--no-replace-objects", "rev-list", "--reverse", f"{output_base}..{output_commit}"
+        hub, "--no-replace-objects", "rev-list", "--reverse", f"{output_base}..{output_commit}", env=env
     ).splitlines()
     if not commits:
         return False
+    head_commits = _git_output(
+        hub, "--no-replace-objects", "rev-list", f"{head_base}..{head}", env=env
+    ).splitlines()
+    if len(head_commits) > len(commits):
+        return False
+    driver = _git(hub, "config", "--get-regexp", r"^merge\..*\.driver", env=env)
+    if driver.stdout.strip():
+        key = driver.stdout.strip().splitlines()[0].split(" ", 1)[0]
+        raise MergeError(f"hub git config defines merge driver {key[len('merge.'):-len('.driver')]}")
     cursor = head_base
     for commit in commits:
-        parent = _git_output(hub, "--no-replace-objects", "rev-parse", f"{commit}^")
+        parent = _git_output(hub, "--no-replace-objects", "rev-parse", f"{commit}^", env=env)
         proc = _git(
-            hub, "--no-replace-objects", "merge-tree", "--write-tree", f"--merge-base={parent}", cursor, commit
+            hub,
+            "--no-replace-objects",
+            "merge-tree",
+            "--write-tree",
+            f"--merge-base={parent}",
+            cursor,
+            commit,
+            env=env,
         )
         if proc.returncode == 1:
             return False
@@ -291,8 +351,8 @@ def _is_verified_commit(hub: Path, head: str, output_commit: str) -> bool:
             "replay",
             env=_no_git_ident_env(),
         )
-    return _git_output(hub, "--no-replace-objects", "rev-parse", f"{cursor}^{{tree}}") == _git_output(
-        hub, "--no-replace-objects", "rev-parse", f"{head}^{{tree}}"
+    return _git_output(hub, "--no-replace-objects", "rev-parse", f"{cursor}^{{tree}}", env=env) == _git_output(
+        hub, "--no-replace-objects", "rev-parse", f"{head}^{{tree}}", env=env
     )
 
 

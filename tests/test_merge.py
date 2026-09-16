@@ -2197,3 +2197,157 @@ def test_real_hub_dry_run_reports_success_not_staleness(tmp_path: Path, monkeypa
         "would rebase, test, merge, push, and remove",
     )
     assert _git(hub, "show", "main:value.txt") == "base"
+
+
+# ---------------------------------------------------------------- hel-nkk: a branch
+# can carry extra commits whose net tree effect is zero and still replay to the
+# verified tree, so the range sizes are compared too, not just the final trees.
+
+
+def test_add_then_revert_pair_refuses_longer_range(tmp_path: Path) -> None:
+    """A rebased HEAD carries an add-then-revert commit pair on top of the
+    verified change: 3 commits against a 1-commit verified range. Its final tree
+    matches the verified tree exactly, but `head_base..HEAD` holds more commits
+    than `output_base..output_commit`, so it refuses, writes nothing, and the
+    blob it added never reaches main's history.
+    """
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    old_commit = beads.beads["b1"].metadata["output_commit"]
+
+    _git(worktree, "reset", "--hard", "main")
+    (worktree / "value.txt").write_text("merged\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "merged value")
+    (worktree / "blob.txt").write_text("evil\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "add blob")
+    _git(worktree, "rm", "blob.txt")
+    _git(worktree, "commit", "-m", "revert blob")
+    new_head = _git(worktree, "rev-parse", "HEAD")
+    assert new_head != old_commit
+    assert _git(worktree, "rev-parse", "HEAD^{tree}") == _git(hub, "rev-parse", f"{old_commit}^{{tree}}")
+
+    before_main = _git(hub, "rev-parse", "main")
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == f"worktree HEAD {new_head} is not the verified output_commit {old_commit}"
+    assert beads.argv_log == []
+    assert _git(hub, "rev-parse", "main") == before_main
+    assert "blob.txt" not in _git(hub, "ls-tree", "-r", "--name-only", "main").splitlines()
+    assert "blob.txt" not in _git(hub, "rev-list", "--objects", "main").splitlines()
+
+
+# The range-size check does not disturb ordinary equal-or-fewer-commit replays:
+# a plain rebase (1 commit against 1) is `test_hand_rebase_onto_newer_main_still_merges`,
+# a squashed hand rebase (1 against 2) is `test_two_commit_range_squashed_on_new_main_merges`,
+# and a rename chain (2 against 2) is `test_rename_then_rewrite_while_main_edits_old_path_merges`,
+# all already asserting exit 0; the fix keeps them green as is.
+
+
+# ---------------------------------------------------------------- hel-cbx: a committed
+# merge driver can steer `git merge-tree`'s replay unless the check isolates the
+# global and system git config and refuses a driver defined in the hub's own
+# repository config outright.
+
+
+def _write_evil_driver(path: Path) -> Path:
+    """A merge driver that ignores its real merge inputs and always overwrites the
+    result with a fixed payload matching what a tampered HEAD carries: if a
+    driver can take part in the replay, this makes an unverified HEAD look
+    verified.
+    """
+    script = path / "evil-driver.sh"
+    script.write_text('#!/bin/sh\nprintf "EVIL PAYLOAD\\n" > "$2"\nexit 0\n')
+    script.chmod(0o755)
+    return script
+
+
+def test_global_merge_driver_cannot_fool_the_replay(tmp_path: Path, monkeypatch) -> None:
+    """A `.gitattributes` committed in the base sets `merge=evil` on `evil.dat`; a
+    driver for `evil` is defined only in the global git config and always
+    overwrites its result with the same payload the attacker's HEAD carries. Main
+    advances with a conflicting edit to `evil.dat` between the verified commit and
+    the attacker's HEAD, so replaying the verified commit onto `head_base` needs
+    a real three-way merge of `evil.dat`, exactly where a driver could substitute
+    forged content. `GIT_CONFIG_GLOBAL=/dev/null` on every git command of the
+    check keeps this driver out of the replay, so the conflict surfaces as a real
+    conflict and the tamper still refuses.
+    """
+    driver = _write_evil_driver(tmp_path)
+    _set_global_git_config(monkeypatch, tmp_path, {"merge.evil.driver": f"{driver} %O %A %B"})
+
+    hub = tmp_path / "repo"
+    hub.mkdir()
+    _git(hub, "init", "-b", "main")
+    _git(hub, "config", "user.email", "test@example.com")
+    _git(hub, "config", "user.name", "Test")
+    (hub / ".beads").mkdir()
+    (hub / ".beads" / "issues.jsonl").write_text("{}\n")
+    (hub / "evil.dat").write_text("orig\n")
+    (hub / ".gitattributes").write_text("evil.dat merge=evil\n")
+    _git(hub, "add", ".")
+    _git(hub, "commit", "-m", "base")
+    worktree = tmp_path / "worktree" / "b1"
+    worktree.parent.mkdir()
+    _git(hub, "worktree", "add", "-b", "worktree-b1", str(worktree), "main")
+    _git(hub, "worktree", "lock", "--reason", "keep", str(worktree))
+
+    (worktree / "evil.dat").write_text("GOOD\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "verified change")
+    beads = _beads(hub, worktree)
+    old_commit = beads.beads["b1"].metadata["output_commit"]
+
+    (hub / "evil.dat").write_text("MAIN\n")
+    _git(hub, "add", "evil.dat")
+    _git(hub, "commit", "-m", "advance main")
+
+    _git(worktree, "reset", "--hard", "main")
+    (worktree / "evil.dat").write_text("EVIL PAYLOAD\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "tampered")
+    new_head = _git(worktree, "rev-parse", "HEAD")
+
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == f"worktree HEAD {new_head} is not the verified output_commit {old_commit}"
+
+
+def test_repo_config_merge_driver_refuses_before_replay(tmp_path: Path) -> None:
+    """Config isolation alone does not help when the driver is defined in the
+    hub's own repository config, reachable by a worker because a worktree shares
+    the hub's `.git/config`. `helios merge` refuses immediately, naming the
+    driver, before attempting any replay.
+    """
+    driver = _write_evil_driver(tmp_path)
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    _git(hub, "config", "merge.evil.driver", f"{driver} %O %A %B")
+    (hub / "other.txt").write_text("other\n")
+    _git(hub, "add", "other.txt")
+    _git(hub, "commit", "-m", "advance main")
+    _git(worktree, "rebase", "main")
+
+    before_main = _git(hub, "rev-parse", "main")
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == "hub git config defines merge driver evil"
+    assert beads.argv_log == []
+    assert _git(hub, "rev-parse", "main") == before_main
+
+
+def test_no_merge_driver_configured_is_unaffected(tmp_path: Path) -> None:
+    """A hub with no merge driver configured is unaffected: the driver-detection
+    check finds nothing and a plain hand rebase still merges (SPEC 12 step 2).
+    """
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    (hub / "other.txt").write_text("other\n")
+    _git(hub, "add", "other.txt")
+    _git(hub, "commit", "-m", "advance main")
+    _git(worktree, "rebase", "main")
+    assert _run(beads, hub) == (0, "merged")
