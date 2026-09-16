@@ -250,15 +250,14 @@ the checks run, and a TOML table does not preserve order.
 
 `name` matches `[a-z0-9_-]{1,32}`; a name that does not match is refused with `helios:
 project.check[<i>].name must match [a-z0-9_-]{1,32}`, `<i>` the entry's zero-based index in the
-list, exit 2. Names are unique within the list; a duplicate is refused with `helios: duplicate
-check name <name>`, exit 2. The names `report` and `ownership` are reserved for helios's own
-checks (§7.1 step 9); either is refused with `helios: check name <name> is reserved`, exit 2.
-The name `test` is reserved in a run, because the per-bead test check already uses it, so an
-entry named `test` whose `when` is `run` or `both` is refused with `helios: check "test" cannot
-have when = "<when>"`, exit 2; `name = "test"` with `when = "merge"` is allowed. The log file of
-a check is `checks/<name>.log`, which is why `name` is restricted to those characters. Each
-refusal above is a bad configuration value and exits with the code a bad configuration value
-already exits with (§2.3): 2.
+list, exit 2. Names are unique within the list; a duplicate is refused with `helios:
+project.check[<i>].name <name> is a duplicate`, exit 2. The names `report` and `ownership` are
+reserved for helios's own checks (§7.1 step 9); either is refused with `helios:
+project.check[<i>].name <name> is reserved`, exit 2. The name `test` is reserved in a run,
+because the per-bead test check already uses it, so an entry named `test` whose `when` is `run`
+or `both` is refused with `helios: project.check[<i>] name "test" requires when = "merge"`, exit
+2; `name = "test"` with `when = "merge"` is allowed. The log file of a check is
+`checks/<name>.log`, which is why `name` is restricted to those characters.
 
 `when` is one of `run`, `merge` or `both`; any other value is refused with `helios:
 project.check[<i>].when must be "run", "merge" or "both"`, exit 2, naming the dotted key. `run`
@@ -1152,8 +1151,10 @@ the order 1, 2, 8, 3, 4, 5, 6, 7.
 Every step writes the comment `merge: [<bead>@<main_before>:<step>] <detail>` under the replay
 rule of §7.5, where `<step>` is one of `rebased` or `conflict` (step 3), `tested` or
 `test-failed` (step 4), `main-moved` (step 5), `merged` (step 6), `pushed` and `removed`
-(step 7). `<main_before>` is always the value of metadata `merge_main_before`, so the markers
-of a recovery run use it too.
+(step 7). Step 4 keeps exactly these two markers whatever the configured checks are named: the
+marker vocabulary and the replay rule of §7.5 are unchanged, and the detail of a `test-failed`
+marker names the check that failed. `<main_before>` is always the value of metadata
+`merge_main_before`, so the markers of a recovery run use it too.
 
 Configured checks (§5 `project.check`, `project.test` and `project.typecheck` included as
 sugar) run with stdout and stderr captured, never inherited; their output is discarded on
@@ -1551,8 +1552,9 @@ Credentials come from the environment only, never from `workflow.toml`, because 
 committed to the repository. The variables are `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`.
 helios builds the `Authorization: Basic <base64 of "<public key>:<secret key>">` header from
 them and always sends `x-langfuse-ingestion-version: 4`. When `telemetry.enabled` is true and
-either variable is missing or empty, helios exports nothing and records the note of rule 6
-below; it is not a refusal, because a missing key on one machine must not stop work.
+either variable is missing or empty, helios exports nothing and records the note required by
+the export never fails a run rule below; it is not a refusal, because a missing key on one
+machine must not stop work.
 
 Transport is OTLP over HTTP, protobuf or JSON, never gRPC, to the signal-specific traces
 endpoint (`telemetry.endpoint`, for example Langfuse's `/api/public/otel/v1/traces`). Any
