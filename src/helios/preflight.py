@@ -21,8 +21,9 @@ All failures exit 2 before anything is created:
   over-approximates on purpose.
 - the latest attempt of the bead is finalized, unless recovery (SPEC §8.4)
   applies.
-- the hub's ``.gitignore`` ignores ``.helios/`` and ``.claude/worktrees/``
-  (SPEC §2.2), checked once per preflight call with ``git check-ignore``.
+- the hub's ``.gitignore`` ignores the configured ``project.runs`` and
+  ``project.worktrees`` directories (SPEC §2.2, §5), checked once per
+  preflight call with ``git check-ignore``.
 """
 
 from __future__ import annotations
@@ -173,20 +174,20 @@ def _check_attempt_finalized(bead: Bead, ctx: PreflightContext) -> list[str]:
     return []
 
 
-_GITIGNORE_PATHS = (".helios/", ".claude/worktrees/")
-
-
 def _check_gitignore(ctx: PreflightContext) -> list[str]:
-    """The hub's ``.gitignore`` must ignore ``.helios/`` and ``.claude/worktrees/``
-    (SPEC §2.2). Runs once per preflight call, not once per bead.
+    """The hub's ``.gitignore`` must ignore the configured ``project.runs``
+    and ``project.worktrees`` directories (SPEC §2.2, §5). Runs once per
+    preflight call, not once per bead.
 
     Uses ``git check-ignore -q`` on a probe path under each directory: exit 0
-    means ignored, exit 1 means not ignored (a preflight error). Any other
-    exit code, or an ``OSError`` from launching git, is its own error naming
-    git's stderr or the exception message.
+    means ignored, exit 1 means not ignored (a preflight error naming the
+    configured directory with a trailing slash). Any other exit code, or an
+    ``OSError`` from launching git, is its own error naming git's stderr or
+    the exception message.
     """
     errors: list[str] = []
-    for path in _GITIGNORE_PATHS:
+    for rel in (ctx.runs_rel, ctx.worktrees_rel):
+        path = rel if rel.endswith("/") else f"{rel}/"
         probe = f"{path}probe"
         try:
             result = subprocess.run(

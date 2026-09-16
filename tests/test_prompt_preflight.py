@@ -362,6 +362,9 @@ def test_globs_overlap_rule() -> None:
 
 
 def test_preflight_gitignore_must_ignore_helios_and_worktrees(tmp_path: Path) -> None:
+    """Default config (SPEC §5): project.runs is `.helios/runs`, project.worktrees is
+    `.claude/worktrees`. A hub that ignores the parent `.helios/` is unaffected, since
+    git recognizes the nested probe as ignored too (SPEC §7.1 step 2)."""
     hub = tmp_path / "hub2"
     hub.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=hub, check=True)
@@ -370,18 +373,56 @@ def test_preflight_gitignore_must_ignore_helios_and_worktrees(tmp_path: Path) ->
 
     (hub / ".gitignore").write_text("")
     assert check([bead], ctx) == [
-        ".gitignore must ignore .helios/",
+        ".gitignore must ignore .helios/runs/",
         ".gitignore must ignore .claude/worktrees/",
     ]
 
     (hub / ".gitignore").write_text(".claude/worktrees/\n")
-    assert check([bead], ctx) == [".gitignore must ignore .helios/"]
+    assert check([bead], ctx) == [".gitignore must ignore .helios/runs/"]
 
     (hub / ".gitignore").write_text(".helios/\n")
     assert check([bead], ctx) == [".gitignore must ignore .claude/worktrees/"]
 
     (hub / ".gitignore").write_text(".helios/\n.claude/worktrees/\n")
     assert check([bead], ctx) == []
+
+
+def test_preflight_gitignore_probes_configured_directories(tmp_path: Path) -> None:
+    """A hub with non-default `project.worktrees` and `project.runs` is checked against
+    those configured directories, not the hardcoded defaults (hel-4xv)."""
+    hub = tmp_path / "hub2b"
+    hub.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=hub, check=True)
+    ctx = PreflightContext(
+        hub=hub,
+        memory_has=memory_map({}),
+        runs_rel=".helios/runs",
+        worktrees_rel=".helios-worktrees",
+    )
+    bead = impl_bead()
+
+    (hub / ".gitignore").write_text(".helios/\n.helios-worktrees/\n")
+    assert check([bead], ctx) == []
+
+    (hub / ".gitignore").write_text(".helios/\n")
+    errors = check([bead], ctx)
+    assert errors == [".gitignore must ignore .helios-worktrees/"]
+    assert not any(".claude/worktrees/" in e for e in errors)
+
+
+def test_preflight_gitignore_runs_once_per_call_not_per_bead(tmp_path: Path) -> None:
+    """SPEC §7.1 step 2: the gitignore check runs once per preflight call, not once
+    per bead, so a batch of beads gets one copy of the refusal, not one per bead."""
+    hub = tmp_path / "hub2c"
+    hub.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=hub, check=True)
+    (hub / ".gitignore").write_text("")
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}))
+    errors = check(
+        [impl_bead(id="b1", files=["src/a/"]), impl_bead(id="b2", files=["src/b/"])], ctx
+    )
+    assert errors.count(".gitignore must ignore .helios/runs/") == 1
+    assert errors.count(".gitignore must ignore .claude/worktrees/") == 1
 
 
 def test_preflight_gitignore_honors_git_info_exclude(tmp_path: Path) -> None:
