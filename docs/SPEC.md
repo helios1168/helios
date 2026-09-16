@@ -1025,38 +1025,45 @@ the order 1, 2, 8, 3, 4, 5, 6, 7.
    refuse. Every one must be closed with metadata `verdict` `verified`. Its evidence is
    `<runs>/<verify>/attempt-<n>/envelope.json`, with `<n>` its metadata `attempt`, which must
    exist and not be stale (§8.5). The impl bead must be closed. Any failure refuses.
-2. Refuse unless the hub is on `main` and both trees are clean. The hub is on `main` when
-   `git symbolic-ref --short HEAD` prints `main`. A tree is clean when
-   `git status --porcelain=v1 -z --untracked-files=no` parses to no entries, NUL-separated (a
-   rename or copy entry carries two paths); in the hub only, an entry every one of whose paths
-   starts with `.beads/` is dropped first (bd's own export, dirtied by any bd write), so in the
-   worktree a change under `.beads/` is dirt like any other path. When the worktree directory is
-   missing and step 8's recovery does not apply, refuse `helios: worktree missing for <bead>`.
-   Step 2 runs on every invocation, before recovery (step 8). Refuse unless the worktree is on
-   branch `worktree-<bead>` (`git -C <worktree> symbolic-ref --short HEAD`, else
-   `helios: worktree is not on branch worktree-<bead>`). Refuse also when
-   `git diff -z --no-renames --ignore-submodules=none --name-only <main>...worktree-<bead>`, split on NUL (so a quoted
+2. Refuse unless the hub is on `main` and both trees are clean. The hub is on `main` when `git
+   symbolic-ref --short HEAD` prints `main`. A tree is clean when `git status --porcelain=v1 -z
+   --untracked-files=no` parses to no entries, NUL-separated (a rename or copy entry carries two
+   paths); in the hub only, an entry every one of whose paths starts with `.beads/` is dropped
+   first (bd's own export, dirtied by any bd write), so in the worktree a change under `.beads/`
+   is dirt like any other path. When the worktree directory is missing and step 8's recovery
+   does not apply, refuse `helios: worktree missing for <bead>`. Step 2 runs on every
+   invocation, before recovery (step 8). Refuse unless the worktree is on branch
+   `worktree-<bead>` (`git -C <worktree> symbolic-ref --short HEAD`, else `helios: worktree is
+   not on branch worktree-<bead>`). Refuse also when `git diff -z --no-renames
+   --ignore-submodules=none --name-only <main>...worktree-<bead>`, split on NUL (so a quoted
    path, non-ASCII, a double quote or a tab, is still seen), lists any path under `.beads/`
    (`helios: branch changes .beads/`). Before any merge-base call, refuse when `output_commit`
    names no commit (`git cat-file -e <sha>^{commit}` fails) with `helios: verified output_commit
    <sha> is not a commit`, exit 2. The worktree HEAD passes when it equals the impl bead's
-   `output_commit`, checked first. Otherwise let `output_base` be `git merge-base <output_commit>
-   main` and `head_base` be `git merge-base <HEAD> main`. Refuse when `git rev-list
-   --min-parents=2` lists a commit in `head_base..HEAD` or in `output_base..output_commit` (a
-   merge commit), and refuse when `git rev-list <output_base>..<output_commit>` is empty (the
-   verified range is empty because `output_commit` is already on main). Then run `git merge-tree
-   --write-tree --merge-base=<output_base> <head_base> <output_commit>` in the hub, which
-   replays the verified range onto the branch's base (`git merge-tree --write-tree
-   --merge-base` requires git 2.38 or newer). Exit 0: the first line of stdout is the replayed
-   tree. Exit 1: a conflict, so HEAD is not the verified work replayed, refuse. Any other exit
-   code is a git failure: print git's stderr prefixed `helios: ` and exit 4. HEAD passes when the
-   replayed tree equals `git rev-parse <HEAD>^{tree}`. Otherwise refuse with the unchanged
-   `helios: worktree HEAD <sha> is not the verified output_commit <sha>`, exit 2; so the commit
-   step 6 merges, once rebased, is the verified commit. A diff comparison cannot tell a hunk's
-   position, so an edit moved to an identical block elsewhere in the file compares equal, while a
-   replay compares the resulting content. Git output that `helios merge` parses or passes
-   back to git is never decoded strictly: text is decoded with `surrogateescape` and printed
-   with `backslashreplace`.
+   `output_commit`, checked first. Otherwise let `output_base` be `git merge-base
+   <output_commit> main` and `head_base` be `git merge-base <HEAD> main`. When either command
+   exits nonzero or prints nothing (unrelated histories, for example an orphan branch), the HEAD
+   is not verified: refuse with the usual message and exit 2, not exit 4. Refuse when `git
+   rev-list --min-parents=2` lists a commit in `head_base..HEAD` or in
+   `output_base..output_commit` (a merge commit), and refuse when `git rev-list
+   <output_base>..<output_commit>` is empty (the verified range is empty because `output_commit`
+   is already on main). Start a cursor at `head_base`. For each commit `c` of `git
+   rev-list --reverse <output_base>..<output_commit>`, in order, run `git merge-tree
+   --write-tree --merge-base=<c^> <cursor> <c>` in the hub (`git merge-tree --write-tree
+   --merge-base` requires git 2.38 or newer). Exit 1 is a conflict, so HEAD is not the verified
+   work replayed: refuse. Any other nonzero exit is a git failure: print git's stderr prefixed
+   `helios: ` and exit 4. On exit 0 the first line of stdout is the replayed tree; the cursor
+   becomes `git commit-tree <tree> -p <cursor> -m replay`, written with a fixed identity
+   (`user.name=helios`, `user.email=helios@invalid`) because the hub may have none. These
+   commits are unreferenced scratch objects. HEAD passes when the final cursor's tree equals
+   `git rev-parse <HEAD>^{tree}`. Otherwise refuse with the unchanged `helios: worktree HEAD
+   <sha> is not the verified output_commit <sha>`, exit 2; so the commit step 6 merges, once
+   rebased, is the verified commit. Every git command in this check runs with
+   `--no-replace-objects`, so a `git replace` ref cannot redirect the replay. A squashed replay
+   cannot see a rename made in one commit and rewritten in the next, so it would refuse work
+   that `git rebase` produced cleanly, including work helios rebased itself. Git output that
+   `helios merge` parses or passes back to git is never decoded strictly: text is decoded with
+   `surrogateescape` and printed with `backslashreplace`.
 3. Record `main_before` as metadata `merge_main_before`. Then in the worktree run
    `git rebase main`. A nonzero exit is a conflict, `git rebase --abort`, `run=conflict`, stop,
    only when a rebase is in progress (`git rev-parse --git-path rebase-merge` or `rebase-apply`
