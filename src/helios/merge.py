@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import os
 import subprocess
 import unicodedata
 from collections.abc import Callable
@@ -26,15 +27,16 @@ CheckRunner = Callable[[str, Path], int]
 HashFunction = Callable[[Bead], dict[str, str]]
 
 
-def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _git(cwd: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     """Run git, decoding stdout/stderr as UTF-8 with `surrogateescape`, by hand
     from raw bytes rather than through a text-mode pipe.
 
     A manual decode never raises `UnicodeDecodeError` on a non-UTF-8 path or
     message (SPEC 12 item 2), and, unlike `subprocess.run(text=True)`, never
-    translates a `\\r\\n` in the output.
+    translates a `\\r\\n` in the output. `env`, when given, replaces the
+    inherited environment entirely; the default `None` inherits it, as before.
     """
-    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=False)
+    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=False, env=env)
     return subprocess.CompletedProcess(
         proc.args,
         proc.returncode,
@@ -43,11 +45,27 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _git_output(cwd: Path, *args: str) -> str:
-    proc = _git(cwd, *args)
+def _git_output(cwd: Path, *args: str, env: dict[str, str] | None = None) -> str:
+    proc = _git(cwd, *args) if env is None else _git(cwd, *args, env=env)
     if proc.returncode:
         raise MergeError(proc.stderr.strip() or f"git {' '.join(args)} failed", 4)
     return proc.stdout.strip()
+
+
+def _no_git_ident_env() -> dict[str, str]:
+    """A copy of the process environment with every `GIT_AUTHOR_` and
+    `GIT_COMMITTER_` key removed.
+
+    Git prefers these variables over `-c user.name`/`-c user.email`, so the
+    scratch `commit-tree` call in `_is_verified_commit` needs this to keep its
+    fixed `helios`/`helios@invalid` identity regardless of what the hub's
+    environment holds (SPEC 12 step 2, hel-tq1).
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_AUTHOR_") and not key.startswith("GIT_COMMITTER_")
+    }
 
 
 class _DefaultRunner:
@@ -233,10 +251,13 @@ def _is_verified_commit(hub: Path, head: str, output_commit: str) -> bool:
     already on main), unrelated histories (a `merge-base` call fails or is empty),
     or a replay conflict all read as unverified rather than raising. `commit-tree`
     needs a committer identity a test hub may not have, so it runs with
-    `-c user.name=helios -c user.email=helios@invalid`, keeping `GIT_AUTHOR_*` and
-    `GIT_COMMITTER_*` out of it. `--no-replace-objects` guards every git call this
-    check runs, so a `git replace` ref on a commit inside the range cannot redirect
-    the replay.
+    `-c user.name=helios -c user.email=helios@invalid` and an environment with
+    every `GIT_AUTHOR_*` and `GIT_COMMITTER_*` key removed (`_no_git_ident_env`),
+    since git prefers those variables over `-c user.*` and a hostile or malformed
+    one (an empty `GIT_COMMITTER_NAME`, an unparsable `GIT_AUTHOR_DATE`) would
+    otherwise make this scratch commit fail. `--no-replace-objects` guards every
+    git call this check runs, so a `git replace` ref on a commit inside the range
+    cannot redirect the replay.
     """
     output_base = _merge_base(hub, output_commit, "main")
     head_base = _merge_base(hub, head, "main")
@@ -275,6 +296,7 @@ def _is_verified_commit(hub: Path, head: str, output_commit: str) -> bool:
             cursor,
             "-m",
             "replay",
+            env=_no_git_ident_env(),
         )
     return _git_output(hub, "--no-replace-objects", "rev-parse", f"{cursor}^{{tree}}") == _git_output(
         hub, "--no-replace-objects", "rev-parse", f"{head}^{{tree}}"

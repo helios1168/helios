@@ -1924,4 +1924,71 @@ def test_replace_ref_on_range_commit_does_not_change_outcome(tmp_path: Path) -> 
     assert _run(beads, hub) == (0, "merged")
     assert _git(hub, "show", "main:extra.txt") == "one\ntwo"
     assert _git(hub, "show", "main:other.txt") == "other"
+
+
+# ---------------------------------------------------------------- hel-tq1:
+# the scratch `commit-tree` call the replay makes keeps `GIT_AUTHOR_*` and
+# `GIT_COMMITTER_*` out of its environment, so a hostile or malformed value
+# inherited from the hub's environment cannot break a legitimate merge.
+
+
+def _two_commit_replay_repo(tmp_path: Path) -> tuple[Path, Path, FakeBeads]:
+    """A two-commit verified range, rebased onto a main that has since moved, so
+    HEAD no longer equals `output_commit` and the verified-commit check must
+    replay the range commit by commit (the scratch `commit-tree` call runs at
+    least once) rather than take the HEAD-equals-output_commit shortcut.
+    """
+    hub, worktree = _repo(tmp_path)
+    (worktree / "extra.txt").write_text("one\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "c1")
+    (worktree / "extra.txt").write_text("one\ntwo\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "c2")
+    out = _git(worktree, "rev-parse", "HEAD")
+    beads = _beads(hub, worktree)
+    beads.beads["b1"].metadata["output_commit"] = out
+    _new_envelope(hub, worktree)
+
+    (hub / "other.txt").write_text("other\n")
+    _git(hub, "add", "other.txt")
+    _git(hub, "commit", "-m", "advance main")
+    _git(worktree, "rebase", "main")
+    return hub, worktree, beads
+
+
+def test_replay_merges_with_empty_git_committer_name(tmp_path: Path, monkeypatch) -> None:
+    """A hostile empty `GIT_COMMITTER_NAME` in the environment does not break the
+    scratch `commit-tree` call the replay makes; git would otherwise refuse an
+    empty ident name and the merge would die with exit 4.
+    """
+    hub, worktree, beads = _two_commit_replay_repo(tmp_path)
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "")
+    assert _run(beads, hub) == (0, "merged")
+    assert _git(hub, "show", "main:extra.txt") == "one\ntwo"
+
+
+def test_replay_merges_with_malformed_git_author_date(tmp_path: Path, monkeypatch) -> None:
+    """A malformed `GIT_AUTHOR_DATE` in the environment does not break the
+    scratch `commit-tree` call the replay makes; git would otherwise refuse an
+    unparsable date and the merge would die with exit 4.
+    """
+    hub, worktree, beads = _two_commit_replay_repo(tmp_path)
+    monkeypatch.setenv("GIT_AUTHOR_DATE", "not-a-date")
+    assert _run(beads, hub) == (0, "merged")
+    assert _git(hub, "show", "main:extra.txt") == "one\ntwo"
+
+
+def test_replay_merges_with_valid_author_and_committer_env(tmp_path: Path, monkeypatch) -> None:
+    """Valid `GIT_AUTHOR_*`/`GIT_COMMITTER_*` values in the environment do not
+    change the outcome either: they can only ever change a scratch commit's
+    sha, never the tree the replay compares.
+    """
+    hub, worktree, beads = _two_commit_replay_repo(tmp_path)
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Someone")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "someone@example.com")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Someone Else")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "else@example.com")
+    assert _run(beads, hub) == (0, "merged")
+    assert _git(hub, "show", "main:extra.txt") == "one\ntwo"
     assert _git(hub, "show", "main:value.txt") == "merged"
