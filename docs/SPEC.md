@@ -52,6 +52,10 @@ tools/verify/<unit>/                   verifier artifacts, committed
 .helios/events.jsonl                   event stream (§9.3), gitignored
 ```
 
+`.claude/worktrees` and `.helios/runs` are the defaults for `project.worktrees` and
+`project.runs` (§5). The hub's `.gitignore` must ignore whatever directories those settings
+resolve to, not these literal paths; preflight checks this (§7.1 step 2).
+
 ### 2.3 Command modules
 
 `helios.cli` imports every public module in `helios.commands`. A module defines `NAME`
@@ -394,8 +398,8 @@ These apply to claude, codex, opencode and agy.
    module that calls `bd`). Metadata values may arrive JSON-encoded as strings; decode them.
 2. Preflight (`helios.preflight`), all failures exit 2 before anything is created. Every preflight
    refusal is written to stderr with the prefix `preflight: `, for example `preflight: .gitignore
-   must ignore .helios/`; that prefix is what distinguishes a refusal raised by preflight from one
-   raised by the command itself (`helios: `):
+   must ignore .helios/runs/`; that prefix is what distinguishes a refusal raised by preflight
+   from one raised by the command itself (`helios: `):
    - `impl` and `validate` need `files` and `test`; verify kinds need `unit` and `parent`, and
      a verify bead without a worktree needs `output_commit` metadata on its parent (§7.3), so a
      verify worktree is never created from `main` in any run mode.
@@ -420,11 +424,14 @@ These apply to claude, codex, opencode and agy.
    - `skills/<kind>/SKILL.md` exists in the hub for the bead kind;
    - the bead is not closed;
    - the latest attempt of the bead is finalized, unless recovery (§8.4) applies;
-   - the hub's `.gitignore` ignores `.helios/` and `.claude/worktrees/`, checked once per
-     preflight call, not once per bead, before any attempt: `git check-ignore -q` is run on a
-     probe path under each (`<path>probe`). Exit 0 means ignored; exit 1 is the preflight error
-     `.gitignore must ignore <path>`; any other exit code, or an `OSError` from launching git, is
-     its own error naming git's stderr or the exception message.
+   - the hub's `.gitignore` ignores the configured `project.runs` and `project.worktrees`
+     directories (§5), checked once per preflight call, not once per bead, before any attempt:
+     `git check-ignore -q` is run on a probe path under each (`<project.runs>/probe` and
+     `<project.worktrees>/probe`). Exit 0 means ignored; exit 1 is the preflight error
+     `.gitignore must ignore <path>`, where `<path>` is the configured directory with a trailing
+     slash; any other exit code, or an `OSError` from launching git, is its own error naming
+     git's stderr or the exception message. The defaults are `.helios/runs` and
+     `.claude/worktrees`, so a hub that ignores `.helios/` and `.claude/worktrees/` is unaffected.
 3. Resolve the harness (§5). `--harness` overrides. Then, unless the bead is already closed
    (which helios never reopens), set its status to `in_progress`.
 4. Prepare the worktree (§7.3).
