@@ -1450,20 +1450,20 @@ second person joins.
 | id | subject | status |
 | --- | --- | --- |
 | ★A | environment per worktree | closed: environment per worktree, shared uv cache |
-| ★B | test runner | open for projects; helios itself uses pytest |
+| ★B | test runner | closed 2026-09-16: an ordered list of named checks (§5); `project.test` and `project.typecheck` stay as sugar |
 | ★C | where the kit lives | closed: `repos/helios`, own beads database |
 | ★D | may any harness author a model | closed: yes, with a fresh verifier on another harness |
 | ★E | validation verifier scope | closed: reproduce every result behind a conclusion plus boundary and failure cases |
-| ★F | move dispatch to ACP | open |
+| ★F | move dispatch to ACP | closed 2026-09-16: declined; keep the native structured JSON channels of §6.3 |
 | ★G | read-only subagents inside a bead | closed: allowed, one patch owner |
-| ★H | Microsoft Conductor as run layer | open, after the slice |
+| ★H | Microsoft Conductor as run layer | closed 2026-09-16: declined; native CLIs plus tmux stay (★L) |
 | ★I | operating model | provisional, §17 |
 | ★J | codex daemon threads | deferred: this wave uses `codex exec`; daemon threads come with remote control |
-| ★K | trace backend | open |
+| ★K | trace backend | closed 2026-09-16: Langfuse over OTLP/HTTP; export is best effort and never fails a run |
 | ★L | session runtime | closed: native CLIs plus tmux |
-| ★M | Graphiti | open |
+| ★M | Graphiti | closed 2026-09-16: declined for now; beads with a files export stays (★N) |
 | ★N | memory store | closed: beads, with a files export |
-| ★O | Lean beyond a pilot | open |
+| ★O | Lean beyond a pilot | deferred 2026-09-16: revisit with the `math-verify` port |
 | ★P | harness set | closed 2026-09-13: claude, codex, opencode, agy |
 | ★Q | beads database scope | closed 2026-09-13: one database per repository |
 
