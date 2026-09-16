@@ -11,8 +11,9 @@ from pathlib import Path
 from typing import TextIO, cast
 
 from helios.beads import Bead, BeadsLike, comment_has
-from helios.config import ProjectConfig
+from helios.config import Config, ProjectConfig
 from helios.envelope import Envelope
+from helios.run import recompute_input_hashes
 
 
 class MergeError(RuntimeError):
@@ -95,14 +96,6 @@ class _DefaultRunner:
 _default_runner = _DefaultRunner()
 
 
-def _default_hashes(bead: Bead) -> dict[str, str]:
-    """Return hashes for the bead's persisted input files."""
-    hashes: dict[str, str] = {}
-    for key, value in bead.metadata.get("input_hashes", {}).items():
-        hashes[str(key)] = str(value)
-    return hashes
-
-
 def _comment(beads: BeadsLike, bead: str, marker: str, detail: str) -> None:
     text = f"merge: {marker} {detail}"
     if not comment_has(beads.comments(bead), "merge", marker):
@@ -165,7 +158,7 @@ def _verify_evidence(hub: Path, runs: str, impl: Bead, beads: BeadsLike, hashes:
             raise MergeError(f"invalid verify envelope: {exc}") from exc
         if envelope.base_commit != impl.metadata.get("output_commit"):
             raise MergeError("verify envelope is stale")
-        current = hashes(impl)
+        current = hashes(verifier)
         recorded = envelope.input_hashes
         keys = set(current) | set(recorded)
         if any(key != "prompt" and current.get(key) != recorded.get(key) for key in keys):
@@ -327,14 +320,25 @@ def merge_bead(
     project: ProjectConfig,
     beads: BeadsLike,
     check_runner: CheckRunner = _default_runner,
-    input_hashes: HashFunction = _default_hashes,
+    input_hashes: HashFunction | None = None,
     dry_run: bool = False,
 ) -> tuple[int, str]:
     """Integrate one closed implementation bead, returning ``(exit_code, message)``.
 
     Steps run in the order 1, 2, 8, 3, 4, 5, 6, 7 (SPEC 12).
+
+    ``input_hashes`` defaults to recomputing a verify bead's input hashes the
+    same way a run computes them (``helios.run.recompute_input_hashes``,
+    SPEC §7.1 step 6, §8.5); a caller may still inject a fake, mainly for
+    tests that are not about evidence hashing itself. Only ``project`` is
+    known here, not a full ``Config``, so the recompute uses default
+    ``agents``, ``harness``, ``control`` and ``memory`` settings alongside
+    the given ``project``.
     """
     bead = beads.show(bead_id)
+    hashes_fn: HashFunction = input_hashes if input_hashes is not None else (
+        lambda verifier: recompute_input_hashes(hub, Config(hub=hub, project=project), beads, verifier)
+    )
     runs_dir = hub / project.runs / bead_id
     lock_path = runs_dir / "lock"
     lock: TextIO | None = None
@@ -351,7 +355,7 @@ def merge_bead(
             raise MergeError("merge lock is held", 2) from exc
     try:
         # Step 1: evidence.
-        _verify_evidence(hub, project.runs, bead, beads, input_hashes)
+        _verify_evidence(hub, project.runs, bead, beads, hashes_fn)
 
         branch = f"worktree-{bead_id}"
         worktree = (hub / project.worktrees / bead_id).resolve()

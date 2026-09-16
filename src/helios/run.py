@@ -1262,28 +1262,23 @@ def _finalize_unlaunched_lookup_failure(
     return 2
 
 
-def _assemble_inputs(
-    *,
+def _gather_input_texts(
     hub: Path,
     config: config_mod.Config,
     beads: beads_mod.BeadsLike,
     bead: beads_mod.Bead,
-    worktree_path: Path,
-    branch: str,
-    attempt_id: str,
-    report_path: Path,
-) -> tuple[str, dict[str, str], str, list[tuple[str, str]], dict[str, str], str | None]:
-    """Assemble the prompt and its hashed inputs (SPEC §7.2, §8.3).
+) -> tuple[dict[str, object], list[tuple[str, str]], dict[str, str], str | None]:
+    """Read a bead's persisted, un-prompted inputs (SPEC §7.1 step 6, §7.2).
 
-    Each memory's body is read through the memory backend keyed by
-    ``config.memory.backend`` (SPEC §13 ``inject``); ``prompt.assemble``
-    renders its own ``### <key>`` heading per value, so passing raw bodies
-    here produces the same bytes as ``inject(bead.memories)`` would, item by
-    item, before any inject-cap truncation (SPEC §7.2 item 5).
+    Returns the bead JSON fields exactly as the prompt's ``Bead`` section
+    renders them, each docs entry through ``prompt_mod.read_doc``, each
+    memory value resolved through the memory backend keyed by
+    ``config.memory.backend`` (SPEC §13), and the unit file text when the
+    bead has a unit. Shared by prompt assembly (``_assemble_inputs``) and
+    the verify-evidence staleness recompute a merge runs (SPEC §8.5,
+    ``recompute_input_hashes``), so there is one copy of this logic.
     """
-    skills_dir = hub / "skills"
-    agents_path = hub / "AGENTS.md"
-    bead_map = {
+    bead_map: dict[str, object] = {
         "id": bead.id,
         "title": bead.title,
         "description": bead.description,
@@ -1308,6 +1303,60 @@ def _assemble_inputs(
                 raise MemoryLookupError(
                     f"helios: memory lookup failed for {key}: {exc}"
                 ) from exc
+    docs_texts: list[tuple[str, str]] = []
+    for entry in bead.docs:
+        try:
+            _, text = prompt_mod.read_doc(hub, entry)
+        except (OSError, KeyError):
+            text = ""
+        docs_texts.append((entry, text))
+    unit_text: str | None = None
+    if bead.unit:
+        unit_path = hub / config.project.units / f"{bead.unit}.md"
+        try:
+            unit_text = unit_path.read_text()
+        except OSError:
+            unit_text = None
+    return bead_map, docs_texts, memories, unit_text
+
+
+def recompute_input_hashes(
+    hub: Path,
+    config: config_mod.Config,
+    beads: beads_mod.BeadsLike,
+    bead: beads_mod.Bead,
+) -> dict[str, str]:
+    """Recompute a bead's persisted input hashes the same way a run computes
+    them (SPEC §7.1 step 6), for the merge staleness check (SPEC §8.5).
+
+    Never returns a ``prompt`` key: recomputing the actual prompt text needs
+    an attempt's worktree, branch and report path, none of which exist at
+    merge time, and SPEC §8.5 exempts ``prompt`` from the comparison anyway.
+    """
+    bead_map, docs_texts, memories, unit_text = _gather_input_texts(hub, config, beads, bead)
+    bead_json = json.dumps(bead_map, indent=2, sort_keys=True)
+    hashes = compute_input_hashes(
+        prompt="", bead_json=bead_json, docs=docs_texts, memories=memories, unit_text=unit_text
+    )
+    del hashes["prompt"]
+    return hashes
+
+
+def _assemble_inputs(
+    *,
+    hub: Path,
+    config: config_mod.Config,
+    beads: beads_mod.BeadsLike,
+    bead: beads_mod.Bead,
+    worktree_path: Path,
+    branch: str,
+    attempt_id: str,
+    report_path: Path,
+) -> tuple[str, dict[str, str], str, list[tuple[str, str]], dict[str, str], str | None]:
+    """Assemble the prompt and its hashed inputs (SPEC §7.2, §8.3)."""
+    skills_dir = hub / "skills"
+    agents_path = hub / "AGENTS.md"
+    bead_map, docs_texts, memories, unit_text = _gather_input_texts(hub, config, beads, bead)
     report_schema = envelope_mod.schema_text("agent-report")
     prompt = prompt_mod.assemble(
         kind=bead.kind,
@@ -1324,20 +1373,6 @@ def _assemble_inputs(
         report_schema=report_schema,
         inject_cap_bytes=config.memory.inject_cap_bytes,
     )
-    docs_texts: list[tuple[str, str]] = []
-    for entry in bead.docs:
-        try:
-            _, text = prompt_mod.read_doc(hub, entry)
-        except (OSError, KeyError):
-            text = ""
-        docs_texts.append((entry, text))
-    unit_text: str | None = None
-    if bead.unit:
-        unit_path = hub / config.project.units / f"{bead.unit}.md"
-        try:
-            unit_text = unit_path.read_text()
-        except OSError:
-            unit_text = None
     bead_json = json.dumps(bead_map, indent=2, sort_keys=True)
     hashes = compute_input_hashes(
         prompt=prompt,

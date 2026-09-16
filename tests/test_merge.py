@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import fcntl
 import shutil
@@ -11,8 +12,9 @@ from pathlib import Path
 
 import pytest
 
+from helios import run as run_mod
 from helios.beads import Bead, Beads, FakeBeads
-from helios.config import ProjectConfig
+from helios.config import Config, ProjectConfig
 from helios.envelope import AgentReport, Envelope, ExecutionStatus, WorkStatus
 from helios.merge import MergeError, merge_bead
 
@@ -43,7 +45,20 @@ def _repo(tmp_path: Path) -> tuple[Path, Path]:
     return hub, worktree
 
 
-def _beads(hub: Path, worktree: Path) -> FakeBeads:
+def _beads(hub: Path, worktree: Path, *, real_hashes: bool = False) -> FakeBeads:
+    """FakeBeads with a closed impl bead "b1" and a verified verify bead "v1".
+
+    Most tests here exercise merge mechanics (rebase, push, worktree
+    removal...), not evidence hashing, and inject a fake `input_hashes`
+    through `_run` regardless of what is recorded, so the recorded
+    `input_hashes` default to `{}` (matching that fake's own `{}`). A test
+    that calls `merge_bead` or `helios.commands.merge` without an injected
+    `input_hashes` exercises the real default (hel-z3b,
+    `run.recompute_input_hashes`) and needs `real_hashes=True` so the
+    recorded value actually matches: nothing here gives the verify bead
+    docs, memories or a unit file, so that is the hash of its bead JSON
+    alone.
+    """
     impl = Bead(
         id="b1",
         kind="impl",
@@ -60,6 +75,10 @@ def _beads(hub: Path, worktree: Path) -> FakeBeads:
         metadata={"verdict": "verified", "attempt": 1},
         labels=["unit:u1"],
     )
+    beads = FakeBeads([impl, verify])
+    hashes: dict[str, str] = {}
+    if real_hashes:
+        hashes = run_mod.recompute_input_hashes(hub, Config(hub=hub, project=_project()), beads, verify)
     envelope_dir = hub / ".helios" / "runs" / "v1" / "attempt-1"
     envelope_dir.mkdir(parents=True)
     (envelope_dir / "envelope.json").write_text(
@@ -71,12 +90,12 @@ def _beads(hub: Path, worktree: Path) -> FakeBeads:
             harness="fake",
             started_at="now",
             base_commit=impl.metadata["output_commit"],
-            input_hashes={},
+            input_hashes=hashes,
             execution_status=ExecutionStatus.COMPLETED,
             report=AgentReport(status=WorkStatus.DONE, summary="ok"),
         ).model_dump_json()
     )
-    return FakeBeads([impl, verify])
+    return beads
 
 
 def _project() -> ProjectConfig:
@@ -147,7 +166,7 @@ def test_refuses_missing_envelope_without_bead_writes(tmp_path: Path) -> None:
 
 def test_dry_run_does_not_write_beads(tmp_path: Path) -> None:
     hub, worktree = _repo(tmp_path)
-    beads = _beads(hub, worktree)
+    beads = _beads(hub, worktree, real_hashes=True)
     assert merge_bead(
         hub,
         "b1",
@@ -160,7 +179,7 @@ def test_dry_run_does_not_write_beads(tmp_path: Path) -> None:
 
 def test_happy_path_merges_and_removes_worktree(tmp_path: Path) -> None:
     hub, worktree = _repo(tmp_path)
-    beads = _beads(hub, worktree)
+    beads = _beads(hub, worktree, real_hashes=True)
     assert _git(hub, "status", "--porcelain", "--untracked-files=no") == ""
     assert _git(worktree, "status", "--porcelain", "--untracked-files=no") == ""
     code, message = merge_bead(
@@ -665,7 +684,7 @@ def test_command_writes_refusal_to_stderr_and_planned_steps_to_stdout(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     hub, worktree = _repo(tmp_path)
-    beads = _beads(hub, worktree)
+    beads = _beads(hub, worktree, real_hashes=True)
     beads.beads["v1"].metadata["verdict"] = "inconclusive"
     import helios.commands.merge as command
     from helios.config import Config
@@ -752,7 +771,7 @@ def test_check_failure_reports_last_lines_of_captured_output(tmp_path: Path) -> 
 
 def test_command_discards_successful_check_output(tmp_path: Path, monkeypatch, capsys) -> None:
     hub, worktree = _repo(tmp_path)
-    beads = _beads(hub, worktree)
+    beads = _beads(hub, worktree, real_hashes=True)
     project = ProjectConfig(worktrees="../worktree", test="echo NOISY-OUT; echo NOISY-ERR 1>&2")
     import helios.commands.merge as command
     from helios.config import Config
@@ -769,7 +788,7 @@ def test_command_prints_prefixed_failure_output_from_noisy_check(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     hub, worktree = _repo(tmp_path)
-    beads = _beads(hub, worktree)
+    beads = _beads(hub, worktree, real_hashes=True)
     project = ProjectConfig(
         worktrees="../worktree", test="echo NOISY-OUT; echo NOISY-ERR 1>&2; exit 3"
     )
@@ -839,7 +858,7 @@ def test_command_unreadable_workflow_toml_exits_one(tmp_path: Path, monkeypatch,
 
 def test_push_rejection_stderr_is_fully_prefixed(tmp_path: Path, monkeypatch, capsys) -> None:
     hub, worktree = _repo(tmp_path)
-    beads = _beads(hub, worktree)
+    beads = _beads(hub, worktree, real_hashes=True)
     origin = tmp_path / "origin.git"
     _git(tmp_path, "init", "--bare", str(origin))
     _git(hub, "remote", "add", "origin", str(origin))
@@ -1991,4 +2010,190 @@ def test_replay_merges_with_valid_author_and_committer_env(tmp_path: Path, monke
     monkeypatch.setenv("GIT_COMMITTER_EMAIL", "else@example.com")
     assert _run(beads, hub) == (0, "merged")
     assert _git(hub, "show", "main:extra.txt") == "one\ntwo"
-    assert _git(hub, "show", "main:value.txt") == "merged"
+
+
+# ---------------------------------------------------------------- hel-z3b: merge's
+# default `input_hashes` recomputes the VERIFY bead's own input hashes the same way
+# a real `helios run` computes them (SPEC 7.1 step 6, 8.5), not the impl bead's, and
+# not from bead metadata nothing ever writes (the defect the wave 3 end-to-end run
+# caught and the unit tests missed, since they always injected the hash function).
+# These build a real hub and run a real verify-code bead through the fake harness,
+# so the envelope's `input_hashes` come from the real prompt-assembly code path, and
+# exercise `helios merge` with no injected hash function at all.
+
+
+_REAL_VERIFY_REPORT = {
+    "status": "done",
+    "summary": "ok",
+    "findings": [
+        {
+            "id": "f1",
+            "claim": "the merge fix works",
+            "verdict": "verified",
+            "method": "review",
+            "scope": "universal",
+        }
+    ],
+}
+
+
+def _real_evidence_hub(tmp_path: Path, monkeypatch) -> tuple[Path, FakeBeads, ProjectConfig]:
+    """A real hub: a real impl worktree and commit, and a real verify-code bead
+    run through the fake harness, so its envelope.json's `input_hashes` are
+    whatever `helios run` actually recorded, not hand-written.
+    """
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    _git(hub, "init", "-b", "main")
+    _git(hub, "config", "user.email", "t@t")
+    _git(hub, "config", "user.name", "t")
+    (hub / "value.txt").write_text("base\n")
+    (hub / ".gitignore").write_text(".helios/\n.claude/worktrees/\n")
+    (hub / "docs").mkdir()
+    (hub / "docs" / "NOTE.md").write_text("# Note\n\noriginal text\n")
+    for kind in ("impl", "verify-code"):
+        (hub / "skills" / kind).mkdir(parents=True)
+        (hub / "skills" / kind / "SKILL.md").write_text(
+            f"---\nname: {kind}\n---\n\n# {kind} bead\n\nDo the work.\n"
+        )
+    (hub / "AGENTS.md").write_text(
+        "# helios\n\n## Worker contract\n\nWork exactly one bead.\n\n## Orchestrator\n\nMerges.\n"
+    )
+    _git(hub, "add", ".")
+    _git(hub, "commit", "-m", "init")
+
+    worktree = hub / ".claude" / "worktrees" / "b1"
+    worktree.parent.mkdir(parents=True)
+    _git(hub, "worktree", "add", "-b", "worktree-b1", str(worktree), "main")
+    _git(hub, "worktree", "lock", "--reason", "keep", str(worktree))
+    (worktree / "value.txt").write_text("merged\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "change")
+    output_commit = _git(worktree, "rev-parse", "HEAD")
+
+    impl = Bead(
+        id="b1",
+        kind="impl",
+        unit="u1",
+        files=["value.txt"],
+        test="true",
+        metadata={"output_commit": output_commit},
+    )
+    verify = Bead(
+        id="v1",
+        kind="verify-code",
+        unit="u1",
+        parent="b1",
+        files=["tools/verify/u1/"],
+        test="true",
+        docs=["docs/NOTE.md"],
+        labels=["unit:u1"],
+    )
+    beads = FakeBeads([impl, verify])
+
+    script = tmp_path / "fake_script.json"
+    script.write_text(
+        json.dumps(
+            {
+                "exit_code": 0,
+                "sleep_s": 0,
+                "stdout": "x",
+                "session_id": "s1",
+                "report": _REAL_VERIFY_REPORT,
+            }
+        )
+    )
+    monkeypatch.setenv("HELIOS_FAKE_SCRIPT", str(script))
+
+    cfg = Config(hub=hub)
+    rc = run_mod.run_one("v1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 0, "setup: the verify bead must run and verify cleanly"
+    assert "v1" in beads.closed
+    assert beads.beads["v1"].metadata.get("verdict") == "verified"
+    # FakeBeads.close() records the close (`.closed`) without touching
+    # `.status` (a write-back convention, see FakeBeads.close); merge only
+    # reads `.status`, so set it here the way a real `bd close` would.
+    beads.beads["v1"].status = "closed"
+    beads.beads["b1"].status = "closed"
+    return hub, beads, cfg.project
+
+
+def test_real_hub_no_injected_hashes_merges(tmp_path: Path, monkeypatch) -> None:
+    """Acceptance item 1: a real hub, a real impl bead, a real verify-code bead
+    and a real envelope, no injected hash function: `helios merge` succeeds.
+    """
+    hub, beads, project = _real_evidence_hub(tmp_path, monkeypatch)
+    code, message = merge_bead(
+        hub, "b1", project=project, beads=beads, check_runner=lambda _command, _cwd: 0
+    )
+    assert (code, message) == (0, "merged")
+
+
+def test_real_hub_doc_change_after_envelope_refuses_as_stale(tmp_path: Path, monkeypatch) -> None:
+    """Acceptance item 2: changing a doc the verify prompt used, after the
+    envelope was written, refuses as stale and writes nothing.
+    """
+    hub, beads, project = _real_evidence_hub(tmp_path, monkeypatch)
+    (hub / "docs" / "NOTE.md").write_text("# Note\n\nchanged after the verify envelope\n")
+    _git(hub, "add", "docs/NOTE.md")
+    _git(hub, "commit", "-m", "doc changed after verify")
+    before_main = _git(hub, "rev-parse", "main")
+    before_log = len(beads.argv_log)
+    with pytest.raises(MergeError) as error:
+        merge_bead(hub, "b1", project=project, beads=beads, check_runner=lambda _command, _cwd: 0)
+    assert str(error.value) == "verify envelope is stale"
+    assert error.value.code == 2
+    assert beads.argv_log[before_log:] == []
+    assert _git(hub, "rev-parse", "main") == before_main
+
+
+def test_real_hub_prompt_only_change_still_merges(tmp_path: Path, monkeypatch) -> None:
+    """Acceptance item 3: changing only the recorded `prompt` hash (so only that
+    key differs) still merges, since `prompt` is exempt from the comparison.
+    """
+    hub, beads, project = _real_evidence_hub(tmp_path, monkeypatch)
+    envelope_path = hub / ".helios" / "runs" / "v1" / "attempt-1" / "envelope.json"
+    recorded = Envelope.model_validate_json(envelope_path.read_text())
+    assert "prompt" in recorded.input_hashes
+    changed = recorded.model_copy(
+        update={"input_hashes": {**recorded.input_hashes, "prompt": "not-the-real-prompt-hash"}}
+    )
+    envelope_path.write_text(changed.model_dump_json())
+    code, message = merge_bead(
+        hub, "b1", project=project, beads=beads, check_runner=lambda _command, _cwd: 0
+    )
+    assert (code, message) == (0, "merged")
+
+
+def test_real_hub_missing_recorded_key_refuses_as_stale(tmp_path: Path, monkeypatch) -> None:
+    """Acceptance item 4: a key present on the recomputed side but missing from
+    the recorded side counts as different and refuses.
+    """
+    hub, beads, project = _real_evidence_hub(tmp_path, monkeypatch)
+    envelope_path = hub / ".helios" / "runs" / "v1" / "attempt-1" / "envelope.json"
+    recorded = Envelope.model_validate_json(envelope_path.read_text())
+    assert "bead" in recorded.input_hashes
+    trimmed = {key: value for key, value in recorded.input_hashes.items() if key != "bead"}
+    changed = recorded.model_copy(update={"input_hashes": trimmed})
+    envelope_path.write_text(changed.model_dump_json())
+    before_main = _git(hub, "rev-parse", "main")
+    before_log = len(beads.argv_log)
+    with pytest.raises(MergeError) as error:
+        merge_bead(hub, "b1", project=project, beads=beads, check_runner=lambda _command, _cwd: 0)
+    assert str(error.value) == "verify envelope is stale"
+    assert error.value.code == 2
+    assert beads.argv_log[before_log:] == []
+    assert _git(hub, "rev-parse", "main") == before_main
+
+
+def test_real_hub_dry_run_reports_success_not_staleness(tmp_path: Path, monkeypatch) -> None:
+    """Acceptance item 5 (dry-run half): `--dry-run` on the real hub of item 1
+    reports success rather than staleness; the existing injected-hash tests
+    (the rest of this file) stay green.
+    """
+    hub, beads, project = _real_evidence_hub(tmp_path, monkeypatch)
+    assert merge_bead(hub, "b1", project=project, beads=beads, dry_run=True) == (
+        0,
+        "would rebase, test, merge, push, and remove",
+    )
+    assert _git(hub, "show", "main:value.txt") == "base"
