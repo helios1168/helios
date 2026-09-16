@@ -392,7 +392,10 @@ These apply to claude, codex, opencode and agy.
 
 1. Load config (§5). Read each bead with `bd show <id> --json` through `helios.beads` (the only
    module that calls `bd`). Metadata values may arrive JSON-encoded as strings; decode them.
-2. Preflight (`helios.preflight`), all failures exit 2 before anything is created:
+2. Preflight (`helios.preflight`), all failures exit 2 before anything is created. Every preflight
+   refusal is written to stderr with the prefix `preflight: `, for example `preflight: .gitignore
+   must ignore .helios/`; that prefix is what distinguishes a refusal raised by preflight from one
+   raised by the command itself (`helios: `):
    - `impl` and `validate` need `files` and `test`; verify kinds need `unit` and `parent`, and
      a verify bead without a worktree needs `output_commit` metadata on its parent (§7.3), so a
      verify worktree is never created from `main` in any run mode.
