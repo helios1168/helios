@@ -999,10 +999,12 @@ def _finish_attempt(
             checks.append(
                 envelope_mod.Check(name="test", passed=False, detail=unlaunched_detail)
             )
-        if args.config.project.typecheck:
+        for entry in config_mod.effective_checks(args.config.project):
+            if entry.when not in ("run", "both") or not entry.command:
+                continue
             checks.append(
                 envelope_mod.Check(
-                    name="typecheck", passed=False, detail=unlaunched_detail
+                    name=entry.name, passed=False, detail=unlaunched_detail
                 )
             )
         checks.append(
@@ -1028,20 +1030,21 @@ def _finish_attempt(
                     log_path="checks/test.log",
                 )
             )
-        typecheck_cmd = args.config.project.typecheck
-        if typecheck_cmd:
+        for entry in config_mod.effective_checks(args.config.project):
+            if entry.when not in ("run", "both") or not entry.command:
+                continue
             passed, code, detail = _run_shell(
-                typecheck_cmd, args.worktree_path, checks_dir / "typecheck.log",
-                f"{attempt_dir}:check:typecheck",
+                entry.command, args.worktree_path, checks_dir / f"{entry.name}.log",
+                f"{attempt_dir}:check:{entry.name}",
             )
             checks.append(
                 envelope_mod.Check(
-                    name="typecheck",
+                    name=entry.name,
                     passed=passed,
-                    command=typecheck_cmd,
+                    command=entry.command,
                     exit_code=code,
                     detail=detail,
-                    log_path="checks/typecheck.log",
+                    log_path=f"checks/{entry.name}.log",
                 )
             )
         ownership = ownership_mod.check(

@@ -15,7 +15,7 @@ import pytest
 from helios import memory as memory_mod
 from helios import run as run_mod
 from helios.beads import Bead, Beads, FakeBeads
-from helios.config import Config, MemoryConfig, ProjectConfig
+from helios.config import CheckEntry, Config, MemoryConfig, ProjectConfig
 from helios.envelope import AgentReport, Envelope, ExecutionStatus, WorkStatus
 from helios.merge import MergeError, merge_bead
 
@@ -517,10 +517,97 @@ def test_ff_only_failure_when_main_moved_is_exit_three(tmp_path: Path, monkeypat
 def test_check_failure_is_exit_five(tmp_path: Path) -> None:
     hub, worktree = _repo(tmp_path)
     beads = _beads(hub, worktree)
+    main_before = _git(hub, "rev-parse", "main")
     with pytest.raises(MergeError) as error:
         _run(beads, hub, runner=lambda _command, _cwd: 1)
     assert error.value.code == 5
-    assert any(comment.text.endswith("test-failed") for comment in beads.comments("b1"))
+    texts = [comment.text for comment in beads.comments("b1")]
+    assert f"merge: [b1@{main_before}:test-failed] test" in texts
+
+
+# --- project.check in `helios merge` step 4 (SPEC section 5, section 12 step 4, hel-7br) ----
+
+
+def test_configured_checks_run_in_order_at_merge(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    project = ProjectConfig(
+        worktrees="../worktree",
+        check=(
+            CheckEntry(name="run-only", command="echo skip", when="run"),
+            CheckEntry(name="lint", command="echo lint", when="merge"),
+            CheckEntry(name="typecheck", command="echo type", when="both"),
+        ),
+    )
+    calls: list[tuple[str, Path]] = []
+    code, _ = merge_bead(
+        hub, "b1", project=project, beads=beads,
+        check_runner=lambda command, cwd: calls.append((command, cwd)) or 0,
+        input_hashes=lambda _b: {},
+    )
+    assert code == 0
+    assert calls == [("echo lint", worktree), ("echo type", worktree)]
+
+
+def test_configured_check_stops_at_first_failure_at_merge(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    project = ProjectConfig(
+        worktrees="../worktree",
+        check=(
+            CheckEntry(name="lint", command="echo lint", when="merge"),
+            CheckEntry(name="typecheck", command="echo type", when="merge"),
+        ),
+    )
+    calls: list[str] = []
+
+    def runner(command: str, _cwd: Path) -> int:
+        calls.append(command)
+        return 1 if command == "echo lint" else 0
+
+    with pytest.raises(MergeError) as error:
+        merge_bead(
+            hub, "b1", project=project, beads=beads,
+            check_runner=runner, input_hashes=lambda _b: {},
+        )
+    assert error.value.code == 5
+    assert str(error.value) == "lint failed with exit 1"
+    assert calls == ["echo lint"]
+    texts = [comment.text for comment in beads.comments("b1")]
+    assert any(t.endswith(":test-failed] lint") for t in texts)
+
+
+def test_configured_check_empty_command_disabled_at_merge(tmp_path: Path) -> None:
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    project = ProjectConfig(
+        worktrees="../worktree",
+        check=(CheckEntry(name="lint", command="", when="merge"),),
+    )
+    calls: list[str] = []
+    code, _ = merge_bead(
+        hub, "b1", project=project, beads=beads,
+        check_runner=lambda command, _cwd: calls.append(command) or 0,
+        input_hashes=lambda _b: {},
+    )
+    assert code == 0
+    assert calls == []
+
+
+def test_old_keys_only_hub_merges_exactly_as_today(tmp_path: Path) -> None:
+    """A hub configured only with `project.test`/`project.typecheck` runs the
+    same single check at merge as before `[[project.check]]` existed."""
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    project = ProjectConfig(worktrees="../worktree", test="uv run pytest -q", typecheck="")
+    calls: list[tuple[str, Path]] = []
+    code, _ = merge_bead(
+        hub, "b1", project=project, beads=beads,
+        check_runner=lambda command, cwd: calls.append((command, cwd)) or 0,
+        input_hashes=lambda _b: {},
+    )
+    assert code == 0
+    assert calls == [("uv run pytest -q", worktree)]
 
 
 def test_push_failure_is_exit_four(tmp_path: Path, monkeypatch) -> None:

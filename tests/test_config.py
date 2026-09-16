@@ -90,3 +90,185 @@ def test_verify_validate_has_its_own_spec(tmp_path: Path) -> None:
     loaded = cfg.load(write_workflow(tmp_path, "[agents]\nverify_validate = 'codex'\n"))
     assert cfg.spec_for_kind(loaded, "verify-validate") == "codex"
     assert cfg.harness_for_kind(loaded, "verify-validate", author="claude") == "codex"
+
+
+# --- project.check (SPEC section 5, hel-7br) ---------------------------------
+
+
+def test_check_entries_load_in_order(tmp_path: Path) -> None:
+    loaded = cfg.load(
+        write_workflow(
+            tmp_path,
+            "[[project.check]]\nname = 'lint'\ncommand = 'ruff check'\nwhen = 'run'\n"
+            "[[project.check]]\nname = 'typecheck'\ncommand = 'pyright'\n",
+        )
+    )
+    assert loaded.project.check == (
+        cfg.CheckEntry(name="lint", command="ruff check", when="run"),
+        cfg.CheckEntry(name="typecheck", command="pyright", when="both"),
+    )
+
+
+def test_check_name_pattern_refused(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"project\.check\[0\]\.name must match \[a-z0-9_-\]\{1,32\}",
+    ):
+        cfg.load(
+            write_workflow(
+                tmp_path, "[[project.check]]\nname = 'Bad Name'\ncommand = 'x'\n"
+            )
+        )
+
+
+def test_check_duplicate_name_refused(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError, match=r"project\.check\[1\]\.name lint is a duplicate"
+    ):
+        cfg.load(
+            write_workflow(
+                tmp_path,
+                "[[project.check]]\nname = 'lint'\ncommand = 'a'\n"
+                "[[project.check]]\nname = 'lint'\ncommand = 'b'\n",
+            )
+        )
+
+
+@pytest.mark.parametrize("name", ["report", "ownership"])
+def test_check_reserved_name_refused(tmp_path: Path, name: str) -> None:
+    with pytest.raises(
+        ValueError, match=rf"project\.check\[0\]\.name {name} is reserved"
+    ):
+        cfg.load(
+            write_workflow(
+                tmp_path, f"[[project.check]]\nname = '{name}'\ncommand = 'x'\n"
+            )
+        )
+
+
+@pytest.mark.parametrize("when", ["run", "both"])
+def test_check_test_name_requires_when_merge(tmp_path: Path, when: str) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r'project\.check\[0\] name "test" requires when = "merge"',
+    ):
+        cfg.load(
+            write_workflow(
+                tmp_path,
+                f"[[project.check]]\nname = 'test'\ncommand = 'x'\nwhen = '{when}'\n",
+            )
+        )
+
+
+def test_check_test_name_allowed_with_when_merge(tmp_path: Path) -> None:
+    loaded = cfg.load(
+        write_workflow(
+            tmp_path,
+            "[[project.check]]\nname = 'test'\ncommand = 'x'\nwhen = 'merge'\n",
+        )
+    )
+    assert loaded.project.check == (cfg.CheckEntry(name="test", command="x", when="merge"),)
+
+
+def test_check_bad_when_value_refused(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r'project\.check\[0\]\.when must be "run", "merge" or "both"',
+    ):
+        cfg.load(
+            write_workflow(
+                tmp_path,
+                "[[project.check]]\nname = 'lint'\ncommand = 'x'\nwhen = 'never'\n",
+            )
+        )
+
+
+def test_check_unknown_entry_key_named(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"project\.check\[0\]\.nope"):
+        cfg.load(
+            write_workflow(
+                tmp_path, "[[project.check]]\nname = 'lint'\ncommand = 'x'\nnope = 1\n"
+            )
+        )
+
+
+def test_check_entry_wrong_type_named(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match=r"project\.check\[0\]\.command"):
+        cfg.load(
+            write_workflow(
+                tmp_path, "[[project.check]]\nname = 'lint'\ncommand = 1\n"
+            )
+        )
+
+
+def test_check_missing_required_key_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"project\.check\[0\]\.command"):
+        cfg.load(write_workflow(tmp_path, "[[project.check]]\nname = 'lint'\n"))
+    with pytest.raises(ValueError, match=r"project\.check\[0\]\.name"):
+        cfg.load(write_workflow(tmp_path, "[[project.check]]\ncommand = 'x'\n"))
+
+
+def test_old_keys_with_check_entry_refused(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"project\.test and project\.typecheck cannot be set with project\.check",
+    ):
+        cfg.load(
+            write_workflow(
+                tmp_path,
+                "[project]\ntest = 'pytest'\n"
+                "[[project.check]]\nname = 'lint'\ncommand = 'x'\n",
+            )
+        )
+    with pytest.raises(
+        ValueError,
+        match=r"project\.test and project\.typecheck cannot be set with project\.check",
+    ):
+        cfg.load(
+            write_workflow(
+                tmp_path,
+                "[project]\ntypecheck = 'pyright'\n"
+                "[[project.check]]\nname = 'lint'\ncommand = 'x'\n",
+            )
+        )
+
+
+def test_effective_checks_sugar_reproduces_defaults(tmp_path: Path) -> None:
+    loaded = cfg.load(tmp_path)
+    assert cfg.effective_checks(loaded.project) == (
+        cfg.CheckEntry(name="test", command="uv run pytest -q", when="merge"),
+        cfg.CheckEntry(name="typecheck", command="", when="both"),
+    )
+
+
+def test_effective_checks_sugar_from_configured_old_keys(tmp_path: Path) -> None:
+    loaded = cfg.load(
+        write_workflow(
+            tmp_path, "[project]\ntest = 'make test'\ntypecheck = 'make typecheck'\n"
+        )
+    )
+    assert cfg.effective_checks(loaded.project) == (
+        cfg.CheckEntry(name="test", command="make test", when="merge"),
+        cfg.CheckEntry(name="typecheck", command="make typecheck", when="both"),
+    )
+
+
+def test_effective_checks_uses_check_entries_when_present(tmp_path: Path) -> None:
+    loaded = cfg.load(
+        write_workflow(
+            tmp_path,
+            "[[project.check]]\nname = 'lint'\ncommand = 'ruff'\nwhen = 'run'\n",
+        )
+    )
+    assert cfg.effective_checks(loaded.project) == (
+        cfg.CheckEntry(name="lint", command="ruff", when="run"),
+    )
+
+
+def test_check_empty_command_still_an_entry(tmp_path: Path) -> None:
+    loaded = cfg.load(
+        write_workflow(
+            tmp_path, "[[project.check]]\nname = 'lint'\ncommand = ''\n"
+        )
+    )
+    assert loaded.project.check == (cfg.CheckEntry(name="lint", command="", when="both"),)

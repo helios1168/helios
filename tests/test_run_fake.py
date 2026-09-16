@@ -2363,3 +2363,96 @@ def test_run_one_launch_adds_exactly_one_extra_state_write(
     assert launched_entries[1]["pid"] == launched_entries[0]["pid"]
     assert launched_entries[0]["pid_start"] is None
     assert isinstance(launched_entries[1]["pid_start"], str) and launched_entries[1]["pid_start"]
+
+
+# --- project.check in `helios run` step 9 (SPEC section 5, section 7.1 step 9, hel-7br) -----
+
+
+def test_configured_checks_run_in_order_and_log_path(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "done", "summary": "s"}}))
+    cfg = config_mod.Config(
+        hub=hub,
+        project=config_mod.ProjectConfig(
+            check=(
+                config_mod.CheckEntry(name="lint", command="echo lint-out", when="run"),
+                config_mod.CheckEntry(name="typecheck", command="echo type-out", when="both"),
+                config_mod.CheckEntry(name="merge-only", command="echo x", when="merge"),
+            )
+        ),
+    )
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 0
+    env = read_envelope(hub, "b1", 1)
+    names = [c["name"] for c in env["checks"]]
+    assert names == ["test", "lint", "typecheck", "ownership"]
+    lint_check = next(c for c in env["checks"] if c["name"] == "lint")
+    assert lint_check["passed"] is True
+    assert lint_check["log_path"] == "checks/lint.log"
+    log = hub / ".helios" / "runs" / "b1" / "attempt-1" / "checks" / "lint.log"
+    assert log.exists() and "lint-out" in log.read_text()
+
+
+def test_configured_check_failure_does_not_stop_others(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "done", "summary": "s"}}))
+    cfg = config_mod.Config(
+        hub=hub,
+        project=config_mod.ProjectConfig(
+            check=(
+                config_mod.CheckEntry(name="a", command="false", when="run"),
+                config_mod.CheckEntry(name="b", command="true", when="run"),
+            )
+        ),
+    )
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 5
+    env = read_envelope(hub, "b1", 1)
+    checks_by_name = {c["name"]: c for c in env["checks"]}
+    assert checks_by_name["a"]["passed"] is False
+    assert checks_by_name["b"]["passed"] is True
+
+
+def test_configured_check_empty_command_disabled(tmp_path: Path, monkeypatch) -> None:
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "done", "summary": "s"}}))
+    cfg = config_mod.Config(
+        hub=hub,
+        project=config_mod.ProjectConfig(
+            check=(config_mod.CheckEntry(name="lint", command="", when="run"),)
+        ),
+    )
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 0
+    env = read_envelope(hub, "b1", 1)
+    names = [c["name"] for c in env["checks"]]
+    assert names == ["test", "ownership"]
+    assert "lint" not in names
+
+
+def test_sugar_typecheck_runs_like_today(tmp_path: Path, monkeypatch) -> None:
+    """A hub configured only with the old `project.typecheck` key behaves
+    exactly as it did before the `[[project.check]]` sugar existed."""
+    hub = make_hub(tmp_path)
+    beads = beads_mod.FakeBeads([make_bead("b1")])
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "done", "summary": "s"}}))
+    cfg = config_mod.Config(hub=hub, project=config_mod.ProjectConfig(typecheck="echo ok"))
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 0
+    env = read_envelope(hub, "b1", 1)
+    names = [c["name"] for c in env["checks"]]
+    assert names == ["test", "typecheck", "ownership"]
+    typecheck_check = next(c for c in env["checks"] if c["name"] == "typecheck")
+    assert typecheck_check["passed"] is True
+    assert typecheck_check["log_path"] == "checks/typecheck.log"

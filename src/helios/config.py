@@ -9,6 +9,7 @@ of the wrong type, are errors naming the dotted key.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,11 +73,31 @@ _MEMORY_TYPES: dict[str, str] = {
 
 _SECTIONS = {"project", "agents", "harness", "control", "memory", "tolerance"}
 
+_CHECK_TYPES: dict[str, str] = {
+    "name": _STR,
+    "command": _STR,
+    "when": _STR,
+}
+
+_CHECK_NAME_RE = re.compile(r"[a-z0-9_-]{1,32}")
+_CHECK_RESERVED_NAMES = ("report", "ownership")
+_CHECK_WHEN_VALUES = ("run", "merge", "both")
+
+
+@dataclass(frozen=True)
+class CheckEntry:
+    """One ordered, named `[[project.check]]` entry (SPEC section 5)."""
+
+    name: str
+    command: str
+    when: str = "both"
+
 
 @dataclass(frozen=True)
 class ProjectConfig:
     test: str = "uv run pytest -q"
     typecheck: str = ""
+    check: tuple[CheckEntry, ...] = ()
     units: str = "docs/units"
     verify_artifacts: str = "tools/verify"
     experiments: str = "experiments"
@@ -187,13 +208,71 @@ def _check_table(table: Any, types: dict[str, str], prefix: str) -> None:
         _check_type(dotted, value, types[key])
 
 
+def _check_entries(raw: Any) -> tuple[CheckEntry, ...]:
+    """Validate `[[project.check]]` and return its entries (SPEC section 5)."""
+    if not isinstance(raw, list):
+        raise TypeError(f"config key 'project.check' has the wrong type: {raw!r}")
+    entries: list[CheckEntry] = []
+    seen: set[str] = set()
+    for i, item in enumerate(raw):
+        prefix = f"project.check[{i}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"config key {prefix!r} has the wrong type: {item!r}")
+        for key, value in item.items():
+            if key not in _CHECK_TYPES:
+                raise ValueError(f"unknown config key '{prefix}.{key}'")
+            _check_type(f"{prefix}.{key}", value, _CHECK_TYPES[key])
+        if "name" not in item:
+            raise ValueError(f"config key '{prefix}.name' is required")
+        if "command" not in item:
+            raise ValueError(f"config key '{prefix}.command' is required")
+        name = item["name"]
+        command = item["command"]
+        when = item.get("when", "both")
+        if not _CHECK_NAME_RE.fullmatch(name):
+            raise ValueError(f"project.check[{i}].name must match [a-z0-9_-]{{1,32}}")
+        if name in seen:
+            raise ValueError(f"project.check[{i}].name {name} is a duplicate")
+        seen.add(name)
+        if name in _CHECK_RESERVED_NAMES:
+            raise ValueError(f"project.check[{i}].name {name} is reserved")
+        if when not in _CHECK_WHEN_VALUES:
+            raise ValueError(f'project.check[{i}].when must be "run", "merge" or "both"')
+        if name == "test" and when != "merge":
+            raise ValueError(f'project.check[{i}] name "test" requires when = "merge"')
+        entries.append(CheckEntry(name=name, command=command, when=when))
+    return tuple(entries)
+
+
 def _project(table: dict) -> ProjectConfig:
-    _check_table(table, _PROJECT_TYPES, "project")
     data = dict(table)
+    check_raw = data.pop("check", None)
+    _check_table(data, _PROJECT_TYPES, "project")
+    entries: tuple[CheckEntry, ...] = ()
+    if check_raw is not None:
+        entries = _check_entries(check_raw)
+    if entries and ("test" in data or "typecheck" in data):
+        raise ValueError("project.test and project.typecheck cannot be set with project.check")
     for key in ("link_into_worktrees", "confidential", "always_allowed"):
         if key in data:
             data[key] = tuple(data[key])
-    return ProjectConfig(**data)
+    return ProjectConfig(check=entries, **data)
+
+
+def effective_checks(project: ProjectConfig) -> tuple[CheckEntry, ...]:
+    """Configured checks, applying the `project.test`/`project.typecheck` sugar (SPEC section 5).
+
+    With no `[[project.check]]` entry, `project.test` and `project.typecheck` are read
+    as exactly two entries in this order: `name = "test"` with `when = "merge"`, then
+    `name = "typecheck"` with `when = "both"`. An empty command still produces the
+    entry; the caller skips a disabled (empty command) entry.
+    """
+    if project.check:
+        return project.check
+    return (
+        CheckEntry(name="test", command=project.test, when="merge"),
+        CheckEntry(name="typecheck", command=project.typecheck, when="both"),
+    )
 
 
 def _agents(table: dict) -> AgentsConfig:

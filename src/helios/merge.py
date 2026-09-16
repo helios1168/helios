@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TextIO, cast
 
 from helios.beads import Bead, BeadsLike, comment_has
-from helios.config import Config, ProjectConfig
+from helios.config import Config, ProjectConfig, effective_checks
 from helios.envelope import Envelope
 from helios.run import recompute_input_hashes
 
@@ -519,16 +519,18 @@ def merge_bead(
             raise MergeError(detail, 4)
         _comment(beads, bead_id, marker + "rebased]", "rebased")
 
-        # Step 4: checks.
-        for name, command in (("test", project.test), ("typecheck", project.typecheck)):
-            if not command:
+        # Step 4: checks (SPEC section 12 step 4, section 5 project.check).
+        for entry in effective_checks(project):
+            if entry.when not in ("merge", "both") or not entry.command:
                 continue
-            exit_code = check_runner(command, worktree)
+            exit_code = check_runner(entry.command, worktree)
             if exit_code != 0:
-                _comment(beads, bead_id, marker + "test-failed]", "test-failed")
+                _comment(beads, bead_id, marker + "test-failed]", entry.name)
                 output = getattr(check_runner, "last_output", "")
                 tail = output.splitlines()[-50:]
-                raise MergeError("\n".join([f"{name} failed with exit {exit_code}", *tail]), 5)
+                raise MergeError(
+                    "\n".join([f"{entry.name} failed with exit {exit_code}", *tail]), 5
+                )
         _comment(beads, bead_id, marker + "tested]", "tested")
 
         # Step 5: main must not have moved during the checks.
