@@ -272,3 +272,49 @@ def test_check_empty_command_still_an_entry(tmp_path: Path) -> None:
         )
     )
     assert loaded.project.check == (cfg.CheckEntry(name="lint", command="", when="both"),)
+
+
+def test_telemetry_defaults(tmp_path: Path) -> None:
+    loaded = cfg.load(tmp_path)
+    assert loaded.telemetry == cfg.TelemetryConfig()
+    assert loaded.telemetry.enabled is False
+    assert loaded.telemetry.endpoint == ""
+    assert loaded.telemetry.timeout_s == 5
+    assert loaded.telemetry.service_name == "helios"
+
+
+def test_telemetry_enabled_requires_endpoint(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"telemetry\.enabled requires telemetry\.endpoint"):
+        cfg.load(write_workflow(tmp_path, "[telemetry]\nenabled = true\n"))
+    with pytest.raises(ValueError, match=r"telemetry\.enabled requires telemetry\.endpoint"):
+        cfg.load(write_workflow(tmp_path, "[telemetry]\nenabled = true\nendpoint = ''\n"))
+
+
+def test_telemetry_enabled_with_endpoint_is_accepted(tmp_path: Path) -> None:
+    loaded = cfg.load(
+        write_workflow(
+            tmp_path,
+            "[telemetry]\nenabled = true\nendpoint = 'http://localhost:4318/v1/traces'\n",
+        )
+    )
+    assert loaded.telemetry.enabled is True
+    assert loaded.telemetry.endpoint == "http://localhost:4318/v1/traces"
+
+
+def test_telemetry_unknown_key_names_the_dotted_key(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"telemetry\.nope"):
+        cfg.load(write_workflow(tmp_path, "[telemetry]\nnope = 1\n"))
+
+
+def test_telemetry_wrong_typed_values_name_the_dotted_key(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match=r"telemetry\.enabled"):
+        cfg.load(write_workflow(tmp_path, "[telemetry]\nenabled = 'yes'\n"))
+    with pytest.raises(TypeError, match=r"telemetry\.enabled"):
+        # An int is not a bool, even though bool is an int subclass in Python.
+        cfg.load(write_workflow(tmp_path, "[telemetry]\nenabled = 1\n"))
+    with pytest.raises(TypeError, match=r"telemetry\.endpoint"):
+        cfg.load(write_workflow(tmp_path, "[telemetry]\nendpoint = 1\n"))
+    with pytest.raises(TypeError, match=r"telemetry\.timeout_s"):
+        cfg.load(write_workflow(tmp_path, "[telemetry]\ntimeout_s = 'x'\n"))
+    with pytest.raises(TypeError, match=r"telemetry\.service_name"):
+        cfg.load(write_workflow(tmp_path, "[telemetry]\nservice_name = 1\n"))

@@ -23,6 +23,7 @@ _STR = "str"
 _OPT_STR = "opt_str"
 _STR_LIST = "str_list"
 _INT = "int"
+_BOOL = "bool"
 
 _PROJECT_TYPES: dict[str, str] = {
     "test": _STR,
@@ -71,7 +72,14 @@ _MEMORY_TYPES: dict[str, str] = {
     "inject_cap_bytes": _INT,
 }
 
-_SECTIONS = {"project", "agents", "harness", "control", "memory", "tolerance"}
+_TELEMETRY_TYPES: dict[str, str] = {
+    "enabled": _BOOL,
+    "endpoint": _STR,
+    "timeout_s": _INT,
+    "service_name": _STR,
+}
+
+_SECTIONS = {"project", "agents", "harness", "control", "memory", "telemetry", "tolerance"}
 
 _CHECK_TYPES: dict[str, str] = {
     "name": _STR,
@@ -150,6 +158,16 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True)
+class TelemetryConfig:
+    """The ``[telemetry]`` block (SPEC section 21): export OpenTelemetry spans over OTLP."""
+
+    enabled: bool = False
+    endpoint: str = ""
+    timeout_s: int = 5
+    service_name: str = "helios"
+
+
+@dataclass(frozen=True)
 class Config:
     hub: Path
     project: ProjectConfig = field(default_factory=ProjectConfig)
@@ -157,6 +175,7 @@ class Config:
     harness: dict[str, HarnessConfig] = field(default_factory=dict)
     control: ControlConfig = field(default_factory=ControlConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     tolerance: dict[str, float] = field(default_factory=dict)
 
 
@@ -183,6 +202,8 @@ def _check_type(dotted: str, value: Any, want: str) -> None:
         ok = value is None or isinstance(value, str)
     elif want == _INT:
         ok = isinstance(value, int) and not isinstance(value, bool)
+    elif want == _BOOL:
+        ok = isinstance(value, bool)
     elif want == _STR_LIST:
         ok = isinstance(value, list) and all(isinstance(v, str) for v in value)
     else:
@@ -331,6 +352,10 @@ def load(start: Path) -> Config:
         if key in control_raw:
             control_raw[key] = tuple(control_raw[key])
     memory_raw = _validated_table(raw.get("memory", {}), _MEMORY_TYPES, "memory")
+    telemetry_raw = _validated_table(raw.get("telemetry", {}), _TELEMETRY_TYPES, "telemetry")
+    telemetry = TelemetryConfig(**telemetry_raw)
+    if telemetry.enabled and not telemetry.endpoint:
+        raise ValueError("telemetry.enabled requires telemetry.endpoint")
     return Config(
         hub=hub,
         project=project,
@@ -338,6 +363,7 @@ def load(start: Path) -> Config:
         harness=_harness(raw.get("harness", {})),
         control=ControlConfig(**control_raw),
         memory=MemoryConfig(**memory_raw),
+        telemetry=telemetry,
         tolerance=_tolerance(raw.get("tolerance", {})),
     )
 

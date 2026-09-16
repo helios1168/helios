@@ -58,6 +58,14 @@ backend = "beads"                  # beads | files
 export_dir = ".helios/memories"
 inject_cap_bytes = 32000
 
+[telemetry]                        # export OpenTelemetry spans to an OTLP backend (SPEC §21)
+enabled = false
+endpoint = ""                      # full OTLP traces URL, e.g. https://cloud.langfuse.com/api/public/otel/v1/traces
+timeout_s = 5
+service_name = "helios"
+# Credentials (LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY) come from the environment only,
+# never from this file, because this file is committed to the repository.
+
 [tolerance]
 # tier1 = 1e-8
 # tier2 = 5e-3

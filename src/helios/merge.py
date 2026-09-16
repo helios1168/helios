@@ -7,9 +7,12 @@ import os
 import subprocess
 import unicodedata
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO, cast
 
+from helios import telemetry as telemetry_mod
+from helios.attempt import utc_now
 from helios.beads import Bead, BeadsLike, comment_has
 from helios.config import Config, ProjectConfig, effective_checks
 from helios.envelope import Envelope
@@ -356,6 +359,54 @@ def _is_verified_commit(hub: Path, head: str, output_commit: str) -> bool:
     )
 
 
+@dataclass
+class _MergeTiming:
+    """Wall-clock start/end of each merge step that actually ran (SPEC section 21).
+
+    Populated as ``merge_bead`` proceeds and read in its ``finally`` block, so a
+    trace covering whatever steps ran is still built and exported when a later
+    step raises ``MergeError``.
+    """
+
+    rebase: tuple[str, str] | None = None
+    checks: list[tuple[str, str, str]] = field(default_factory=list)
+    merge: tuple[str, str] | None = None
+    push: tuple[str, str] | None = None
+    remove: tuple[str, str] | None = None
+
+
+def _merge_trace(bead_id: str, base_commit: str, output_commit: str | None, timing: _MergeTiming) -> telemetry_mod.Span:
+    """Build the merge trace of SPEC section 21: root span ``merge``, children
+    ``rebase``, one ``check.<name>`` per check performed, ``merge``, ``push``,
+    ``remove``, in that order; only steps that actually ran get a span.
+    """
+    children: list[telemetry_mod.Span] = []
+    if timing.rebase is not None:
+        children.append(telemetry_mod.Span(name="rebase", start=timing.rebase[0], end=timing.rebase[1]))
+    for name, start, end in timing.checks:
+        children.append(
+            telemetry_mod.Span(
+                name=f"check.{name}", start=start, end=end, attributes={"check.name": name}
+            )
+        )
+    if timing.merge is not None:
+        children.append(telemetry_mod.Span(name="merge", start=timing.merge[0], end=timing.merge[1]))
+    if timing.push is not None:
+        children.append(telemetry_mod.Span(name="push", start=timing.push[0], end=timing.push[1]))
+    if timing.remove is not None:
+        children.append(telemetry_mod.Span(name="remove", start=timing.remove[0], end=timing.remove[1]))
+    attributes: dict[str, telemetry_mod.AttrValue] = {"bead.id": bead_id, "base_commit": base_commit}
+    if output_commit is not None:
+        attributes["output_commit"] = output_commit
+    return telemetry_mod.Span(
+        name="merge",
+        start=min(c.start for c in children),
+        end=max(c.end for c in children),
+        attributes=attributes,
+        children=tuple(children),
+    )
+
+
 def _finish_step7(
     hub: Path,
     worktree: Path,
@@ -363,13 +414,18 @@ def _finish_step7(
     beads: BeadsLike,
     bead_id: str,
     marker: str,
+    timing: _MergeTiming,
 ) -> None:
     if "origin" in _git_output(hub, "remote").splitlines():
+        push_start = utc_now()
         pushed = _git(hub, "push", "origin", "main")
+        timing.push = (push_start, utc_now())
         if pushed.returncode:
             raise MergeError(pushed.stderr.strip() or "push failed", 4)
         _comment(beads, bead_id, marker + "pushed]", "pushed")
+    remove_start = utc_now()
     _remove_worktree(hub, worktree, branch)
+    timing.remove = (remove_start, utc_now())
     _comment(beads, bead_id, marker + "removed]", "removed")
 
 
@@ -456,7 +512,7 @@ def merge_bead(
             if dry_run:
                 return 0, "would recover and remove worktree"
             _comment(beads, bead_id, marker + "merged]", "merged")
-            _finish_step7(hub, worktree, branch, beads, bead_id, marker)
+            _finish_step7(hub, worktree, branch, beads, bead_id, marker, _MergeTiming())
             return 0, "recovered"
 
         if not worktree_exists:
@@ -505,54 +561,72 @@ def merge_bead(
                 return 0, "would rebase, test, merge, push, and remove"
             return 0, "would rebase, test, merge, and remove"
         beads.set_metadata(bead_id, {"merge_main_before": main_before})
-        rebase = _git(worktree, "rebase", "main")
-        if rebase.returncode:
-            rebase_merge = _git_output(worktree, "rev-parse", "--git-path", "rebase-merge")
-            rebase_apply = _git_output(worktree, "rev-parse", "--git-path", "rebase-apply")
-            in_progress = (worktree / rebase_merge).exists() or (worktree / rebase_apply).exists()
-            if in_progress:
-                _git(worktree, "rebase", "--abort")
-                beads.set_state(bead_id, "run", "conflict", "rebase conflict")
-                _comment(beads, bead_id, marker + "conflict]", "conflict")
-                raise MergeError("rebase conflict", 3)
-            detail = "\n".join(["rebase failed:", *rebase.stderr.strip().splitlines()])
-            raise MergeError(detail, 4)
-        _comment(beads, bead_id, marker + "rebased]", "rebased")
 
-        # Step 4: checks (SPEC section 12 step 4, section 5 project.check).
-        for entry in effective_checks(project):
-            if entry.when not in ("merge", "both") or not entry.command:
-                continue
-            exit_code = check_runner(entry.command, worktree)
-            if exit_code != 0:
-                _comment(beads, bead_id, marker + "test-failed]", entry.name)
-                output = getattr(check_runner, "last_output", "")
-                tail = output.splitlines()[-50:]
-                raise MergeError(
-                    "\n".join([f"{entry.name} failed with exit {exit_code}", *tail]), 5
-                )
-        _comment(beads, bead_id, marker + "tested]", "tested")
+        effective_config = config if config is not None else Config(hub=hub, project=project)
+        timing = _MergeTiming()
+        merge_output_commit: str | None = None
+        try:
+            rebase_start = utc_now()
+            rebase = _git(worktree, "rebase", "main")
+            timing.rebase = (rebase_start, utc_now())
+            if rebase.returncode:
+                rebase_merge = _git_output(worktree, "rev-parse", "--git-path", "rebase-merge")
+                rebase_apply = _git_output(worktree, "rev-parse", "--git-path", "rebase-apply")
+                in_progress = (worktree / rebase_merge).exists() or (worktree / rebase_apply).exists()
+                if in_progress:
+                    _git(worktree, "rebase", "--abort")
+                    beads.set_state(bead_id, "run", "conflict", "rebase conflict")
+                    _comment(beads, bead_id, marker + "conflict]", "conflict")
+                    raise MergeError("rebase conflict", 3)
+                detail = "\n".join(["rebase failed:", *rebase.stderr.strip().splitlines()])
+                raise MergeError(detail, 4)
+            _comment(beads, bead_id, marker + "rebased]", "rebased")
 
-        # Step 5: main must not have moved during the checks.
-        if _git_output(hub, "rev-parse", "main") != main_before:
-            _comment(beads, bead_id, marker + "main-moved]", "main-moved")
-            raise MergeError("main moved during checks", 3)
+            # Step 4: checks (SPEC section 12 step 4, section 5 project.check).
+            for entry in effective_checks(project):
+                if entry.when not in ("merge", "both") or not entry.command:
+                    continue
+                check_start = utc_now()
+                exit_code = check_runner(entry.command, worktree)
+                timing.checks.append((entry.name, check_start, utc_now()))
+                if exit_code != 0:
+                    _comment(beads, bead_id, marker + "test-failed]", entry.name)
+                    output = getattr(check_runner, "last_output", "")
+                    tail = output.splitlines()[-50:]
+                    raise MergeError(
+                        "\n".join([f"{entry.name} failed with exit {exit_code}", *tail]), 5
+                    )
+            _comment(beads, bead_id, marker + "tested]", "tested")
 
-        # Step 6: record merge_commit before the fast-forward merge.
-        commit = _git_output(worktree, "rev-parse", "HEAD")
-        beads.set_metadata(bead_id, {"merge_commit": commit})
-        merged = _git(hub, "merge", "--ff-only", branch)
-        if merged.returncode:
+            # Step 5: main must not have moved during the checks.
             if _git_output(hub, "rev-parse", "main") != main_before:
-                beads.set_metadata(bead_id, {"merge_commit": ""})
                 _comment(beads, bead_id, marker + "main-moved]", "main-moved")
-                raise MergeError("main moved during merge", 3)
-            raise MergeError(merged.stderr.strip() or "fast-forward merge failed", 4)
-        _comment(beads, bead_id, marker + "merged]", "merged")
+                raise MergeError("main moved during checks", 3)
 
-        # Step 7: push (if origin exists) and remove the worktree.
-        _finish_step7(hub, worktree, branch, beads, bead_id, marker)
-        return 0, "merged"
+            # Step 6: record merge_commit before the fast-forward merge.
+            commit = _git_output(worktree, "rev-parse", "HEAD")
+            beads.set_metadata(bead_id, {"merge_commit": commit})
+            merge_start = utc_now()
+            merged = _git(hub, "merge", "--ff-only", branch)
+            timing.merge = (merge_start, utc_now())
+            if merged.returncode:
+                if _git_output(hub, "rev-parse", "main") != main_before:
+                    beads.set_metadata(bead_id, {"merge_commit": ""})
+                    _comment(beads, bead_id, marker + "main-moved]", "main-moved")
+                    raise MergeError("main moved during merge", 3)
+                raise MergeError(merged.stderr.strip() or "fast-forward merge failed", 4)
+            merge_output_commit = commit
+            _comment(beads, bead_id, marker + "merged]", "merged")
+
+            # Step 7: push (if origin exists) and remove the worktree.
+            _finish_step7(hub, worktree, branch, beads, bead_id, marker, timing)
+            return 0, "merged"
+        finally:
+            if timing.rebase is not None and effective_config.telemetry.enabled:
+                telemetry_mod.export(
+                    effective_config.telemetry,
+                    _merge_trace(bead_id, main_before, merge_output_commit, timing),
+                )
     finally:
         if lock is not None:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

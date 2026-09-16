@@ -34,6 +34,7 @@ from helios import jsonio
 from helios import memory as memory_mod
 from helios import ownership as ownership_mod
 from helios import prompt as prompt_mod
+from helios import telemetry as telemetry_mod
 from helios import worktree as worktree_mod
 from helios.harness.base import Harness, LaunchSpec
 
@@ -893,6 +894,7 @@ class _FinishArgs:
     started_at: str
     notes: list[str]
     steered: list[str] = field(default_factory=list)
+    launch_finished_at: str | None = None
 
 
 def _apply_writeback_once(
@@ -904,6 +906,77 @@ def _apply_writeback_once(
     if not plan.close and plan.run_state != final_state:
         plan = replace(plan, run_state=final_state)
     beads_mod.apply_writeback(beads, bead_id, plan)
+
+
+def _attempt_trace(
+    args: _FinishArgs,
+    *,
+    bead: beads_mod.Bead,
+    execution: envelope_mod.ExecutionStatus,
+    terminal: str,
+    native_session: str | None,
+    output_commit: str | None,
+    model: str | None,
+    validate_started_at: str,
+    validate_finished_at: str,
+    checks: list[envelope_mod.Check],
+    check_spans: list[tuple[str, str, str]],
+    commit_span: tuple[str, str] | None,
+    attempt_finished_at: str,
+) -> telemetry_mod.Span:
+    """Build the attempt trace of SPEC section 21: root span ``attempt``, children
+    ``launch``, one ``check.<name>`` per check performed, ``validate``, ``commit``,
+    in that order. A child is included only when its phase actually ran, so an
+    attempt that never launched carries no ``launch``, ``check.*`` or ``commit``
+    spans.
+    """
+    children: list[telemetry_mod.Span] = []
+    if args.launch_finished_at is not None:
+        children.append(
+            telemetry_mod.Span(name="launch", start=args.started_at, end=args.launch_finished_at)
+        )
+    check_times = {name: (start, end) for name, start, end in check_spans}
+    for check in checks:
+        times = check_times.get(check.name)
+        if times is None:
+            continue
+        attrs: dict[str, telemetry_mod.AttrValue] = {
+            "check.name": check.name,
+            "passed": check.passed,
+        }
+        if check.exit_code is not None:
+            attrs["exit_code"] = check.exit_code
+        children.append(
+            telemetry_mod.Span(
+                name=f"check.{check.name}", start=times[0], end=times[1], attributes=attrs
+            )
+        )
+    children.append(
+        telemetry_mod.Span(name="validate", start=validate_started_at, end=validate_finished_at)
+    )
+    if commit_span is not None:
+        children.append(telemetry_mod.Span(name="commit", start=commit_span[0], end=commit_span[1]))
+    attributes: dict[str, telemetry_mod.AttrValue] = {
+        "bead.id": bead.id,
+        "bead.kind": bead.kind,
+        "harness": args.harness_name,
+        "execution_status": execution.value,
+        "terminal_state": terminal,
+        "base_commit": args.base_commit,
+    }
+    if model is not None:
+        attributes["model"] = model
+    if native_session is not None:
+        attributes["session_id"] = native_session
+    if output_commit is not None:
+        attributes["output_commit"] = output_commit
+    return telemetry_mod.Span(
+        name="attempt",
+        start=args.started_at,
+        end=attempt_finished_at,
+        attributes=attributes,
+        children=tuple(children),
+    )
 
 
 def _finish_attempt(
@@ -925,6 +998,7 @@ def _finish_attempt(
     attempt_dir = args.attempt.dir
     n = args.attempt.n
     attempt_id = args.attempt.attempt_id
+    validate_started_at = attempt_mod.utc_now()
 
     if capture.store_bytes is not None:
         try:
@@ -961,15 +1035,16 @@ def _finish_attempt(
             f"native issue ignored ({native_error or f'exit code {proc_exit}'})"
         )
     finished_at = attempt_mod.utc_now()
+    validate_finished_at = finished_at
 
+    terminal = {
+        envelope_mod.ExecutionStatus.INTERRUPTED: "interrupted",
+        envelope_mod.ExecutionStatus.TIMED_OUT: "timed_out",
+        envelope_mod.ExecutionStatus.LAUNCH_FAILED: "launch_failed",
+    }.get(execution, "native_completed" if proc_exit == 0 else "crashed")
+    if launch_failed:
+        terminal = "launch_failed"
     if transition_from is not None:
-        terminal = {
-            envelope_mod.ExecutionStatus.INTERRUPTED: "interrupted",
-            envelope_mod.ExecutionStatus.TIMED_OUT: "timed_out",
-            envelope_mod.ExecutionStatus.LAUNCH_FAILED: "launch_failed",
-        }.get(execution, "native_completed" if proc_exit == 0 else "crashed")
-        if launch_failed:
-            terminal = "launch_failed"
         attempt_mod.transition(
             attempt_dir,
             terminal,
@@ -979,6 +1054,8 @@ def _finish_attempt(
 
     checks_dir = attempt_dir / "checks"
     checks: list[envelope_mod.Check] = []
+    check_spans: list[tuple[str, str, str]] = []
+    commit_span: tuple[str, str] | None = None
     if (
         execution is envelope_mod.ExecutionStatus.COMPLETED
         and report is None
@@ -1016,10 +1093,12 @@ def _finish_attempt(
         output_commit: str | None = None
     else:
         if bead.test:
+            _check_start = attempt_mod.utc_now()
             passed, code, detail = _run_shell(
                 bead.test, args.worktree_path, checks_dir / "test.log",
                 f"{attempt_dir}:check:test",
             )
+            check_spans.append(("test", _check_start, attempt_mod.utc_now()))
             checks.append(
                 envelope_mod.Check(
                     name="test",
@@ -1033,10 +1112,12 @@ def _finish_attempt(
         for entry in config_mod.effective_checks(args.config.project):
             if entry.when not in ("run", "both") or not entry.command:
                 continue
+            _check_start = attempt_mod.utc_now()
             passed, code, detail = _run_shell(
                 entry.command, args.worktree_path, checks_dir / f"{entry.name}.log",
                 f"{attempt_dir}:check:{entry.name}",
             )
+            check_spans.append((entry.name, _check_start, attempt_mod.utc_now()))
             checks.append(
                 envelope_mod.Check(
                     name=entry.name,
@@ -1047,6 +1128,7 @@ def _finish_attempt(
                     log_path=f"checks/{entry.name}.log",
                 )
             )
+        _ownership_start = attempt_mod.utc_now()
         ownership = ownership_mod.check(
             worktree=args.worktree_path,
             base_commit=args.base_commit,
@@ -1095,6 +1177,7 @@ def _finish_attempt(
                     else "all paths allowed"
                 ),
             )
+        check_spans.append(("ownership", _ownership_start, attempt_mod.utc_now()))
         checks.append(
             envelope_mod.Check(
                 name="ownership",
@@ -1108,12 +1191,35 @@ def _finish_attempt(
             output_commit = None
         else:
             summary = report.summary if report is not None else execution.value
+            _commit_start = attempt_mod.utc_now()
             _stage_and_commit(
                 args.worktree_path, bead.id, summary, list(ownership.allowed)
             )
             output_commit = _head_commit(args.worktree_path)
+            commit_span = (_commit_start, attempt_mod.utc_now())
 
     harness_cfg = args.config.harness.get(args.harness_name)
+    if args.config.telemetry.enabled:
+        note = telemetry_mod.export(
+            args.config.telemetry,
+            _attempt_trace(
+                args,
+                bead=bead,
+                execution=execution,
+                terminal=terminal,
+                native_session=native_session,
+                output_commit=output_commit,
+                model=harness_cfg.model if harness_cfg else None,
+                validate_started_at=validate_started_at,
+                validate_finished_at=validate_finished_at,
+                checks=checks,
+                check_spans=check_spans,
+                commit_span=commit_span,
+                attempt_finished_at=attempt_mod.utc_now(),
+            ),
+        )
+        if note is not None:
+            notes.append(note)
     verdict: str | None = None
     if report is not None and bead.kind.startswith("verify"):
         overall = envelope_mod.overall_verdict(list(report.findings))
@@ -1884,6 +1990,7 @@ def _run_one_inner(
             stop_path=stop_path,
             tee_stdout=tee_stdout,
         )
+        launch_finished_at = attempt_mod.utc_now() if launched_box["fired"] else None
         # SPEC §4.4 point 2: tested once, after the group is gone, before parse.
         if not launch_failed and stop_path.exists():
             interrupted = True
@@ -1907,6 +2014,7 @@ def _run_one_inner(
             input_hashes=hashes,
             started_at=started_at,
             notes=list(alloc_notes),
+            launch_finished_at=launch_finished_at,
         )
         return _finish_attempt(
             finish_args,
