@@ -4,14 +4,6 @@
 [project]
 test = "uv run pytest -q"          # run with bash -c from the worktree root
 typecheck = ""                     # empty disables
-# [[project.check]] replaces test/typecheck with an ordered list of named
-# checks: entry order is run order, "when" is "run", "merge" or "both" and
-# defaults to "both". Setting test or typecheck together with any
-# [[project.check]] entry is refused.
-# [[project.check]]
-# name = "lint"
-# command = "ruff check"
-# when = "run"
 units = "docs/units"
 verify_artifacts = "tools/verify"
 experiments = "experiments"
@@ -22,6 +14,15 @@ confidential = []                  # globs never staged, pushed or printed
 always_allowed = ["tests/"]        # prefixes any impl bead may touch
 # program = "pkg.model.program"    # module exposing REGISTRY (SPEC §15)
 # claims = "pkg.model.claims"      # module with @claim functions
+# [[project.check]] replaces test/typecheck with an ordered list of named
+# checks: entry order is run order, "when" is "run", "merge" or "both" and
+# defaults to "both". Setting test or typecheck together with any
+# [[project.check]] entry is refused. An entry must come after every plain
+# [project] key above, since it opens a new array-of-tables.
+# [[project.check]]
+# name = "lint"
+# command = "ruff check"
+# when = "run"
 
 [agents]                           # agent spec: "harness", "harness:profile" or "other"
 orchestrate = "claude"
