@@ -1782,3 +1782,146 @@ def test_worktree_registered_matches_across_unicode_normalization_forms(tmp_path
     assert merge_module._worktree_registered(hub, nfc_query) is True
     assert merge_module._worktree_registered(hub, nfd_query) is True
     assert merge_module._worktree_registered(hub, hub.parent / "not-there") is False
+
+
+# ---------------------------------------------------------------- h3c-fix8 item 1:
+# the verified-commit check replays the verified range commit by commit, not as one
+# squashed `merge-tree` call. A squashed replay loses per-commit rename detection: a
+# rename in one commit followed by a near-total rewrite in the next drops under
+# git's whole-range similarity threshold even though a real `git rebase main` is
+# clean, so the old rule refused work a rebase (hand or helios's own) produced.
+
+_RENAME_LINES = b"".join(b"original line %02d\n" % i for i in range(40))
+_RENAME_REWRITE = b"".join(
+    (b"rewritten %02d\n" % i) if i >= 5 else (b"original line %02d\n" % i) for i in range(40)
+)
+
+
+def _rename_then_rewrite_repo(tmp_path: Path) -> tuple[Path, Path, FakeBeads]:
+    """`f.txt` renamed to `g.txt` in one commit, then 35 of its 40 lines rewritten
+    in the next (about 9 percent whole-range similarity), while main independently
+    edits line 1 of the old path `f.txt`.
+    """
+    hub, worktree = _fp_repo(tmp_path, [("write", "f.txt", _RENAME_LINES)])
+    _git(worktree, "mv", "f.txt", "g.txt")
+    _git(worktree, "commit", "-m", "rename")
+    _apply_ops(worktree, [("write", "g.txt", _RENAME_REWRITE)])
+    _git(worktree, "commit", "-m", "rewrite")
+    beads = _beads(hub, worktree)
+
+    main_lines = _RENAME_LINES.split(b"\n")
+    main_lines[1] = b"MAIN edited line 01"
+    (hub / "f.txt").write_bytes(b"\n".join(main_lines))
+    _git(hub, "add", "f.txt")
+    _git(hub, "commit", "-m", "main edits the old path")
+    return hub, worktree, beads
+
+
+def test_rename_then_rewrite_while_main_edits_old_path_merges(tmp_path: Path) -> None:
+    """(a) A hand rebase of the rename-then-rewrite range onto main's edit to the
+    old path merges, and main's tree carries both main's edit and the rewrite.
+    """
+    hub, worktree, beads = _rename_then_rewrite_repo(tmp_path)
+    _git(worktree, "rebase", "main")
+    assert _run(beads, hub) == (0, "merged")
+
+    tree = sorted(_git(hub, "ls-tree", "-r", "--name-only", "main").splitlines())
+    assert tree == [".beads/issues.jsonl", "g.txt"]
+    expected_lines = _RENAME_REWRITE.split(b"\n")
+    expected_lines[1] = b"MAIN edited line 01"
+    expected = b"\n".join(expected_lines).decode().strip()
+    assert _git(hub, "show", "main:g.txt") == expected
+
+
+def test_rename_then_rewrite_via_helios_rebase_then_rerun_merges(tmp_path: Path) -> None:
+    """(b) helios's own rebase (step 3) produces the same shape; a first attempt
+    that fails a check with exit 5 must not have its rebased HEAD refused by a
+    rerun.
+    """
+    hub, worktree, beads = _rename_then_rewrite_repo(tmp_path)
+    original_output_commit = beads.beads["b1"].metadata["output_commit"]
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub, runner=lambda _c, _w: 1)
+    assert error.value.code == 5
+    rebased = _git(worktree, "rev-parse", "HEAD")
+    assert rebased != original_output_commit
+
+    assert _run(beads, hub) == (0, "merged")
+    expected_lines = _RENAME_REWRITE.split(b"\n")
+    expected_lines[1] = b"MAIN edited line 01"
+    expected = b"\n".join(expected_lines).decode().strip()
+    assert _git(hub, "show", "main:g.txt") == expected
+
+
+def test_tamper_amended_onto_rebased_rename_rewrite_head_refuses(tmp_path: Path) -> None:
+    """(c) A tamper amended onto that rebased HEAD refuses with exit 2."""
+    hub, worktree, beads = _rename_then_rewrite_repo(tmp_path)
+    _git(worktree, "rebase", "main")
+    (worktree / "g.txt").write_bytes(_RENAME_REWRITE + b"EVIL\n")
+    _git(worktree, "add", "g.txt")
+    _git(worktree, "commit", "--amend", "--no-edit")
+    new_head = _git(worktree, "rev-parse", "HEAD")
+    old_commit = beads.beads["b1"].metadata["output_commit"]
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == f"worktree HEAD {new_head} is not the verified output_commit {old_commit}"
+
+
+def test_orphan_worktree_branch_refuses_exit_two(tmp_path: Path) -> None:
+    """(d) Unrelated histories (an orphan worktree branch) refuse with exit 2 and
+    the ``worktree HEAD ...`` message, not exit 4: a failed or empty `merge-base`
+    call is a refusal, not a git failure.
+    """
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree)
+    _git(worktree, "checkout", "--orphan", "tmp-orphan")
+    _git(worktree, "rm", "-rf", ".")
+    (worktree / "evil.txt").write_text("evil\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "orphan")
+    _git(worktree, "branch", "-M", "worktree-b1")
+    new_head = _git(worktree, "rev-parse", "HEAD")
+    old_commit = beads.beads["b1"].metadata["output_commit"]
+    with pytest.raises(MergeError) as error:
+        _run(beads, hub)
+    assert error.value.code == 2
+    assert str(error.value) == f"worktree HEAD {new_head} is not the verified output_commit {old_commit}"
+
+
+def test_replace_ref_on_range_commit_does_not_change_outcome(tmp_path: Path) -> None:
+    """(e) A `git replace` ref planted on one commit inside the verified range,
+    after a clean ordinary rebase has already run, does not change the outcome:
+    `--no-replace-objects` guards every git call the replay makes.
+    """
+    hub, worktree = _repo(tmp_path)
+    (worktree / "extra.txt").write_text("one\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "c1")
+    c1 = _git(worktree, "rev-parse", "HEAD")
+    (worktree / "extra.txt").write_text("one\ntwo\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "c2")
+    out = _git(worktree, "rev-parse", "HEAD")
+    beads = _beads(hub, worktree)
+    beads.beads["b1"].metadata["output_commit"] = out
+    _new_envelope(hub, worktree)
+
+    (hub / "other.txt").write_text("other\n")
+    _git(hub, "add", "other.txt")
+    _git(hub, "commit", "-m", "advance main")
+    _git(worktree, "rebase", "main")
+
+    _git(worktree, "checkout", "-b", "evil-branch", "main")
+    (worktree / "extra.txt").write_text("EVIL\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "evil")
+    evil = _git(worktree, "rev-parse", "HEAD")
+    _git(worktree, "checkout", "worktree-b1")
+    _git(worktree, "branch", "-D", "evil-branch")
+    _git(hub, "replace", c1, evil)
+
+    assert _run(beads, hub) == (0, "merged")
+    assert _git(hub, "show", "main:extra.txt") == "one\ntwo"
+    assert _git(hub, "show", "main:other.txt") == "other"
+    assert _git(hub, "show", "main:value.txt") == "merged"

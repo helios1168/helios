@@ -198,32 +198,87 @@ def _remove_worktree(hub: Path, path: Path, branch: str) -> None:
             raise MergeError(proc.stderr.strip() or "branch removal failed", 4)
 
 
-def _is_verified_commit(hub: Path, head: str, output_commit: str) -> bool:
-    """True when `head` replays the verified work of `output_commit` (SPEC 12 step 2).
-
-    Not a diff comparison: this replays the non-merge commits of
-    `output_base..output_commit` (where `output_base = merge-base(output_commit, main)`)
-    onto `head_base = merge-base(head, main)` with
-    `git merge-tree --write-tree --merge-base=<output_base> <head_base> <output_commit>`
-    (needs git 2.38 or newer), and compares the resulting tree to `head`'s own tree.
-    A merge commit in either range, an empty verified range (`output_commit` already
-    on main), or a replay conflict all read as unverified rather than raising.
+def _merge_base(hub: Path, a: str, b: str) -> str | None:
+    """`git --no-replace-objects merge-base a b`, or None on failure or empty output
+    (unrelated histories, an orphan branch): that is a refusal, not a git failure.
     """
-    output_base = _git_output(hub, "merge-base", output_commit, "main")
-    head_base = _git_output(hub, "merge-base", head, "main")
-    if _git_output(hub, "rev-list", "--min-parents=2", f"{head_base}..{head}"):
-        return False
-    if _git_output(hub, "rev-list", "--min-parents=2", f"{output_base}..{output_commit}"):
-        return False
-    if not _git_output(hub, "rev-list", f"{output_base}..{output_commit}"):
-        return False
-    proc = _git(hub, "merge-tree", "--write-tree", f"--merge-base={output_base}", head_base, output_commit)
-    if proc.returncode == 1:
-        return False
+    proc = _git(hub, "--no-replace-objects", "merge-base", a, b)
     if proc.returncode != 0:
-        raise MergeError(proc.stderr.strip() or "git merge-tree failed", 4)
-    tree = proc.stdout.split("\n", 1)[0].strip()
-    return tree == _git_output(hub, "rev-parse", f"{head}^{{tree}}")
+        return None
+    result = proc.stdout.strip()
+    return result or None
+
+
+def _is_verified_commit(hub: Path, head: str, output_commit: str) -> bool:
+    """True when `head` replays the verified work of `output_commit` (SPEC 12 step 2,
+    h3c-fix8 item 1, replacing the single squashed `merge-tree` call of h3c-fix7).
+
+    Not a diff comparison, and not one squashed replay: this replays the non-merge
+    commits of `output_base..output_commit` (where
+    `output_base = merge-base(output_commit, main)`) one at a time, oldest first,
+    onto `cursor`, starting at `head_base = merge-base(head, main)`, the way `git
+    rebase` applies them. Each commit `c` is replayed with `git merge-tree
+    --write-tree --merge-base=<c's parent> <cursor> <c>`, and its resulting tree is
+    wrapped in a scratch commit (`git commit-tree`, an unreferenced object never
+    pointed to by any ref) that becomes the next `cursor`. The check passes when the
+    final cursor's tree equals `head`'s own tree.
+
+    A single squashed replay of the whole range loses per-commit rename detection:
+    a rename in one commit followed by a near-total rewrite in the next can drop
+    under git's similarity threshold over the whole range even though each
+    individual step would detect it, refusing work helios's own rebase (step 3)
+    produced. Replaying commit by commit does not have this blind spot.
+
+    A merge commit in either range, an empty verified range (`output_commit`
+    already on main), unrelated histories (a `merge-base` call fails or is empty),
+    or a replay conflict all read as unverified rather than raising. `commit-tree`
+    needs a committer identity a test hub may not have, so it runs with
+    `-c user.name=helios -c user.email=helios@invalid`, keeping `GIT_AUTHOR_*` and
+    `GIT_COMMITTER_*` out of it. `--no-replace-objects` guards every git call this
+    check runs, so a `git replace` ref on a commit inside the range cannot redirect
+    the replay.
+    """
+    output_base = _merge_base(hub, output_commit, "main")
+    head_base = _merge_base(hub, head, "main")
+    if output_base is None or head_base is None:
+        return False
+    if _git_output(hub, "--no-replace-objects", "rev-list", "--min-parents=2", f"{head_base}..{head}"):
+        return False
+    if _git_output(hub, "--no-replace-objects", "rev-list", "--min-parents=2", f"{output_base}..{output_commit}"):
+        return False
+    commits = _git_output(
+        hub, "--no-replace-objects", "rev-list", "--reverse", f"{output_base}..{output_commit}"
+    ).splitlines()
+    if not commits:
+        return False
+    cursor = head_base
+    for commit in commits:
+        parent = _git_output(hub, "--no-replace-objects", "rev-parse", f"{commit}^")
+        proc = _git(
+            hub, "--no-replace-objects", "merge-tree", "--write-tree", f"--merge-base={parent}", cursor, commit
+        )
+        if proc.returncode == 1:
+            return False
+        if proc.returncode != 0:
+            raise MergeError(proc.stderr.strip() or "git merge-tree failed", 4)
+        tree = proc.stdout.split("\n", 1)[0].strip()
+        cursor = _git_output(
+            hub,
+            "-c",
+            "user.name=helios",
+            "-c",
+            "user.email=helios@invalid",
+            "--no-replace-objects",
+            "commit-tree",
+            tree,
+            "-p",
+            cursor,
+            "-m",
+            "replay",
+        )
+    return _git_output(hub, "--no-replace-objects", "rev-parse", f"{cursor}^{{tree}}") == _git_output(
+        hub, "--no-replace-objects", "rev-parse", f"{head}^{{tree}}"
+    )
 
 
 def _finish_step7(
@@ -317,7 +372,8 @@ def merge_bead(
 
         # Only a verified commit merges: the worktree must sit on its own branch,
         # at exactly the commit the verify evidence covers, or a commit that replays
-        # it (git merge-tree, not a diff comparison). Runs on every attempt.
+        # it commit by commit (git merge-tree, not a diff comparison). Runs on every
+        # attempt.
         current_branch = _git(worktree, "symbolic-ref", "--short", "HEAD")
         if current_branch.returncode or current_branch.stdout.strip() != branch:
             raise MergeError(f"worktree is not on branch {branch}")
