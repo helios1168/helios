@@ -1121,7 +1121,8 @@ moved; 5 test or typecheck failed; 4 push, worktree removal, or a rebase failure
 conflict. Refusal and error messages go to stderr; success and `--dry-run` text go to stdout.
 
 `--dry-run` runs steps 1 and 2 and the recovery test of step 8, prints the planned steps, and
-writes nothing.
+writes nothing. It prints `would rebase, test, merge, push, and remove` when `git remote` lists
+`origin`, and `would rebase, test, merge, and remove` when it does not, then exits 0.
 
 ## 13. Memory
 
