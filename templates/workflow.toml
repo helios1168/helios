@@ -4,6 +4,14 @@
 [project]
 test = "uv run pytest -q"          # run with bash -c from the worktree root
 typecheck = ""                     # empty disables
+# [[project.check]] replaces test/typecheck with an ordered list of named
+# checks: entry order is run order, "when" is "run", "merge" or "both" and
+# defaults to "both". Setting test or typecheck together with any
+# [[project.check]] entry is refused.
+# [[project.check]]
+# name = "lint"
+# command = "ruff check"
+# when = "run"
 units = "docs/units"
 verify_artifacts = "tools/verify"
 experiments = "experiments"
