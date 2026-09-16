@@ -12,9 +12,10 @@ from pathlib import Path
 
 import pytest
 
+from helios import memory as memory_mod
 from helios import run as run_mod
 from helios.beads import Bead, Beads, FakeBeads
-from helios.config import Config, ProjectConfig
+from helios.config import Config, MemoryConfig, ProjectConfig
 from helios.envelope import AgentReport, Envelope, ExecutionStatus, WorkStatus
 from helios.merge import MergeError, merge_bead
 
@@ -173,8 +174,45 @@ def test_dry_run_does_not_write_beads(tmp_path: Path) -> None:
         project=ProjectConfig(worktrees="../worktree"),
         beads=beads,
         dry_run=True,
+    ) == (0, "would rebase, test, merge, and remove")
+    assert beads.argv_log == []
+
+
+def test_dry_run_with_origin_names_the_push(tmp_path: Path) -> None:
+    """SPEC 12: `--dry-run` names the push only when `git remote` lists `origin`."""
+    hub, worktree = _repo(tmp_path)
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "--bare", str(origin))
+    _git(hub, "remote", "add", "origin", str(origin))
+    beads = _beads(hub, worktree, real_hashes=True)
+    before_main = _git(hub, "rev-parse", "main")
+    assert merge_bead(
+        hub,
+        "b1",
+        project=ProjectConfig(worktrees="../worktree"),
+        beads=beads,
+        dry_run=True,
     ) == (0, "would rebase, test, merge, push, and remove")
     assert beads.argv_log == []
+    assert _git(hub, "rev-parse", "main") == before_main
+    assert worktree.exists()
+
+
+def test_dry_run_without_origin_omits_the_push(tmp_path: Path) -> None:
+    """SPEC 12: no `origin` means step 7 would skip the push, so dry-run does too."""
+    hub, worktree = _repo(tmp_path)
+    beads = _beads(hub, worktree, real_hashes=True)
+    before_main = _git(hub, "rev-parse", "main")
+    assert merge_bead(
+        hub,
+        "b1",
+        project=ProjectConfig(worktrees="../worktree"),
+        beads=beads,
+        dry_run=True,
+    ) == (0, "would rebase, test, merge, and remove")
+    assert beads.argv_log == []
+    assert _git(hub, "rev-parse", "main") == before_main
+    assert worktree.exists()
 
 
 def test_happy_path_merges_and_removes_worktree(tmp_path: Path) -> None:
@@ -697,7 +735,7 @@ def test_command_writes_refusal_to_stderr_and_planned_steps_to_stdout(
     assert captured.err == "helios: verify evidence is not closed and verified\n"
     beads.beads["v1"].metadata["verdict"] = "verified"
     assert command.run(Namespace(bead="b1", dry_run=True)) == 0
-    assert capsys.readouterr().out == "would rebase, test, merge, push, and remove\n"
+    assert capsys.readouterr().out == "would rebase, test, merge, and remove\n"
 
 
 @pytest.mark.parametrize(
@@ -2194,9 +2232,134 @@ def test_real_hub_dry_run_reports_success_not_staleness(tmp_path: Path, monkeypa
     hub, beads, project = _real_evidence_hub(tmp_path, monkeypatch)
     assert merge_bead(hub, "b1", project=project, beads=beads, dry_run=True) == (
         0,
-        "would rebase, test, merge, push, and remove",
+        "would rebase, test, merge, and remove",
     )
     assert _git(hub, "show", "main:value.txt") == "base"
+
+
+# ---------------------------------------------------------------- hel-d1z: merge_bead
+# must recompute a verify bead's input hashes with the loaded Config, not a
+# rebuilt default one, so a hub whose memory backend or export directory is
+# non-default resolves memory values the same way the run did.
+
+
+def _real_evidence_hub_with_memory(tmp_path: Path, monkeypatch) -> tuple[Path, FakeBeads, Config]:
+    """Like `_real_evidence_hub`, but the hub's `Config` sets a non-default
+    memory backend and export directory, and the verify bead reads one memory
+    key, so the real run's recorded `input_hashes` depend on that config.
+    Returns the full `Config`, not just its `project`: `merge_bead` must be
+    given it back so the recompute resolves the memory the same way the run
+    did (hel-d1z).
+    """
+    hub = tmp_path / "hub"
+    hub.mkdir()
+    _git(hub, "init", "-b", "main")
+    _git(hub, "config", "user.email", "t@t")
+    _git(hub, "config", "user.name", "t")
+    (hub / "value.txt").write_text("base\n")
+    (hub / ".gitignore").write_text(".helios/\n.claude/worktrees/\n")
+    (hub / "docs").mkdir()
+    (hub / "docs" / "NOTE.md").write_text("# Note\n\noriginal text\n")
+    for kind in ("impl", "verify-code"):
+        (hub / "skills" / kind).mkdir(parents=True)
+        (hub / "skills" / kind / "SKILL.md").write_text(
+            f"---\nname: {kind}\n---\n\n# {kind} bead\n\nDo the work.\n"
+        )
+    (hub / "AGENTS.md").write_text(
+        "# helios\n\n## Worker contract\n\nWork exactly one bead.\n\n## Orchestrator\n\nMerges.\n"
+    )
+    _git(hub, "add", ".")
+    _git(hub, "commit", "-m", "init")
+
+    worktree = hub / ".claude" / "worktrees" / "b1"
+    worktree.parent.mkdir(parents=True)
+    _git(hub, "worktree", "add", "-b", "worktree-b1", str(worktree), "main")
+    _git(hub, "worktree", "lock", "--reason", "keep", str(worktree))
+    (worktree / "value.txt").write_text("merged\n")
+    _git(worktree, "add", ".")
+    _git(worktree, "commit", "-m", "change")
+    output_commit = _git(worktree, "rev-parse", "HEAD")
+
+    cfg = Config(hub=hub, memory=MemoryConfig(backend="files", export_dir=".helios/custom-memories"))
+    memory_mod.FilesBackend(hub / cfg.memory.export_dir).write(
+        "mem1", {"source": "b1#1"}, "the remembered fact\n"
+    )
+
+    impl = Bead(
+        id="b1",
+        kind="impl",
+        unit="u1",
+        files=["value.txt"],
+        test="true",
+        metadata={"output_commit": output_commit},
+    )
+    verify = Bead(
+        id="v1",
+        kind="verify-code",
+        unit="u1",
+        parent="b1",
+        files=["tools/verify/u1/"],
+        test="true",
+        docs=["docs/NOTE.md"],
+        memories=["mem1"],
+        labels=["unit:u1"],
+    )
+    beads = FakeBeads([impl, verify])
+
+    script = tmp_path / "fake_script.json"
+    script.write_text(
+        json.dumps(
+            {
+                "exit_code": 0,
+                "sleep_s": 0,
+                "stdout": "x",
+                "session_id": "s1",
+                "report": _REAL_VERIFY_REPORT,
+            }
+        )
+    )
+    monkeypatch.setenv("HELIOS_FAKE_SCRIPT", str(script))
+
+    rc = run_mod.run_one("v1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 0, "setup: the verify bead must run and verify cleanly"
+    assert "v1" in beads.closed
+    assert beads.beads["v1"].metadata.get("verdict") == "verified"
+    beads.beads["v1"].status = "closed"
+    beads.beads["b1"].status = "closed"
+    return hub, beads, cfg
+
+
+def test_real_hub_non_default_memory_config_merges(tmp_path: Path, monkeypatch) -> None:
+    """A hub whose config sets a non-default memory backend and export
+    directory merges a correct verify envelope with exit 0, because
+    `merge_bead` is given the same `Config` the run used, not a rebuilt
+    default one (hel-d1z).
+    """
+    hub, beads, cfg = _real_evidence_hub_with_memory(tmp_path, monkeypatch)
+    code, message = merge_bead(
+        hub, "b1", project=cfg.project, config=cfg, beads=beads, check_runner=lambda _command, _cwd: 0
+    )
+    assert (code, message) == (0, "merged")
+
+
+def test_real_hub_non_default_memory_change_refuses_as_stale(tmp_path: Path, monkeypatch) -> None:
+    """Changing the memory value the verify prompt read, after the envelope
+    was written, refuses as stale and writes nothing (hel-d1z).
+    """
+    hub, beads, cfg = _real_evidence_hub_with_memory(tmp_path, monkeypatch)
+    memory_mod.FilesBackend(hub / cfg.memory.export_dir).write(
+        "mem1", {"source": "b1#1"}, "a different remembered fact\n"
+    )
+    before_main = _git(hub, "rev-parse", "main")
+    before_log = len(beads.argv_log)
+    with pytest.raises(MergeError) as error:
+        merge_bead(
+            hub, "b1", project=cfg.project, config=cfg, beads=beads, check_runner=lambda _command, _cwd: 0
+        )
+    assert str(error.value) == "verify envelope is stale"
+    assert error.value.code == 2
+    assert beads.argv_log[before_log:] == []
+    assert _git(hub, "rev-parse", "main") == before_main
 
 
 # ---------------------------------------------------------------- hel-nkk: a branch

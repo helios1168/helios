@@ -44,6 +44,7 @@ def run(args: argparse.Namespace) -> int:
             config.hub,
             args.bead,
             project=config.project,
+            config=config,
             beads=Beads(config.hub),
             dry_run=args.dry_run,
         )

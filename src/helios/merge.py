@@ -378,6 +378,7 @@ def merge_bead(
     bead_id: str,
     *,
     project: ProjectConfig,
+    config: Config | None = None,
     beads: BeadsLike,
     check_runner: CheckRunner = _default_runner,
     input_hashes: HashFunction | None = None,
@@ -390,14 +391,19 @@ def merge_bead(
     ``input_hashes`` defaults to recomputing a verify bead's input hashes the
     same way a run computes them (``helios.run.recompute_input_hashes``,
     SPEC §7.1 step 6, §8.5); a caller may still inject a fake, mainly for
-    tests that are not about evidence hashing itself. Only ``project`` is
-    known here, not a full ``Config``, so the recompute uses default
-    ``agents``, ``harness``, ``control`` and ``memory`` settings alongside
-    the given ``project``.
+    tests that are not about evidence hashing itself. The recompute uses
+    ``config`` when given, so a hub whose ``.agents/workflow.toml`` sets a
+    non-default ``memory``, ``agents``, ``harness`` or ``control`` setting
+    resolves those values the same way the run did (``commands/merge.py``
+    always passes the loaded ``Config``). A caller that omits ``config``
+    falls back to ``Config(hub=hub, project=project)``, with every other
+    setting at its default.
     """
     bead = beads.show(bead_id)
     hashes_fn: HashFunction = input_hashes if input_hashes is not None else (
-        lambda verifier: recompute_input_hashes(hub, Config(hub=hub, project=project), beads, verifier)
+        lambda verifier: recompute_input_hashes(
+            hub, config if config is not None else Config(hub=hub, project=project), beads, verifier
+        )
     )
     runs_dir = hub / project.runs / bead_id
     lock_path = runs_dir / "lock"
@@ -494,7 +500,10 @@ def merge_bead(
         main_before = _git_output(hub, "rev-parse", "main")
         marker = f"[{bead_id}@{main_before}:"
         if dry_run:
-            return 0, "would rebase, test, merge, push, and remove"
+            has_origin = "origin" in _git_output(hub, "remote").splitlines()
+            if has_origin:
+                return 0, "would rebase, test, merge, push, and remove"
+            return 0, "would rebase, test, merge, and remove"
         beads.set_metadata(bead_id, {"merge_main_before": main_before})
         rebase = _git(worktree, "rebase", "main")
         if rebase.returncode:
