@@ -229,6 +229,10 @@ errors naming the dotted key. `templates/workflow.toml` is the commented templat
 | `memory.backend` | `"beads"` | `beads` or `files` (§13) |
 | `memory.export_dir` | `".helios/memories"` | files export of the beads backend |
 | `memory.inject_cap_bytes` | `32000` | cap on injected memories and docs |
+| `telemetry.enabled` | `false` | export OpenTelemetry spans (§21) |
+| `telemetry.endpoint` | `""` (empty) | full OTLP traces URL, for example `https://cloud.langfuse.com/api/public/otel/v1/traces` |
+| `telemetry.timeout_s` | `5` | export timeout, seconds |
+| `telemetry.service_name` | `"helios"` | OpenTelemetry service name |
 | `tolerance.<tier>` | none | named numeric tolerances for skills and claims |
 
 Agent spec syntax: `harness` or `harness:profile`, or `other`. `other` is valid only for verify
@@ -1525,6 +1529,51 @@ second person joins.
 ## 20. Not in this wave
 
 Plugin hooks (Stop hook inbox draining, PreToolUse denies), a separate `helios verify` command
-(a verify bead runs through `helios run`), telemetry tagging and trace export, the beads board,
-codex daemon threads and remote control, rootshell notifications, Graphiti, Lean, VIPR, porting
-the existing `math-verify` and `code-verify` skills, and any project migration.
+(a verify bead runs through `helios run`), the beads board, codex daemon threads and remote
+control, rootshell notifications, Graphiti, Lean, VIPR, porting the existing `math-verify` and
+`code-verify` skills, and any project migration.
+
+## 21. Telemetry
+
+helios exports one trace per attempt and one trace per merge, so a run can be inspected in an
+observability backend. Export is off by default. The attempt record under `project.runs` stays
+the source of truth; helios never reads telemetry back, and no helios behavior depends on it.
+
+Configuration is a `[telemetry]` block (§5): `telemetry.enabled` (default `false`),
+`telemetry.endpoint` (default empty, the full OTLP traces URL, for example
+`https://cloud.langfuse.com/api/public/otel/v1/traces` or
+`http://localhost:3000/api/public/otel/v1/traces` when self-hosted), `telemetry.timeout_s`
+(default `5`), `telemetry.service_name` (default `helios`). `telemetry.enabled` true with an
+empty `telemetry.endpoint` is refused with `helios: telemetry.enabled requires
+telemetry.endpoint`, exit 2.
+
+Credentials come from the environment only, never from `workflow.toml`, because that file is
+committed to the repository. The variables are `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`.
+helios builds the `Authorization: Basic <base64 of "<public key>:<secret key>">` header from
+them and always sends `x-langfuse-ingestion-version: 4`. When `telemetry.enabled` is true and
+either variable is missing or empty, helios exports nothing and records the note of rule 6
+below; it is not a refusal, because a missing key on one machine must not stop work.
+
+Transport is OTLP over HTTP, protobuf or JSON, never gRPC, to the signal-specific traces
+endpoint (`telemetry.endpoint`, for example Langfuse's `/api/public/otel/v1/traces`). Any
+OTLP-compatible backend works; Langfuse is the configured default target, so the backend can be
+changed without changing helios.
+
+One trace per attempt, whose root span is named `attempt` and carries the bead id, the bead
+kind, the resolved harness, the model, the session id, the base commit, the output commit, the
+execution status and the terminal state. Child spans, in the order they occur: `launch`, one
+`check.<name>` span per check performed (the same names as §7.1 step 9), `validate`, and
+`commit`. One trace per merge, whose root span is named `merge` and whose children match the
+step markers of §12: `rebase`, one `check.<name>` per check, `merge`, `push`, `remove`. Every
+span carries start and end timestamps in the format §4.3 already requires.
+
+Export never fails a run. This is the rule that matters most. Export is best effort: it is
+bounded by `telemetry.timeout_s`, every exception from the exporter is caught, and no exit code
+of any command changes because of telemetry. A failed or skipped export is recorded once on the
+attempt record as a note naming the reason, and nothing else happens. A backend that is
+unreachable, slow, or misconfigured must leave `helios run` and `helios merge` behaving exactly
+as they do with telemetry disabled.
+
+Spans carry identifiers, enumerated statuses, timings, commit hashes and check names only. They
+never carry prompt text, report text, agent output, file paths or the contents of anything
+matched by `project.confidential`.
