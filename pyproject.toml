@@ -4,19 +4,24 @@ version = "0.1.0"
 description = "Research workflow kit: dispatch, verify and record research units across agent CLIs"
 requires-python = ">=3.12"
 dependencies = [
-    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
-    "opentelemetry-sdk>=1.44.0",
     "pydantic>=2.8",
 ]
 
 [project.optional-dependencies]
 claims = ["sympy>=1.13", "z3-solver>=4.13"]
+telemetry = ["opentelemetry-exporter-otlp-proto-http>=1.44.0", "opentelemetry-sdk>=1.44.0"]
 
 [project.scripts]
 helios = "helios.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "hypothesis>=6", "sympy>=1.13"]
+dev = [
+    "pytest>=8",
+    "hypothesis>=6",
+    "sympy>=1.13",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
+    "opentelemetry-sdk>=1.44.0",
+]
 
 [build-system]
 requires = ["hatchling"]
