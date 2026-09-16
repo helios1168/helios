@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -141,6 +142,38 @@ def test_normalized_state_normalizes_pid_and_latest_state_agrees(
     assert normalized["pid"] == expected_pid
     assert normalized["state"] == "launched"
     assert normalized == att.latest_state(hub, ".helios/runs", "b1")
+
+
+def test_pid_and_pid_start_normalization_agrees_across_attempt_sessions_and_resume(
+    tmp_path: Path,
+) -> None:
+    """``attempt.normalized_state``, ``sessions.safe_state`` and the record
+    ``resume._latest_finalized`` works from must agree on ``pid`` and ``pid_start`` for
+    every bad shape (hel-100): all three now share ``attempt.normalize_liveness_fields``,
+    so the rule lives once instead of three times."""
+    from helios import resume, sessions
+
+    hub = make_repo(tmp_path / "hub")
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    a, _ = att.allocate(hub=hub, runs_rel=".helios/runs", bead="b1", worktree=worktree)
+
+    bad_pids: tuple[Any, ...] = (0, -1, True, False, 1.5, 2**31, "123", None, 10**20)
+    bad_pid_starts: tuple[Any, ...] = (123, True, 12.5, None, "x")
+
+    for pid in bad_pids:
+        for pid_start in bad_pid_starts:
+            att.write_state(
+                a.dir, attempt_id="b1#1", state="finalized",
+                pid=pid, pid_start=pid_start, session_id="s1",
+            )
+            from_attempt = att.normalized_state(a.dir)
+            from_sessions = sessions.safe_state(a.dir)
+            _, resumed_state = resume._latest_finalized(hub, ".helios/runs", "b1")
+            from_resume = att.normalize_liveness_fields(resumed_state)
+            agreed = (from_attempt["pid"], from_attempt["pid_start"])
+            assert agreed == (from_sessions["pid"], from_sessions["pid_start"])
+            assert agreed == (from_resume["pid"], from_resume["pid_start"])
 
 
 def test_is_stale_on_hashes_and_ancestry(tmp_path: Path) -> None:

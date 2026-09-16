@@ -229,13 +229,15 @@ def transition(
     )
 
 
-def _normalize_liveness_fields(record: dict[str, Any]) -> dict[str, Any]:
+def normalize_liveness_fields(record: dict[str, Any]) -> dict[str, Any]:
     """Normalize ``pid`` and ``pid_start`` the way SPEC §8.3 reads them.
 
     ``pid`` is kept only when it is an int, not a bool, with
     ``0 < pid < 2**31``, else null; ``pid_start`` is kept only when it is a
     str, else null. Every value normalized this way is safe to pass straight
-    to ``is_pid_alive`` (mirrors the rule ``sessions.safe_state`` applies).
+    to ``is_pid_alive``. This is the one place the rule lives; ``normalized_state``,
+    ``sessions.safe_state`` and ``resume._latest_finalized`` all call it instead of
+    repeating the check.
     """
     pid = record.get("pid")
     if not (isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 2**31):
@@ -246,13 +248,13 @@ def _normalize_liveness_fields(record: dict[str, Any]) -> dict[str, Any]:
     return {**record, "pid": pid, "pid_start": pid_start}
 
 
-def normalized_state(dir: Path) -> dict[str, Any]:
+def normalized_state(directory: Path) -> dict[str, Any]:
     """``read_state`` with ``pid`` and ``pid_start`` normalized (SPEC §8.3).
 
     Every value normalized this way is safe to pass straight to
     ``is_pid_alive`` without re-validating it.
     """
-    return _normalize_liveness_fields(read_state(dir))
+    return normalize_liveness_fields(read_state(directory))
 
 
 def latest_state(hub: Path, runs_rel: str, bead: str) -> dict[str, Any] | None:

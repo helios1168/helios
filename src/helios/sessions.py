@@ -35,15 +35,9 @@ def safe_state(directory: Path) -> dict[str, Any]:
         state = attempt.read_state(directory)
         if not isinstance(state, dict) or not isinstance(state.get("state"), str):
             raise ValueError("invalid state")
-        normalized = dict(state)
-        pid = normalized.get("pid")
-        normalized["pid"] = (
-            pid if isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 2**31 else None
-        )
+        normalized = attempt.normalize_liveness_fields(state)
         session_id = normalized.get("session_id")
         normalized["session_id"] = session_id if isinstance(session_id, str) else None
-        pid_start = normalized.get("pid_start")
-        normalized["pid_start"] = pid_start if isinstance(pid_start, str) else None
         execution_status = normalized.get("execution_status")
         normalized["execution_status"] = execution_status if isinstance(execution_status, str) else None
         normalized["attempt_id"] = normalized["attempt_id"] if isinstance(normalized.get("attempt_id"), str) else None

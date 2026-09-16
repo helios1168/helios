@@ -45,13 +45,10 @@ def _latest_finalized(
     state = attempt_mod.read_state(attempt_dir)
     # SPEC §8.3: a pid that is not an int with 0 < pid < 2**31 (a bool
     # counts as not an int), or a non-string pid_start, reads as null
-    # before any liveness call (the same validation as sessions.safe_state).
-    pid = state.get("pid")
-    if not (isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 2**31):
-        pid = None
-    pid_start = state.get("pid_start")
-    if not isinstance(pid_start, str):
-        pid_start = None
+    # before any liveness call (the same rule as sessions.safe_state).
+    normalized = attempt_mod.normalize_liveness_fields(state)
+    pid = normalized.get("pid")
+    pid_start = normalized.get("pid_start")
     if attempt_mod.is_pid_alive(pid, pid_start):
         raise ResumeRefusal(f"attempt {state.get('attempt_id')} is still running")
     if state.get("state") != "finalized":
