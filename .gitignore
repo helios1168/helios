@@ -16,3 +16,6 @@ dist/
 # helios runtime state: attempts, events, worktrees
 .helios/
 .claude/worktrees/
+
+# macOS
+.DS_Store
