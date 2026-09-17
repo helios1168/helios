@@ -64,3 +64,14 @@
 # Secret keys (stored in this file but prefer env vars to avoid git exposure):
 # - linear.api_key  → use LINEAR_API_KEY env var instead
 # - github.token    → use GITHUB_TOKEN env var instead
+
+# Keep the passive JSONL export fresh so a git push carries the bead data.
+# The Dolt database under .beads/embeddeddolt is gitignored, so issues.jsonl
+# is the only copy that reaches the remote.
+export:
+  auto: true
+  path: issues.jsonl
+  interval: 60s
+  git-add: true
+import:
+  path: issues.jsonl
