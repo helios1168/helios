@@ -17,10 +17,11 @@ from __future__ import annotations
 import argparse
 import importlib
 import pkgutil
+import sys
 from collections.abc import Iterable, Sequence
 from types import ModuleType
 
-from helios import __version__, commands
+from helios import __version__, commands, config
 
 
 def discover() -> list[ModuleType]:
@@ -78,7 +79,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if run is None:
         parser.print_help()
         return 2
-    return int(run(args) or 0)
+    try:
+        return int(run(args) or 0)
+    except config.ConfigError as exc:
+        # One handler for every command, since a configuration refusal reads the same whichever
+        # command asked for the file (SPEC §2.3). Commands with their own handler never get here.
+        print(f"helios: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

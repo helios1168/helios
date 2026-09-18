@@ -17,6 +17,15 @@ from typing import Any
 
 WORKFLOW_REL = Path(".agents/workflow.toml")
 
+
+class ConfigError(ValueError):
+    """A SPEC §5 configuration refusal.
+
+    ``load`` raises this for every unreadable or invalid ``workflow.toml``, so the command layer
+    prints it with a ``helios: `` prefix and exits 2 instead of showing a traceback (SPEC §2.3).
+    It subclasses ``ValueError`` because the handlers written before it catch that.
+    """
+
 _VERIFY_KINDS = ("verify-code", "verify-math", "verify-validate")
 
 _STR = "str"
@@ -335,11 +344,25 @@ def _tolerance(table: Any) -> dict[str, float]:
 
 
 def load(start: Path) -> Config:
-    """Load the project configuration, defaulting when the file is absent (SPEC §5)."""
+    """Load the project configuration, defaulting when the file is absent (SPEC §5).
+
+    Every failure below leaves as a ``ConfigError`` naming the dotted key, so no caller has to
+    know which of ``ValueError`` or ``TypeError`` a particular check happens to raise.
+    """
     hub = find_hub(start)
     path = hub / WORKFLOW_REL
     if not path.is_file():
         return Config(hub=hub)
+    try:
+        return _load_file(hub, path)
+    except ConfigError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _load_file(hub: Path, path: Path) -> Config:
+    """Read and validate an existing workflow.toml."""
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
     for key in raw:

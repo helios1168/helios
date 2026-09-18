@@ -58,11 +58,11 @@ def write_workflow(tmp_path: Path, text: str) -> Path:
 
 
 def test_wrong_typed_values_name_the_dotted_key(tmp_path: Path) -> None:
-    with pytest.raises(TypeError, match=r"tolerance\.a"):
+    with pytest.raises(cfg.ConfigError, match=r"tolerance\.a"):
         cfg.load(write_workflow(tmp_path, "[tolerance]\na = 'x'\n"))
-    with pytest.raises(TypeError, match=r"project\.test"):
+    with pytest.raises(cfg.ConfigError, match=r"project\.test"):
         cfg.load(write_workflow(tmp_path, "[project]\ntest = 1\n"))
-    with pytest.raises(TypeError, match=r"memory\.inject_cap_bytes"):
+    with pytest.raises(cfg.ConfigError, match=r"memory\.inject_cap_bytes"):
         cfg.load(write_workflow(tmp_path, "[memory]\ninject_cap_bytes = 'big'\n"))
 
 
@@ -72,9 +72,9 @@ def test_unknown_nested_key_names_the_dotted_key(tmp_path: Path) -> None:
 
 
 def test_table_value_with_wrong_type_names_the_key(tmp_path: Path) -> None:
-    with pytest.raises(TypeError, match=r"'control'"):
+    with pytest.raises(cfg.ConfigError, match=r"'control'"):
         cfg.load(write_workflow(tmp_path, "control = 1\n"))
-    with pytest.raises(TypeError, match=r"'memory'"):
+    with pytest.raises(cfg.ConfigError, match=r"'memory'"):
         cfg.load(write_workflow(tmp_path, 'memory = "abc"\n'))
 
 
@@ -193,7 +193,7 @@ def test_check_unknown_entry_key_named(tmp_path: Path) -> None:
 
 
 def test_check_entry_wrong_type_named(tmp_path: Path) -> None:
-    with pytest.raises(TypeError, match=r"project\.check\[0\]\.command"):
+    with pytest.raises(cfg.ConfigError, match=r"project\.check\[0\]\.command"):
         cfg.load(
             write_workflow(
                 tmp_path, "[[project.check]]\nname = 'lint'\ncommand = 1\n"
@@ -307,14 +307,14 @@ def test_telemetry_unknown_key_names_the_dotted_key(tmp_path: Path) -> None:
 
 
 def test_telemetry_wrong_typed_values_name_the_dotted_key(tmp_path: Path) -> None:
-    with pytest.raises(TypeError, match=r"telemetry\.enabled"):
+    with pytest.raises(cfg.ConfigError, match=r"telemetry\.enabled"):
         cfg.load(write_workflow(tmp_path, "[telemetry]\nenabled = 'yes'\n"))
-    with pytest.raises(TypeError, match=r"telemetry\.enabled"):
+    with pytest.raises(cfg.ConfigError, match=r"telemetry\.enabled"):
         # An int is not a bool, even though bool is an int subclass in Python.
         cfg.load(write_workflow(tmp_path, "[telemetry]\nenabled = 1\n"))
-    with pytest.raises(TypeError, match=r"telemetry\.endpoint"):
+    with pytest.raises(cfg.ConfigError, match=r"telemetry\.endpoint"):
         cfg.load(write_workflow(tmp_path, "[telemetry]\nendpoint = 1\n"))
-    with pytest.raises(TypeError, match=r"telemetry\.timeout_s"):
+    with pytest.raises(cfg.ConfigError, match=r"telemetry\.timeout_s"):
         cfg.load(write_workflow(tmp_path, "[telemetry]\ntimeout_s = 'x'\n"))
-    with pytest.raises(TypeError, match=r"telemetry\.service_name"):
+    with pytest.raises(cfg.ConfigError, match=r"telemetry\.service_name"):
         cfg.load(write_workflow(tmp_path, "[telemetry]\nservice_name = 1\n"))
