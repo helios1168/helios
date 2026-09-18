@@ -1561,20 +1561,25 @@ endpoint (`telemetry.endpoint`, for example Langfuse's `/api/public/otel/v1/trac
 OTLP-compatible backend works; Langfuse is the configured default target, so the backend can be
 changed without changing helios.
 
-One trace per attempt, whose root span is named `attempt` and carries the bead id, the bead
-kind, the resolved harness, the model, the session id, the base commit, the output commit, the
-execution status and the terminal state. Child spans, in the order they occur: `launch`, one
-`check.<name>` span per check performed (the same names as §7.1 step 9), `validate`, and
-`commit`. One trace per merge, whose root span is named `merge` and whose children match the
-step markers of §12: `rebase`, one `check.<name>` per check, `merge`, `push`, `remove`. Every
-span carries start and end timestamps in the format §4.3 already requires.
+One trace per attempt, whose root span is named `attempt` and carries the bead id, the bead kind,
+the resolved harness, the model, the session id, the base commit, the output commit, the execution
+status and the terminal state. Child spans, in the order they occur: `launch`, `validate`, one
+`check.<name>` span per check performed (the same names as §7.1 step 9), and `commit`. That order
+follows the run steps of §7.1, which parse and classify at step 8, run the checks at step 9 and
+commit at step 10, so the order the children are emitted in agrees with the timestamps they carry.
+One trace per merge, whose root span is named `merge` and whose children match the step markers of
+§12: `rebase`, one `check.<name>` per check, `merge`, `push`, `remove`. Every span carries start and
+end timestamps in the format §4.3 already requires.
 
-Export never fails a run. This is the rule that matters most. Export is best effort: it is
-bounded by `telemetry.timeout_s`, every exception from the exporter is caught, and no exit code
-of any command changes because of telemetry. A failed or skipped export is recorded once on the
-attempt record as a note naming the reason, and nothing else happens. A backend that is
-unreachable, slow, or misconfigured must leave `helios run` and `helios merge` behaving exactly
-as they do with telemetry disabled.
+Export never fails a run. This is the rule that matters most. Export is best effort: it is bounded
+by `telemetry.timeout_s`, every exception from the exporter is caught, and no exit code of any
+command changes because of telemetry. A failed or skipped attempt export is recorded once on the
+attempt record as a note naming the reason, and nothing else happens. A merge has no attempt record,
+so a failed or skipped merge export is silent: `helios merge` prefixes every stderr line with
+`helios: ` under fixed exit codes (§12), and its bead comments are the step markers the replay rule
+of §7.5 depends on, so neither carries a telemetry note. A backend that is unreachable, slow, or
+misconfigured must leave `helios run` and `helios merge` behaving exactly as they do with telemetry
+disabled.
 
 Spans carry identifiers, enumerated statuses, timings, commit hashes and check names only. They
 never carry prompt text, report text, agent output, file paths or the contents of anything

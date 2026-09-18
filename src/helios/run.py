@@ -925,8 +925,10 @@ def _attempt_trace(
     attempt_finished_at: str,
 ) -> telemetry_mod.Span:
     """Build the attempt trace of SPEC section 21: root span ``attempt``, children
-    ``launch``, one ``check.<name>`` per check performed, ``validate``, ``commit``,
-    in that order. A child is included only when its phase actually ran, so an
+    ``launch``, ``validate``, one ``check.<name>`` per check performed, ``commit``,
+    in that order. That is the order of section 7.1, which parses and classifies at
+    step 8 before the checks at step 9, so the emitted order agrees with the span
+    timestamps. A child is included only when its phase actually ran, so an
     attempt that never launched carries no ``launch``, ``check.*`` or ``commit``
     spans.
     """
@@ -935,6 +937,9 @@ def _attempt_trace(
         children.append(
             telemetry_mod.Span(name="launch", start=args.started_at, end=args.launch_finished_at)
         )
+    children.append(
+        telemetry_mod.Span(name="validate", start=validate_started_at, end=validate_finished_at)
+    )
     check_times = {name: (start, end) for name, start, end in check_spans}
     for check in checks:
         times = check_times.get(check.name)
@@ -951,9 +956,6 @@ def _attempt_trace(
                 name=f"check.{check.name}", start=times[0], end=times[1], attributes=attrs
             )
         )
-    children.append(
-        telemetry_mod.Span(name="validate", start=validate_started_at, end=validate_finished_at)
-    )
     if commit_span is not None:
         children.append(telemetry_mod.Span(name="commit", start=commit_span[0], end=commit_span[1]))
     attributes: dict[str, telemetry_mod.AttrValue] = {

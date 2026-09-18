@@ -623,6 +623,8 @@ def merge_bead(
             return 0, "merged"
         finally:
             if timing.rebase is not None and effective_config.telemetry.enabled:
+                # The note is dropped on purpose: a merge has no attempt record to carry it, and
+                # SPEC section 21 states that a failed or skipped merge export is silent.
                 telemetry_mod.export(
                     effective_config.telemetry,
                     _merge_trace(bead_id, main_before, merge_output_commit, timing),

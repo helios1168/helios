@@ -222,6 +222,44 @@ def test_attempt_trace_shape(tmp_path, monkeypatch, receiver) -> None:
     assert test_check["passed"] is True
 
 
+def test_attempt_child_order_matches_the_timestamps(tmp_path, monkeypatch, receiver) -> None:
+    """SPEC section 21 lists launch, validate, check.<name>, commit, the order of section 7.1.
+
+    The emitted order used to contradict the timestamps each span carried, because the children
+    were built with validate after the checks while section 7.1 classifies at step 8 and runs the
+    checks at step 9.
+    """
+    hub = make_hub(tmp_path)
+    bead = make_bead("b1", files=["src/"], test="mkdir -p src && echo hi > src/out.txt && exit 0")
+    beads = beads_mod.FakeBeads([bead])
+    script = write_script(
+        tmp_path,
+        {"exit_code": 0, "sleep_s": 0, "stdout": "ok", "session_id": "s1",
+         "report": {"status": "done", "summary": "did it"}},
+    )
+    set_fake(monkeypatch, script)
+    set_credentials(monkeypatch)
+    cfg = replace(
+        config_mod.load(hub),
+        telemetry=TelemetryConfig(enabled=True, endpoint=receiver.endpoint(), timeout_s=5),
+    )
+    assert run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake") == 0
+
+    spans = _spans(receiver.requests[0]["body"])
+    root = _by_name(spans, "attempt")
+    children = [s for s in spans if s.parent_span_id == root.span_id]
+
+    assert [s.name for s in children] == [
+        "launch",
+        "validate",
+        "check.test",
+        "check.ownership",
+        "commit",
+    ]
+    starts = [s.start_time_unix_nano for s in children]
+    assert starts == sorted(starts), [(s.name, s.start_time_unix_nano) for s in children]
+
+
 def test_disabled_makes_no_network_call(tmp_path, monkeypatch, receiver) -> None:
     hub = make_hub(tmp_path)
     beads = beads_mod.FakeBeads([make_bead("b1")])
