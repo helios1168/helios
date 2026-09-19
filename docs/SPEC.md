@@ -39,6 +39,8 @@ schemas/                 generated JSON Schemas; never edit by hand
 skills/<name>/SKILL.md   stage skills, Agent Skills format; skills/report-block.md shared
 tests/                   pytest; tests/fixtures/native/<harness>/ holds recorded CLI output
 docs/SPEC.md             this file
+docs/GENERAL_PURPOSE.md  the guide for a hub that declares its own stages (§3.1)
+README.md                what helios is, and where to read next
 AGENTS.md                the worker contract (its "Worker contract" section)
 ```
 
