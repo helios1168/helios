@@ -12,6 +12,10 @@ from helios import stageset
 from helios.beads import Bead, BeadNotFound, Comment, FakeBeads
 from helios.learned import LINE_RE, list_lines, mark
 
+#: Every test here exercises research stage behavior, so every direct call passes this
+#: explicitly now that list_lines/mark take no default.
+RESEARCH = stageset.research()
+
 
 def queue_beads() -> FakeBeads:
     return FakeBeads([
@@ -30,7 +34,7 @@ def test_learned_dotall_dedupes_by_kind_marker_and_curated_kind() -> None:
         Comment("3", "b", "a", "missing_context: [b#2#1] keep despite learned mark"),
         Comment("4", "b", "a", "curated: [learned:b#2#1] -> memory"),
     ]
-    lines = list_lines(beads)
+    lines = list_lines(beads, stages=RESEARCH)
     assert [(line.attempt, line.kind, line.k, line.text) for line in lines] == [
         (2, "missing_context", 1, "keep despite learned mark"),
     ]
@@ -41,23 +45,23 @@ def test_learned_unit_filter_and_status_and_unlabelled_filter() -> None:
     beads.add_comment("b", "learned: [b#1#1] u")
     beads.add_comment("closed", "learned: [closed#1#1] closed")
     beads.add_comment("ignored", "learned: [ignored#1#1] no kind label")
-    assert [line.bead for line in list_lines(beads, "u")] == ["b"]
+    assert [line.bead for line in list_lines(beads, "u", stages=RESEARCH)] == ["b"]
     # "closed" carries no unit label, so its unit sorts as "-", ahead of "u".
-    assert [(line.unit, line.bead) for line in list_lines(beads)] == [("-", "closed"), ("u", "b")]
+    assert [(line.unit, line.bead) for line in list_lines(beads, stages=RESEARCH)] == [("-", "closed"), ("u", "b")]
 
 
 def test_learned_sort_order_numeric_attempt_before_ten() -> None:
     beads = FakeBeads([Bead("b", kind="impl", labels=["kind:impl", "unit:u"])])
     beads.add_comment("b", "learned: [b#10#1] ten")
     beads.add_comment("b", "learned: [b#2#1] two")
-    assert [line.attempt for line in list_lines(beads)] == [2, 10]
+    assert [line.attempt for line in list_lines(beads, stages=RESEARCH)] == [2, 10]
 
 
 def test_learned_bead_field_is_marker_bead_not_carrier() -> None:
     """Decided: the listed bead is the bead named in the marker, not the carrier."""
     beads = FakeBeads([Bead("carrier", kind="impl", labels=["kind:impl", "unit:u"])])
     beads.add_comment("carrier", "learned: [other#1#1] x")
-    lines = list_lines(beads)
+    lines = list_lines(beads, stages=RESEARCH)
     assert [line.bead for line in lines] == ["other"]
 
 
@@ -66,7 +70,7 @@ def test_learned_leading_zero_markers_are_distinct() -> None:
     beads = FakeBeads([Bead("b", kind="impl", labels=["kind:impl", "unit:u"])])
     beads.add_comment("b", "learned: [b#01#1] zero")
     beads.add_comment("b", "learned: [b#1#1] plain")
-    lines = list_lines(beads)
+    lines = list_lines(beads, stages=RESEARCH)
     assert len(lines) == 2
     assert [line.text for line in lines] == ["zero", "plain"]  # marker text tiebreak: "01" < "1"
 
@@ -80,7 +84,7 @@ def test_learned_curated_comment_on_marker_target_without_kind_label() -> None:
     ])
     beads.add_comment("carrier", "learned: [other#1#1] x")
     beads.add_comment("other", "curated: [learned:other#1#1] -> drop")
-    assert list_lines(beads) == []
+    assert list_lines(beads, stages=RESEARCH) == []
 
 
 class BeadNotFoundForOneBead(FakeBeads):
@@ -100,7 +104,7 @@ def test_learned_marker_target_bead_not_found_is_skipped_not_raised() -> None:
     simply skipped."""
     beads = BeadNotFoundForOneBead([Bead("carrier", kind="impl", labels=["kind:impl", "unit:u"])], missing="gone")
     beads.add_comment("carrier", "learned: [gone#1#1] x")
-    lines = list_lines(beads)
+    lines = list_lines(beads, stages=RESEARCH)
     assert [line.bead for line in lines] == ["gone"]
 
 
@@ -118,7 +122,7 @@ class RuntimeErrorForOneBead(FakeBeads):
 def test_learned_marker_target_bead_runtime_error_is_skipped_not_raised() -> None:
     beads = RuntimeErrorForOneBead([Bead("carrier", kind="impl", labels=["kind:impl", "unit:u"])], missing="gone")
     beads.add_comment("carrier", "learned: [gone#1#1] x")
-    lines = list_lines(beads)
+    lines = list_lines(beads, stages=RESEARCH)
     assert [line.bead for line in lines] == ["gone"]
 
 
@@ -145,7 +149,7 @@ def test_learned_curated_comment_on_another_bead_still_counts() -> None:
     ])
     beads.add_comment("b", "learned: [b#1#1] x")
     beads.add_comment("c", "curated: [learned:b#1#1] -> drop")
-    assert list_lines(beads) == []
+    assert list_lines(beads, stages=RESEARCH) == []
 
 
 def test_learned_regex_ascii_digits_only_ten_digit_attempt_no_match() -> None:
@@ -153,30 +157,30 @@ def test_learned_regex_ascii_digits_only_ten_digit_attempt_no_match() -> None:
     big = "1" * 10
     beads = FakeBeads([Bead("b", kind="impl", labels=["kind:impl", "unit:u"])])
     beads.add_comment("b", f"learned: [b#{big}#1] x")
-    assert list_lines(beads) == []
+    assert list_lines(beads, stages=RESEARCH) == []
     assert LINE_RE.fullmatch(f"learned: [b#{big}#1] x") is None
 
 
 def test_learned_regex_unicode_digits_no_match() -> None:
     beads = FakeBeads([Bead("b", kind="impl", labels=["kind:impl", "unit:u"])])
     beads.add_comment("b", "learned: [b#１#1] x")  # fullwidth "1", not ASCII
-    assert list_lines(beads) == []
+    assert list_lines(beads, stages=RESEARCH) == []
 
 
 def test_learned_mark_comment_text_replay_unknown_and_curated_label() -> None:
     beads = FakeBeads([Bead("b", kind="impl", labels=["kind:impl", "unit:u"])])
     beads.add_comment("b", "learned: [b#1#1] one")
     beads.add_comment("b", "missing_context: [b#1#1] two")
-    assert mark(beads, "learned:b#1#1", "memory") == 0
+    assert mark(beads, "learned:b#1#1", "memory", stages=RESEARCH) == 0
     assert beads.comments("b")[-1].text == "curated: [learned:b#1#1] -> memory"
     assert "curated" not in beads.show("b").labels
-    assert mark(beads, "learned:b#1#1", "memory") == 0
+    assert mark(beads, "learned:b#1#1", "memory", stages=RESEARCH) == 0
     assert len(beads.comments("b")) == 3
-    assert mark(beads, "missing_context:b#1#1", "drop") == 0
+    assert mark(beads, "missing_context:b#1#1", "drop", stages=RESEARCH) == 0
     assert beads.comments("b")[-1].text == "curated: [missing_context:b#1#1] -> drop"
     assert "curated" in beads.show("b").labels
     with pytest.raises(ValueError):
-        mark(beads, "learned:nope#1#1", "drop")
+        mark(beads, "learned:nope#1#1", "drop", stages=RESEARCH)
 
 
 def test_learned_mark_unknown_marker_text_variants_are_rejected() -> None:
@@ -185,11 +189,11 @@ def test_learned_mark_unknown_marker_text_variants_are_rejected() -> None:
     beads = FakeBeads([Bead("t-a7v", kind="impl", labels=["kind:impl", "unit:u"])])
     beads.add_comment("t-a7v", "learned: [t-a7v#1#1] only line")
     with pytest.raises(ValueError, match="unknown marker"):
-        mark(beads, "learned:t-a7v#01#1", "drop")
+        mark(beads, "learned:t-a7v#01#1", "drop", stages=RESEARCH)
     with pytest.raises(ValueError, match="unknown marker"):
-        mark(beads, "learned:t-a7v#1#01", "drop")
+        mark(beads, "learned:t-a7v#1#01", "drop", stages=RESEARCH)
     with pytest.raises(ValueError, match="unknown marker"):
-        mark(beads, "learned:t-a7v#١#1", "drop")  # Arabic-Indic digit one
+        mark(beads, "learned:t-a7v#١#1", "drop", stages=RESEARCH)  # Arabic-Indic digit one
     assert len(beads.comments("t-a7v")) == 1  # nothing written by the rejected marks
 
 
@@ -200,7 +204,7 @@ def test_learned_mark_replay_of_curated_marker_still_matches() -> None:
     beads.add_comment("b", "learned: [b#1#1] x")
     beads.add_comment("b", "curated: [learned:b#1#1] -> drop")
     assert "curated" not in beads.show("b").labels
-    assert mark(beads, "learned:b#1#1", "drop") == 0
+    assert mark(beads, "learned:b#1#1", "drop", stages=RESEARCH) == 0
     assert "curated" in beads.show("b").labels
 
 
@@ -211,10 +215,10 @@ def test_learned_mark_replay_after_crash_before_label_adds_label() -> None:
     beads.add_comment("b", "learned: [b#1#1] x")
     beads.add_comment("b", "curated: [learned:b#1#1] -> drop")  # comment landed, label did not
     assert "curated" not in beads.show("b").labels
-    assert mark(beads, "learned:b#1#1", "drop") == 0
+    assert mark(beads, "learned:b#1#1", "drop", stages=RESEARCH) == 0
     assert "curated" in beads.show("b").labels
     comments_before = len(beads.comments("b"))
-    assert mark(beads, "learned:b#1#1", "drop") == 0  # double replay changes nothing
+    assert mark(beads, "learned:b#1#1", "drop", stages=RESEARCH) == 0  # double replay changes nothing
     assert len(beads.comments("b")) == comments_before
     assert beads.show("b").labels.count("curated") == 1
 
@@ -294,11 +298,11 @@ def test_learned_mark_missing_target_bead_curates_source_and_skips_label() -> No
     second comment."""
     beads = FakeBeads([Bead("carrier", kind="impl", labels=["kind:impl", "unit:u"])])
     beads.add_comment("carrier", "learned: [gone#1#1] x")
-    assert mark(beads, "learned:gone#1#1", "drop") == 0
+    assert mark(beads, "learned:gone#1#1", "drop", stages=RESEARCH) == 0
     assert beads.comments("carrier")[-1].text == "curated: [learned:gone#1#1] -> drop"
-    assert list_lines(beads) == []
+    assert list_lines(beads, stages=RESEARCH) == []
     comments_before = len(beads.comments("carrier"))
-    assert mark(beads, "learned:gone#1#1", "drop") == 0
+    assert mark(beads, "learned:gone#1#1", "drop", stages=RESEARCH) == 0
     assert len(beads.comments("carrier")) == comments_before
 
 
@@ -315,7 +319,7 @@ def test_learned_mark_already_check_lets_runtime_error_propagate() -> None:
     )
     beads.add_comment("carrier", "learned: [target#1#1] x")
     with pytest.raises(RuntimeError):
-        mark(beads, "learned:target#1#1", "memory")
+        mark(beads, "learned:target#1#1", "memory", stages=RESEARCH)
     assert beads.comments("carrier") == [Comment("c0", "carrier", "helios", "learned: [target#1#1] x")]
     assert beads._comments.get("target", []) == []
 
@@ -331,8 +335,8 @@ def test_real_bd_learned_comments_mark_and_label(tmp_path: Path) -> None:
     created = subprocess.run(["bd", "create", "--title", "learn", "--labels", "kind:impl,unit:u", "--silent"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
     beads = __import__("helios.beads", fromlist=["Beads"]).Beads(tmp_path)
     beads.add_comment(created, f"learned: [{created}#1#1] text")
-    assert [line.text for line in list_lines(beads)] == ["text"]
-    assert mark(beads, f"learned:{created}#1#1", "memory") == 0
+    assert [line.text for line in list_lines(beads, stages=RESEARCH)] == ["text"]
+    assert mark(beads, f"learned:{created}#1#1", "memory", stages=RESEARCH) == 0
     assert "curated" in beads.show(created).labels
 
 
@@ -342,10 +346,10 @@ def test_real_bd_learned_mark_missing_target_bead_curates_source(tmp_path: Path)
     created = subprocess.run(["bd", "create", "--title", "learn", "--labels", "kind:impl,unit:u", "--silent"], cwd=tmp_path, check=True, capture_output=True, text=True).stdout.strip()
     beads = __import__("helios.beads", fromlist=["Beads"]).Beads(tmp_path)
     beads.add_comment(created, "learned: [gone#1#1] text")
-    assert [line.text for line in list_lines(beads)] == ["text"]
-    assert mark(beads, "learned:gone#1#1", "drop") == 0
+    assert [line.text for line in list_lines(beads, stages=RESEARCH)] == ["text"]
+    assert mark(beads, "learned:gone#1#1", "drop", stages=RESEARCH) == 0
     assert beads.comments(created)[-1].text == "curated: [learned:gone#1#1] -> drop"
-    assert list_lines(beads) == []
+    assert list_lines(beads, stages=RESEARCH) == []
     comments_before = len(beads.comments(created))
-    assert mark(beads, "learned:gone#1#1", "drop") == 0
+    assert mark(beads, "learned:gone#1#1", "drop", stages=RESEARCH) == 0
     assert len(beads.comments(created)) == comments_before

@@ -11,10 +11,14 @@ from typing import Any
 
 import pytest
 
-from helios import control
+from helios import control, stageset
 from helios.beads import Bead, FakeBeads
 from helios.envelope import AgentReport, Envelope, Finding
 from helios.stageset import StageSet, StageSpec
+
+#: Every test here exercises research stage behavior unless it builds its own StageSet,
+#: so this is what a direct call passes now that control's functions take no default.
+RESEARCH = stageset.research()
 
 
 def finding(verdict: str) -> Finding:
@@ -74,13 +78,13 @@ def test_candidates_filter_status_kind_unit_and_keep_bd_order() -> None:
         bead("second"),
         bead("first"),
     ]
-    assert [item.id for item in control.candidates(ReadyInBdOrder(rows), "u")] == ["second", "first"]
+    assert [item.id for item in control.candidates(ReadyInBdOrder(rows), "u", stages=RESEARCH)] == ["second", "first"]
 
 
 def test_next_skips_stop_at_and_passes_run_code(capsys: pytest.CaptureFixture[str]) -> None:
     calls: list[str] = []
     rows = [bead("manual", "model"), bead("run", "impl")]
-    result = control.next_bead(ReadyInBdOrder(rows), unit="u", stop_at=("model",), run=lambda item: calls.append(item.id) or 7, read_envelope=lambda item: mk_envelope(item.id))
+    result = control.next_bead(ReadyInBdOrder(rows), unit="u", stop_at=("model",), run=lambda item: calls.append(item.id) or 7, read_envelope=lambda item: mk_envelope(item.id), stages=RESEARCH)
     assert result == 7
     assert calls == ["run"]
     assert capsys.readouterr().out == "run#1\tcompleted\tdone\t-\tok\n"
@@ -90,7 +94,7 @@ def test_next_line_verdict_is_overall_verdict_of_findings(capsys: pytest.Capture
     """SPEC section 4.2/11: the verdict column is overall_verdict(findings), never a
     ``report["verdict"]`` field, which AgentReport does not have."""
     rows = [bead("v", "verify-code")]
-    result = control.next_bead(ReadyInBdOrder(rows), unit="u", stop_at=(), run=lambda _item: 0, read_envelope=lambda item: mk_envelope(item.id, kind="verify-code", verdict="inconclusive"))
+    result = control.next_bead(ReadyInBdOrder(rows), unit="u", stop_at=(), run=lambda _item: 0, read_envelope=lambda item: mk_envelope(item.id, kind="verify-code", verdict="inconclusive"), stages=RESEARCH)
     assert result == 0
     assert capsys.readouterr().out == "v#1\tcompleted\tdone\tinconclusive\tok\n"
 
@@ -100,7 +104,7 @@ def test_next_envelope_line_uses_dashes_when_no_report(capsys: pytest.CaptureFix
     verdict and summary; attempt_id and execution_status still come from the envelope."""
     rows = [bead("b")]
     e = mk_envelope("b", execution_status="missing_output", with_report=False)
-    assert control.next_bead(ReadyInBdOrder(rows), unit="u", stop_at=(), run=lambda _item: 0, read_envelope=lambda _item: e) == 0
+    assert control.next_bead(ReadyInBdOrder(rows), unit="u", stop_at=(), run=lambda _item: 0, read_envelope=lambda _item: e, stages=RESEARCH) == 0
     assert capsys.readouterr().out == "b#1\tmissing_output\t-\t-\t-\n"
 
 
@@ -119,6 +123,7 @@ def test_next_missing_envelope_after_in_place_recovery_uses_run_code(capsys: pyt
         run=lambda _item: 2,
         read_envelope=lambda _item: None,
         attempt_state=lambda _item: state,
+        stages=RESEARCH,
     )
     assert code == 2
     captured = capsys.readouterr()
@@ -136,13 +141,14 @@ def test_next_missing_envelope_with_run_code_zero_is_exit_four(capsys: pytest.Ca
         stop_at=(),
         run=lambda _item: 0,
         read_envelope=lambda _item: None,
+        stages=RESEARCH,
     )
     assert code == 4
     assert capsys.readouterr().err == "helios: execution failure for b: missing envelope\n"
 
 
 def test_next_no_candidate_is_prefixed_stderr_and_exit_three(capsys: pytest.CaptureFixture[str]) -> None:
-    assert control.next_bead(FakeBeads(), unit=None, stop_at=(), run=lambda _item: 0, read_envelope=lambda _item: None) == 3
+    assert control.next_bead(FakeBeads(), unit=None, stop_at=(), run=lambda _item: 0, read_envelope=lambda _item: None, stages=RESEARCH) == 3
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "helios: no ready bead\n"
@@ -153,7 +159,7 @@ def test_next_run_raising_is_execution_failure_exit_four(capsys: pytest.CaptureF
         raise RuntimeError("kaboom")
 
     rows = [bead("b")]
-    assert control.next_bead(ReadyInBdOrder(rows), unit="u", stop_at=(), run=boom, read_envelope=lambda item: mk_envelope(item.id)) == 4
+    assert control.next_bead(ReadyInBdOrder(rows), unit="u", stop_at=(), run=boom, read_envelope=lambda item: mk_envelope(item.id), stages=RESEARCH) == 4
     assert capsys.readouterr().err == "helios: execution failure for b: RuntimeError: kaboom\n"
 
 
@@ -162,7 +168,7 @@ def test_next_read_envelope_raising_is_execution_failure_exit_four(capsys: pytes
         raise ValueError("bad json")
 
     rows = [bead("b")]
-    assert control.next_bead(ReadyInBdOrder(rows), unit="u", stop_at=(), run=lambda _item: 0, read_envelope=boom) == 4
+    assert control.next_bead(ReadyInBdOrder(rows), unit="u", stop_at=(), run=lambda _item: 0, read_envelope=boom, stages=RESEARCH) == 4
     assert capsys.readouterr().err == "helios: execution failure for b: ValueError: bad json\n"
 
 
@@ -176,6 +182,7 @@ def run_unit(
     run: Any = lambda _item: 0,
     read: Any = lambda item: mk_envelope(item.id, kind=item.kind),
     attempt_state: Any = None,
+    stages: StageSet = RESEARCH,
 ) -> tuple[control.UnitResult, str]:
     result = control.unit_run(
         ReadyInBdOrder(rows),
@@ -187,6 +194,7 @@ def run_unit(
         run=run,
         read_envelope=read,
         attempt_state=attempt_state,
+        stages=stages,
     )
     return result, result.reason
 
@@ -416,6 +424,7 @@ def test_next_unchanged_finalized_attempt_is_execution_failure_using_run_code(
         run=lambda _item: 2,
         read_envelope=lambda item: mk_envelope(item.id),
         attempt_state=lambda _item: control.AttemptState(number=5, finalized=True),
+        stages=RESEARCH,
     )
     assert code == 2
     assert capsys.readouterr().err == "helios: execution failure for b: no new attempt\n"
@@ -431,6 +440,7 @@ def test_next_new_attempt_number_is_read_normally(capsys: pytest.CaptureFixture[
         run=lambda _item: 0,
         read_envelope=lambda item: mk_envelope(item.id),
         attempt_state=lambda _item: next(states),
+        stages=RESEARCH,
     )
     assert code == 0
     assert capsys.readouterr().out == "b#1\tcompleted\tdone\t-\tok\n"
@@ -446,6 +456,7 @@ def test_next_in_place_recovery_of_unfinalized_attempt_reads_envelope(capsys: py
         run=lambda _item: 0,
         read_envelope=lambda item: mk_envelope(item.id, attempt=1),
         attempt_state=lambda _item: state,
+        stages=RESEARCH,
     )
     assert code == 0
     assert capsys.readouterr().out == "b#1\tcompleted\tdone\t-\tok\n"
