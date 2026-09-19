@@ -58,3 +58,4 @@
 {"id":"int-8edaeb22e10ffb1c783c905d736f2ca4","kind":"field_change","created_at":"2026-09-18T23:44:36.645158Z","actor":"claude","issue_id":"hel-f1g","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
 {"id":"int-2840164e1e507a56a26edd20b085dab9","kind":"field_change","created_at":"2026-09-18T23:44:37.662721Z","actor":"claude","issue_id":"hel-xev","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
 {"id":"int-8525ca4c0e0c792f02875ba8c9713019","kind":"field_change","created_at":"2026-09-18T23:44:38.188287Z","actor":"claude","issue_id":"hel-5eh","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Closed"}}
+{"id":"int-af013120d901d13fc6587d29353d0af7","kind":"field_change","created_at":"2026-09-19T00:38:26.096406Z","actor":"claude","issue_id":"hel-i5l","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}

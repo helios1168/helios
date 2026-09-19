@@ -78,6 +78,69 @@ arguments and calls it.
 
 ## 3. Stages
 
+A stage set is data, not code. A hub declares its stages in `workflow.toml` (§5) and helios reads
+them; the dispatch core knows a stage only through the fields of §3.1. A hub that declares none gets
+the research stage set of §3.2, so that set is a shipped default rather than the definition of a
+stage. General purpose use is therefore the same mechanism as research use with a different
+declaration, not a documented workaround.
+
+Core and pack. The dispatch core is everything that runs a bead and records what happened: the
+result contracts (§4), configuration (§5), the run pipeline (§7), sessions and recovery (§8, §9),
+control (§11), merge (§12), memory (§13, §14) and telemetry (§21). It contains no stage id. The
+research pack is the declaration of §3.2, the unit file of §10.1, the stage semantics named in the
+§3.2 table, and the program and claims modules of §15. A rule that names a research stage belongs to
+the pack by definition.
+
+### 3.1 Declaring a stage set
+
+```toml
+[[stage]]
+id = "impl"
+requires = ["files", "test"]
+author = "implement"
+gate = "report"
+ownership = "files"
+
+[[stage]]
+id = "verify-code"
+verifies = "impl"
+requires = ["unit", "parent"]
+author = "other"
+gate = "verdict"
+ownership = "artifacts"
+```
+
+Declaration order is stage order: it sets candidate order (§11) and the order `helios unit new`
+builds a chain in (§10.2). The fields:
+
+- `id`, required and unique, matching `[a-z][a-z0-9-]*`. It is the bead's `kind`, its `kind:<id>`
+  label, and the directory of its skill, `skills/<id>/SKILL.md` (§7.1, §7.2).
+- `requires`, what preflight demands of a bead of this stage, any of `files`, `test`, `unit`,
+  `parent` and `model` (§7.1). Default empty, which demands nothing.
+- `author`, a key of `[agents]` (§5) naming who runs the stage, or `other` for the not-the-author
+  rule of §5. Required.
+- `gate`, how §11 judges a finished bead: `report` judges the report status, `verdict` judges the
+  overall verdict, `none` judges neither. Default `report`.
+- `ownership`, which changed paths a bead of this stage may own (§7.4): `files` allows the bead's
+  `files` plus `project.always_allowed`, `artifacts` allows `project.verify_artifacts/<unit>/` only,
+  `none` allows any path. Default `files`. Under every mode `.git`, the memory export directory and
+  anything matching `project.confidential` stay rejected.
+- `verifies`, the id of the stage this stage checks. That stage's bead is this bead's `parent`, and
+  its `output_commit` is the base commit of a fresh worktree (§7.3). Absent on a stage that checks
+  nothing, which is what makes a stage a verify stage or not.
+- `scaffold`, whether `helios unit new` offers the stage (§10.2). Default true.
+
+A stage set is refused with `helios: ` and exit 2 when an id repeats or is malformed, when
+`verifies` names an undeclared stage, when `author` names a role that `[agents]` does not declare,
+or when `requires`, `gate` or `ownership` takes a value outside its list. The refusal names the
+stage and the field.
+
+### 3.2 The shipped research stage set
+
+These ten stages are what a hub gets when it declares none. The `author role`, `verifier` and
+`done when` columns are the prose form of `author`, the `verifies` pointing back at the stage, and
+`gate`.
+
 | id | input | output | author role | verifier | done when |
 | --- | --- | --- | --- | --- | --- |
 | `frame` | question in the owner's words | `docs/PROBLEM.md` with R ids, ★ gates, Q-list | orchestrator with the user | `frame-review` | every ★ that blocks `model` is a closed gate |
@@ -90,6 +153,14 @@ arguments and calls it.
 | `verify-validate` | manifest, results | reproduction of every result behind a conclusion plus boundary cases | not the validate author | none | reproduced within the stated tolerance |
 | `report` | adopted results, unit files | note, figures, `PROVENANCE.md`, `reproduce.sh` | orchestrator | the user | the user signs off |
 | `remember` | `learned` and `missing_context` lines | memories, template fixes | orchestrator only | none | the learned queue for the unit is empty (§14) |
+
+As declarations, the ten carry: `requires` of `files` and `test` on `impl` and `validate`, of `unit`
+and `parent` on the three verify stages, and additionally `model` on `verify-math`; `gate` of
+`report` on `impl` and `validate`, `verdict` on the verify stages and `none` on `frame`, `survey`,
+`model`, `report` and `remember`; `ownership` of `artifacts` on the verify stages and `files` on the
+rest; `verifies` of `model`, `impl` and `validate` on `verify-math`, `verify-code` and
+`verify-validate`; and `scaffold` false on `remember` alone, which is why `helios unit new` does not
+offer it.
 
 Loops: a refuted `verify-math` reopens `model` with the counterexample pasted into the unit file.
 A refuted `verify-code` opens a bug bead on the unit; the verify bead stays open. A validation
@@ -209,12 +280,14 @@ errors naming the dotted key. `templates/workflow.toml` is the commented templat
 | `project.always_allowed` | `["tests/"]` | path prefixes any impl bead may touch |
 | `project.program` | none | module exposing `REGISTRY` (§15) |
 | `project.claims` | none | module holding `@claim` functions (§15) |
-| `agents.orchestrate` | `"claude"` | harness of the orchestrator |
-| `agents.implement` | `"codex"` | agent spec for `impl` and `validate` |
-| `agents.model` | `"claude"` | agent spec for `model` |
-| `agents.verify_code` | `"other"` | agent spec for `verify-code` |
-| `agents.verify_math` | `"other"` | agent spec for `verify-math` |
-| `agents.verify_validate` | `"other"` | agent spec for `verify-validate` |
+| `stage[].id` | none | stage id, `[a-z][a-z0-9-]*`, unique in the list (§3.1) |
+| `stage[].requires` | `[]` | preflight demands: `files`, `test`, `unit`, `parent`, `model` (§3.1) |
+| `stage[].author` | none | a key of `[agents]`, or `other` (§3.1) |
+| `stage[].gate` | `"report"` | `report`, `verdict` or `none` (§3.1, §11) |
+| `stage[].ownership` | `"files"` | `files`, `artifacts` or `none` (§3.1, §7.4) |
+| `stage[].verifies` | none | id of the stage this stage checks (§3.1) |
+| `stage[].scaffold` | `true` | whether `helios unit new` offers the stage (§10.2) |
+| `agents.<role>` | see below | agent spec for the role a stage's `author` names |
 | `agents.verify_order` | `["claude", "codex", "opencode", "agy"]` | how `other` is resolved |
 | `harness.<name>.binary` | the harness name | executable |
 | `harness.<name>.model` | none | passed to the CLI |
@@ -223,8 +296,8 @@ errors naming the dotted key. `templates/workflow.toml` is the commented templat
 | `harness.<name>.extra_args` | `[]` | appended before the prompt |
 | `harness.opencode.server_url` | none | attach to `opencode serve` when set |
 | `control.default` | `"manual"` | `manual`, `until` or `auto` (§11) |
-| `control.until` | `"verify-code"` | stop stage for an unqualified `unit run` |
-| `control.stop_at` | `["frame", "model", "report"]` | stages that always start by hand |
+| `control.until` | `"verify-code"` with the §3.2 set, else none | stop stage for an unqualified `unit run` |
+| `control.stop_at` | `["frame", "model", "report"]` with the §3.2 set, else `[]` | stages that always start by hand |
 | `control.confirm` | `["merge"]` | stages the orchestrator asks before starting |
 | `memory.backend` | `"beads"` | `beads` or `files` (§13) |
 | `memory.export_dir` | `".helios/memories"` | files export of the beads backend |
@@ -235,12 +308,27 @@ errors naming the dotted key. `templates/workflow.toml` is the commented templat
 | `telemetry.service_name` | `"helios"` | OpenTelemetry service name |
 | `tolerance.<tier>` | none | named numeric tolerances for skills and claims |
 
-Agent spec syntax: `harness` or `harness:profile`, or `other`. `other` is valid only for verify
-stages; `other` configured for a non-verify stage is a refusal. `other` resolves to the first
-harness in `agents.verify_order` that differs from the author's harness. The author is the
-`author` metadata of the parent bead, an agent spec; its harness is the part before any `:`, so
-author `claude:opus` excludes `claude`. When no harness in `agents.verify_order` differs, the
-stage is refused with `helios: no harness in agents.verify_order differs from <harness>`. The
+`[[stage]]` is an array of tables, one entry per stage, described field by field in §3.1. An array
+of tables is used rather than a table keyed by id for the same reason as `[[project.check]]`: the
+order of the entries is the stage order, and a TOML table does not preserve order. A file with no
+`[[stage]]` entry gets the research stage set of §3.2, which is how every hub written before stages
+were declarable keeps working.
+
+`[agents]` is open keyed. Any key is a role a stage's `author` may name, and its value is an agent
+spec. The documented roles, which are the ones the §3.2 set names, are `orchestrate` defaulting to
+`claude`, `implement` defaulting to `codex`, `model` defaulting to `claude`, and `verify_code`,
+`verify_math` and `verify_validate` each defaulting to `other`. A stage whose `author` names a role
+that `[agents]` does not declare is refused with `helios: stage <id> author <role> is not a key of
+[agents]`, exit 2. That refusal is what replaces the closed key list as the defence against a typo.
+
+Agent spec syntax: `harness` or `harness:profile`, or `other`. `other` is valid only for a stage
+that declares `verifies`; `other` on a stage that checks nothing is a refusal, because there is no
+author to differ from. `other` resolves to the first harness in `agents.verify_order` that differs
+from the author's harness. The author is the
+`author` metadata of the parent bead, meaning the bead of the stage named by `verifies`; its harness
+is the part before any `:`, so author `claude:opus` excludes `claude`. When no harness in
+`agents.verify_order` differs, the stage is refused with `helios: no harness in
+agents.verify_order differs from <harness>`. The
 resolved harness is recorded on the bead.
 
 `[[project.check]]` is an array of tables; each entry is an ordered, named check with keys
@@ -438,9 +526,10 @@ These apply to claude, codex, opencode and agy.
    refusal is written to stderr with the prefix `preflight: `, for example `preflight: .gitignore
    must ignore .helios/runs/`; that prefix is what distinguishes a refusal raised by preflight
    from one raised by the command itself (`helios: `):
-   - `impl` and `validate` need `files` and `test`; verify kinds need `unit` and `parent`, and
-     a verify bead without a worktree needs `output_commit` metadata on its parent (§7.3), so a
-     verify worktree is never created from `main` in any run mode.
+   - the bead carries whatever its stage's `requires` lists (§3.1): `files`, `test`, `unit`,
+     `parent`, `model`. A bead of a stage that declares `verifies` and has no worktree yet also
+     needs `output_commit` metadata on its parent (§7.3), so such a worktree is never created
+     from `main` in any run mode.
    - every name in `memories` exists (preflight takes the memory lookup as a required argument);
      a name failing the §13 key rule, or equal to `schema_version`, does not exist. The files
      backend matches the exact name via a directory listing; on the beads backend a failing `bd
@@ -448,7 +537,8 @@ These apply to claude, codex, opencode and agy.
      `helios: memory lookup failed for <key>: <message>`, distinct from a name that does not
      exist. Every path in `docs` is an existing file (a directory is an error), and every
      `path#key` resolves to a section (§7.2);
-   - `verify-math` needs a substantive `## Model`. That section starts at the first level 2
+   - a stage whose `requires` lists `model` needs a substantive `## Model`. That section starts at
+     the first level 2
      heading whose text is exactly `Model` (not a `path#key` first-word match, so `### Model
      scope` never counts) and runs to the next heading of level 1 or 2. Its body counts the
      lines that are not headings in the §7.2 sense, not blank (whitespace only) and not the `_empty_` placeholder, each stripped of
@@ -535,9 +625,11 @@ attempt is finalized as a launch that never started: `execution_status` is `laun
 included, recorded as not run with detail `memory lookup failed`, and `output_commit` null. No
 bead close is written.
 
-Exit codes: 0 finalized with report `done` (impl, validate) or overall verdict `verified`
-(verify kinds); 3 report `partial`, `needs_input`, `needs_review` or `blocked`, or a verdict
-other than verified; 4 execution failure; 5 a helios check failed; 2 usage or preflight. With
+Exit codes follow the stage's `gate` (§3.1): 0 finalized with report `done` under gate `report`,
+or overall verdict `verified` under gate `verdict`, or a finalized attempt under gate `none`; 3
+report `partial`, `needs_input`, `needs_review` or `blocked` under gate `report`, or a verdict
+other than verified under gate `verdict`; 4 execution failure; 5 a helios check failed; 2 usage or
+preflight. With
 several beads the exit code is the highest per-bead code. A run that received SIGINT exits 4.
 
 Interrupts: `helios run` installs a SIGINT handler for its whole life, so KeyboardInterrupt is
@@ -623,8 +715,9 @@ so the bytes are identical across harnesses; a test asserts this.
 - `--again` on an existing worktree resets it to its branch tip (`git reset --hard` inside the
   worktree, then `git clean -fd -e .helios`). Earlier attempt records are never deleted.
 - Symlink each `link_into_worktrees` glob match from the hub; skip matches the hub lacks.
-- A new worktree for a verify kind starts at the parent bead's `output_commit` (metadata of the
-  bead named by `parent`) instead of `main`; preflight fails when that metadata is missing.
+- A new worktree for a stage that declares `verifies` (§3.1) starts at the parent bead's
+  `output_commit` (metadata of the bead named by `parent`) instead of `main`; preflight fails when
+  that metadata is missing.
 - Record `base_commit` as the worktree HEAD before launch.
 
 ### 7.4 Ownership
@@ -637,12 +730,14 @@ and then reverted on disk still counts), `git diff --cached --name-only --no-ren
 deleted path is checked too; `-z` keeps non-ASCII paths unquoted. An untracked symlink whose
 path matches a `project.link_into_worktrees` glob (§7.3) is not a change.
 
-Each path must match a `files` entry or start with a prefix in `project.always_allowed`. A
-`files` entry ending in `/` covers everything below that directory. Any other entry is a glob
-matched against the whole path: `*` and `?` never match `/`, `**` matches any number of path
-segments, `[...]` is a character class that never matches `/` and is negated by a leading `!`.
-So `src/*.py` owns `src/a.py` but not `src/sub/a.py`. Verify kinds may touch only
-`<verify_artifacts>/<unit>/`.
+Which paths a bead may own follows its stage's `ownership` field (§3.1). Under `files`, each path
+must match a `files` entry or start with a prefix in `project.always_allowed`. A `files` entry
+ending in `/` covers everything below that directory. Any other entry is a glob matched against the
+whole path: `*` and `?` never match `/`, `**` matches any number of path segments, `[...]` is a
+character class that never matches `/` and is negated by a leading `!`. So `src/*.py` owns
+`src/a.py` but not `src/sub/a.py`. Under `artifacts`, the bead may touch only
+`<verify_artifacts>/<unit>/`. Under `none`, any path passes this test, which is what a stage with no
+file list needs; the rejections below still apply.
 
 Always rejected, whatever the globs say: `.beads/`, `.helios/`, `.agents/`, the memory export
 directory, and anything matching `project.confidential`. Confidential globs follow the same
@@ -658,18 +753,20 @@ A comment has that kind and marker when its text starts with `<kind>: <marker>`;
 later in the text does not count.
 
 - metadata: `harness`, `session` (`<harness>:<session_id>`), `worktree`, `attempt`,
-  `execution_status`, `verdict` (verify kinds), `output_commit`.
+  `execution_status`, `verdict` (gate `verdict` only), `output_commit`.
 - comments: `event: [id] <execution_status> <status> <summary>`, one `learned: [id#k] <line>`
   per learned line, one `missing_context: [id#k] <line>`, one `followup: [id#k] <line>`, and
   `question: [id] <text>` when present.
-- close: an `impl` or `validate` bead closes when execution completed, the report is `done`,
-  and all helios checks passed. A verify bead closes only when additionally the overall verdict
-  is verified. Otherwise the bead stays `in_progress` and its state is recorded with
+- close: under gate `report` a bead closes when execution completed, the report is `done`, and all
+  helios checks passed. Under gate `verdict` it closes when additionally the overall verdict is
+  verified. Under gate `none` it closes when execution completed and all helios checks passed.
+  Otherwise the bead stays `in_progress` and its state is recorded with
   one `bd set-state <bead> run=<state>` call with the final state. The state is the first that
   applies:
   - `failed`: any execution failure (§4.4) or failed helios check;
   - `blocked`: report `blocked`;
-  - `waiting`: report `partial`, `needs_input` or `needs_review`, or a verify verdict other than verified.
+  - `waiting`: report `partial`, `needs_input` or `needs_review`, or under gate `verdict` a
+    verdict other than verified.
 - helios never reopens or deletes beads in this wave; the only label it adds is `curated` (§14).
 
 ## 8. Attempt lifecycle
@@ -948,13 +1045,14 @@ with `helios: unit <unit> is being created by another process`.
 
 1. Validate. Every failure exits 2 with a message on stderr before anything is written, the
    lock file aside:
-   - `--stages` split on `,` has no empty or duplicate items, every item is a stage id of §3
-     except `remember` (it never blocks, so it gets no bead), and the items are strictly
-     increasing in the row order of the §3 table;
-   - a verify stage (`verify-math`, `verify-code`, `verify-validate`) has an earlier non-verify
-     stage in the list, else `<stage> has no earlier stage to verify`;
-   - when `impl` or `validate` is present, `--files` (split on `,`, no empty items) and a
-     `--test` that is not empty or whitespace-only are given;
+   - `--stages` split on `,` has no empty or duplicate items, every item is a declared stage id
+     (§3.1) whose `scaffold` is true, and the items are strictly increasing in declaration order.
+     An item that is not declared is refused naming the declared ids; an item whose `scaffold` is
+     false is refused naming the stage, which is how `remember` stays out without being named here;
+   - a stage that declares `verifies` has the stage it verifies earlier in the list, else
+     `<stage> has no earlier stage to verify`;
+   - when a listed stage's `requires` includes `files`, `--files` (split on `,`, no empty items) is
+     given, and when it includes `test`, a `--test` that is not empty or whitespace-only is given;
    - every existing component of `<hub>/<project.units>` is a directory, checked with `lstat`; a
      component that is a symlink must resolve to a directory; the units directory, after
      resolving symlinks (`os.path.realpath`), lies inside the realpath of the hub, else
@@ -967,29 +1065,28 @@ with `helios: unit <unit> is being created by another process`.
    - every stage's author resolves (step 3).
 2. For each stage in order, reuse the bead that is not closed and carries labels `unit:<unit>`
    and `kind:<stage>`; else create one titled `<unit> <stage>: <title>` with those labels and
-   metadata `unit`, `kind`, `author`, and for `impl` and `validate` `files` and `test`. Metadata
+   metadata `unit`, `kind`, `author`, plus `files` and `test` for a stage whose `requires` asks for
+   them. Metadata
    is passed as one JSON object so every value keeps its JSON type. When more than one bead that
    is not closed carries both labels for a stage, exit 2 naming the stage and the bead ids,
    before any bead is created.
-3. `author` is the resolved agent spec of §5 for the stage: `model` takes `agents.model`, `impl`
-   and `validate` take `agents.implement`, each verify stage takes its `agents.verify_*` key, and
-   `frame`, `survey` and `report` take `agents.orchestrate`. `other` is valid only for verify
-   stages; `other` configured for a non-verify stage is a refusal. For a verify stage, `other`
-   resolves against the author of the stage's `parent` (the nearest earlier non-verify stage in
-   the list): the `author` metadata of the parent bead when step 2 reuses it, else the
-   configured author of the parent stage. A usable author is a string matching
-   `^(claude|codex|opencode|agy)(:[^\s]+)?$` (`re.fullmatch`); the harness is the part before the
-   first `:`, and being one of the four names is enough, whether or not it appears in
-   `agents.verify_order`. A reused parent bead whose author is not usable is a refusal
+3. `author` is the agent spec of the `[agents]` role named by the stage's `author` field (§3.1,
+   §5). `other` is valid only for a stage that declares `verifies`; `other` elsewhere is a refusal.
+   For such a stage, `other` resolves against the author of the stage named by `verifies`, which is
+   also its `parent`: the `author` metadata of the parent bead when step 2 reuses it, else the
+   configured author of that stage. A usable author is a string whose harness, the part before the
+   first `:`, is a harness the adapter registry knows (§6); being registered is enough, whether or
+   not it appears in `agents.verify_order`. A reused parent bead whose author is not usable is a
+   refusal
    `helios: parent bead <id> has no usable author`, exit 2, checked before the
-   `agents.verify_order` check, when the verify stage's configured author is `other`. When no
+   `agents.verify_order` check, when the stage's configured author is `other`. When no
    harness in `agents.verify_order` differs from the parent author's harness, the stage is
    refused with `helios: no harness in agents.verify_order differs from <harness>`. Only an
    `other` resolution records the bare harness name; an explicit agent spec is recorded verbatim.
    Every refusal of steps 1 and 3 happens before any bd write.
 4. Chain in list order: `bd dep add <later> <earlier>` for each adjacent pair, skipping a
-   dependency that already exists. A verify stage also records metadata `parent` = the bead of
-   its parent stage.
+   dependency that already exists. A stage that declares `verifies` also records metadata `parent`
+   = the bead of the stage it verifies.
 5. Write the unit file last: repeat the step 1 path checks (existing components, the
    realpath-inside-hub check, and writability) immediately before writing, then create missing
    parent directories and write with `open(path, "x")`. A failed re-check or an `OSError` here
@@ -1008,8 +1105,9 @@ Tests run against a real `bd init` in a temporary repository when `bd` is on PAT
 ## 11. Control
 
 Candidates are the beads from `bd ready --json` (through `helios.beads`) with status `open` that
-carry a `kind:<stage>` label naming a §3 stage, filtered by label `unit:<unit>` when a unit is
-given, in bd's order. The §3 stage order comes from `helios.stages.STAGES`. A `bd` error while
+carry a `kind:<stage>` label naming a declared stage, filtered by label `unit:<unit>` when a unit is
+given, in bd's order. Stage order is the declaration order of the configured stage set (§3.1). A
+`bd` error while
 listing candidates prints `helios: <message>` and exits 1.
 
 `next` and `unit run` call `helios.run.run_many`, passing it `helios run`'s memory check
@@ -1043,27 +1141,27 @@ nonzero, else 4.
   `control.stop_at`; otherwise it runs it and prints its line as `next` does. After a run it
   checks, in order:
   1. execution failure (the rule above).
-  2. `impl` and `validate` kinds: report status other than `done`, reason `bead <bead> report
+  2. a stage whose `gate` is `report`: report status other than `done`, reason `bead <bead> report
      status <status>`.
-  3. verify kinds (`helios.stages.VERIFY_STAGES`): verdict other than `verified`, missing
-     included, reason `bead <bead> verdict <verdict or ->`. Verify kinds are never judged on
-     report status.
+  3. a stage whose `gate` is `verdict`: verdict other than `verified`, missing included, reason
+     `bead <bead> verdict <verdict or ->`. Such a stage is never judged on report status.
   4. any other nonzero run code, reason `bead <bead> run exited <code>`.
   5. the bead's kind is the `until` stage: `until stage reached`, exit 0.
 
-  A kind that is neither `impl`, `validate` nor a verify kind (`frame`, `survey`, `model`,
-  `report`, `remember`) skips checks 2 and 3. It also stops when no candidate remains (an open
+  A stage whose `gate` is `none`, which in the §3.2 set means `frame`, `survey`, `model`, `report`
+  and `remember`, skips checks 2 and 3. It also stops when no candidate remains (an open
   gate or blocker), and when a candidate was already run in this invocation (reason `bead <id>
   still ready after its run`). On stopping it prints `stopped: <reason>` to stdout.
 - `unit run` exits 0 when it stopped after a successful `until` stage, 3 when it stopped at a
   `stop_at` kind or with no ready bead, else with the last run's code, or per the execution
   failure rule above at check 1.
 - `control.default`: `manual` makes `unit run` refuse without `--until` (exit 2); `until` uses
-  `control.until` when `--until` is absent; `auto` honors an explicit `--until` and otherwise
-  runs until a stop condition other than `until`. An unknown `control.default`, an `--until`
-  that is not a §3 stage, a `control.until` used when `--until` is absent that is not a §3
-  stage, or an `--until` stage with no bead of the unit (label `kind:<until>`) exits 2. These
-  value checks live in the control module, not in config loading.
+  `control.until` when `--until` is absent; `auto` honors an explicit `--until` and otherwise runs
+  until a stop condition other than `until`. An unknown `control.default`, an `--until` that is
+  not a declared stage, a `control.until` used when `--until` is absent that is not a declared
+  stage, or an `--until` stage with no bead of the unit (label `kind:<until>`) exits 2. A refusal
+  for an undeclared stage names the declared ids. These value checks live in the control module,
+  not in config loading.
 
 ## 12. Merge
 
