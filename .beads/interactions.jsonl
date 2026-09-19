@@ -62,3 +62,5 @@
 {"id":"int-8430689de8fa0a45aad80587d53b9dcd","kind":"field_change","created_at":"2026-09-19T01:04:26.436188Z","actor":"claude","issue_id":"hel-8p3","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
 {"id":"int-8347f7eb555fb954035a3427ccddf014","kind":"field_change","created_at":"2026-09-19T01:13:44.556946Z","actor":"claude","issue_id":"hel-j6s","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
 {"id":"int-58e2730bb5d4cdb9b1fbbac8df81d158","kind":"field_change","created_at":"2026-09-19T01:16:08.040843Z","actor":"claude","issue_id":"hel-263","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
+{"id":"int-8fc0bbede8cac1fb3b70a56246aab190","kind":"field_change","created_at":"2026-09-19T01:38:01.354514Z","actor":"claude","issue_id":"hel-4e2","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
+{"id":"int-cb0f5882c1279c958dee46e710bd5206","kind":"field_change","created_at":"2026-09-19T01:38:02.107745Z","actor":"claude","issue_id":"hel-961","extra":{"field":"status","new_value":"closed","old_value":"open","reason":"Closed"}}
