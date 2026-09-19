@@ -33,11 +33,10 @@ src/helios/              the CLI package
   commands/<name>.py     one module per subcommand
   envelope.py            result contracts (§4)
   harness/base.py        adapter interface (§6); one module per harness
-  templates/__init__.py  template lookup; workflow.toml and unit.md sit beside it as
-                         package data, so they ship inside the wheel
+  templates/__init__.py  template lookup; workflow.toml, unit.md and backends.toml sit
+                         beside it as package data, so they ship inside the wheel
 schemas/                 generated JSON Schemas; never edit by hand
 skills/<name>/SKILL.md   stage skills, Agent Skills format; skills/report-block.md shared
-templates/               backends.toml shipped to projects
 tests/                   pytest; tests/fixtures/native/<harness>/ holds recorded CLI output
 docs/SPEC.md             this file
 AGENTS.md                the worker contract (its "Worker contract" section)
@@ -1452,7 +1451,8 @@ or in different ones, are a step 1 problem (`<name>: duplicate claim name`), fou
 collected claim before `--backend`, `--covers` or name filters apply; this covers colliding
 lambdas, factories, `functools.wraps` pairs and `exec` blocks. Callable instances and
 `functools.partial` objects are valid claims. Backends and their allowed methods and scopes come
-from `backends.toml` (the project's `.agents/backends.toml`, else `templates/backends.toml`).
+from `backends.toml` (the project's `.agents/backends.toml`, else the packaged
+`src/helios/templates/backends.toml`, shipped inside the wheel).
 
 `helios claims check [--backend B] [--covers ID] [--timeout S]`:
 

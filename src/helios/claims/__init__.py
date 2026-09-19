@@ -17,6 +17,7 @@ from types import FrameType
 from typing import Any, Callable, TextIO
 
 from helios import program as prog
+from helios import templates
 from helios.envelope import Finding, Method, Scope, Verdict
 from pydantic import ValidationError
 
@@ -192,12 +193,12 @@ class Backend:
 
 
 def default_backends_path() -> Path:
-    """templates/backends.toml relative to the repository root."""
-    return Path(__file__).resolve().parents[3] / "templates" / "backends.toml"
+    """The packaged helios/templates/backends.toml, shipped inside the wheel."""
+    return templates.path("backends.toml")
 
 
 def backends_path(hub: Path) -> Path:
-    """The project .agents/backends.toml, else templates/backends.toml (SPEC §15.2)."""
+    """The project .agents/backends.toml, else the packaged one (SPEC §15.2)."""
     project = hub / ".agents" / "backends.toml"
     if project.is_file():
         return project
