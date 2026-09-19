@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from helios import stageset
 from helios.beads import Bead, BeadNotFound, Comment, FakeBeads
 from helios.learned import LINE_RE, list_lines, mark
 
@@ -129,7 +130,7 @@ def test_learned_command_marker_target_not_found_returns_zero(
     fake = BeadNotFoundForOneBead([Bead("carrier", kind="impl", labels=["kind:impl", "unit:u"])], missing="gone")
     fake.add_comment("carrier", "learned: [gone#1#1] x")
     monkeypatch.setattr(command, "Beads", lambda _hub: fake)
-    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path(".")))
+    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path("."), stages=stageset.research()))
     assert command.run(Namespace(unit=None, json=True, mark=None, decision=None)) == 0
     assert json.loads(capsys.readouterr().out) == [
         {"unit": "u", "bead": "gone", "attempt": 1, "kind": "learned", "k": 1, "text": "x"}
@@ -224,7 +225,7 @@ def test_learned_command_json_and_text_grouping(monkeypatch: pytest.MonkeyPatch,
     fake = FakeBeads([Bead("b", kind="impl", labels=["kind:impl", "unit:u"])])
     fake.add_comment("b", "learned: [b#2#1] text")
     monkeypatch.setattr(command, "Beads", lambda _hub: fake)
-    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path(".")))
+    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path("."), stages=stageset.research()))
     assert command.run(Namespace(unit=None, json=True, mark=None, decision=None)) == 0
     assert json.loads(capsys.readouterr().out) == [{"unit": "u", "bead": "b", "attempt": 2, "kind": "learned", "k": 1, "text": "text"}]
     assert command.run(Namespace(unit=None, json=False, mark=None, decision=None)) == 0
@@ -236,7 +237,7 @@ def test_learned_command_mark_flags_exit_two_and_unknown_marker_prefixed(monkeyp
 
     fake = FakeBeads()
     monkeypatch.setattr(command, "Beads", lambda _hub: fake)
-    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path(".")))
+    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path("."), stages=stageset.research()))
     for args in (
         Namespace(unit="u", json=False, mark="learned:b#1#1", decision="drop"),
         Namespace(unit=None, json=True, mark="learned:b#1#1", decision="drop"),
@@ -260,7 +261,7 @@ def test_learned_command_bd_runtime_error_on_list_is_prefixed_and_exit_one(
     from helios.commands import learned as command
 
     monkeypatch.setattr(command, "Beads", lambda _hub: FailingList())
-    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path(".")))
+    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path("."), stages=stageset.research()))
     assert command.run(Namespace(unit=None, json=False, mark=None, decision=None)) == 1
     assert capsys.readouterr().err == "helios: bd list failed: boom\n"
 
@@ -278,7 +279,7 @@ def test_learned_command_bd_runtime_error_on_mark_is_prefixed_and_exit_one(
     fake = FailingComment([Bead("b", kind="impl", labels=["kind:impl"])])
     fake._comments["b"] = [Comment("1", "b", "a", "learned: [b#1#1] x")]
     monkeypatch.setattr(command, "Beads", lambda _hub: fake)
-    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path(".")))
+    monkeypatch.setattr(command, "load", lambda _path: Namespace(hub=Path("."), stages=stageset.research()))
     assert command.run(Namespace(unit=None, json=False, mark="learned:b#1#1", decision="drop")) == 1
     assert capsys.readouterr().err == "helios: bd comment failed: boom\n"
 
