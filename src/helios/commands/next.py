@@ -34,6 +34,7 @@ def run(args: argparse.Namespace) -> int:
             run=run_bead,
             read_envelope=read_envelope,
             attempt_state=attempt_state,
+            stages=config.stages,
         )
     except RuntimeError as exc:
         print(f"helios: {exc}", file=sys.stderr)
