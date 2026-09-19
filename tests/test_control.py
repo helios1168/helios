@@ -14,6 +14,7 @@ import pytest
 from helios import control
 from helios.beads import Bead, FakeBeads
 from helios.envelope import AgentReport, Envelope, Finding
+from helios.stageset import StageSet, StageSpec
 
 
 def finding(verdict: str) -> Finding:
@@ -255,6 +256,33 @@ def test_unit_control_defaults_and_value_errors() -> None:
         run_unit([bead("b")], default="until", configured_until="wat")
     with pytest.raises(control.ControlError):
         run_unit([bead("b")], until="model")
+
+
+def test_unit_run_with_single_declared_stage_runs_its_loop(capsys: pytest.CaptureFixture[str]) -> None:
+    """A hub need not declare the research set: one stage whose gate is 'report' is
+    enough for candidates, the report-status stop check and 'until' to all work
+    through the configured stage set alone."""
+    stages = StageSet((StageSpec(id="work", author="implement", gate="report"),))
+    result = control.unit_run(
+        ReadyInBdOrder([bead("b", "work")]),
+        unit="u",
+        default="auto",
+        configured_until="work",
+        stop_at=(),
+        until="work",
+        run=lambda _item: 0,
+        read_envelope=lambda item: mk_envelope(item.id, kind="work"),
+        stages=stages,
+    )
+    assert (result.code, result.reason) == (0, "until stage reached")
+    assert capsys.readouterr().out.endswith("stopped: until stage reached\n")
+
+
+def test_validate_until_unknown_stage_names_declared_ids() -> None:
+    """SPEC section 11: a refusal for an undeclared stage names the declared ids."""
+    stages = StageSet((StageSpec(id="work", author="implement", gate="report"),))
+    with pytest.raises(control.ControlError, match=r"unknown until stage nope; declared: work"):
+        control.validate_until(FakeBeads(), "u", "nope", stages=stages)
 
 
 def test_unit_verify_kind_with_no_finding_reads_dash_verdict(capsys: pytest.CaptureFixture[str]) -> None:

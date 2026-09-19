@@ -6,23 +6,30 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from helios import stageset
 from helios.beads import Bead, BeadsLike
 from helios.envelope import Envelope, ExecutionStatus, Verdict, WorkStatus, overall_verdict
-from helios.stages import STAGES, VERIFY_STAGES
+
+#: The stage set a caller gets when it passes none of its own: the SPEC section 3.2 research
+#: set, the same default ``config.Config.stages`` falls back to for a hub with no ``[[stage]]``
+#: entries. A caller with its own configured stage set passes it as ``stages=``.
+_RESEARCH_STAGES = stageset.research()
 
 
 class ControlError(ValueError):
     """A control setting or unit request is invalid."""
 
 
-def candidates(beads: BeadsLike, unit: str | None = None) -> list[Bead]:
+def candidates(
+    beads: BeadsLike, unit: str | None = None, *, stages: stageset.StageSet = _RESEARCH_STAGES
+) -> list[Bead]:
     """Return open, staged ready beads in bd order (SPEC section 11)."""
     wanted = f"unit:{unit}" if unit else None
     return [
         bead
         for bead in beads.ready()
         if bead.status == "open"
-        and bead.kind in STAGES
+        and bead.kind in stages
         and f"kind:{bead.kind}" in bead.labels
         and (wanted is None or wanted in bead.labels)
     ]
@@ -123,6 +130,7 @@ def next_bead(
     run: Callable[[Bead], int],
     read_envelope: Callable[[Bead], Envelope | None],
     attempt_state: Callable[[Bead], AttemptState] | None = None,
+    stages: stageset.StageSet = _RESEARCH_STAGES,
 ) -> int:
     """Run the first candidate not covered by ``stop_at`` (SPEC section 11).
 
@@ -132,7 +140,7 @@ def next_bead(
     ``execution failure for <bead>: missing envelope``, exit the run's own code when
     nonzero else 4 (Decided).
     """
-    bead = next((b for b in candidates(beads, unit) if b.kind not in stop_at), None)
+    bead = next((b for b in candidates(beads, unit, stages=stages) if b.kind not in stop_at), None)
     if bead is None:
         print("helios: no ready bead", file=sys.stderr)
         return 3
@@ -154,10 +162,12 @@ class UnitResult:
     reason: str
 
 
-def validate_until(beads: Any, unit: str, until: str | None) -> str | None:
+def validate_until(
+    beads: Any, unit: str, until: str | None, *, stages: stageset.StageSet = _RESEARCH_STAGES
+) -> str | None:
     """Validate control values and return the effective until stage."""
-    if until is not None and until not in STAGES:
-        raise ControlError(f"unknown until stage {until}")
+    if until is not None and until not in stages:
+        raise ControlError(f"unknown until stage {until}; declared: {', '.join(stages.ids)}")
     if until is not None and not any(
         bead.kind == until and f"kind:{until}" in bead.labels
         for bead in beads.list(labels=[f"unit:{unit}"])
@@ -177,32 +187,33 @@ def unit_run(
     run: Callable[[Bead], int],
     read_envelope: Callable[[Bead], Envelope | None],
     attempt_state: Callable[[Bead], AttemptState] | None = None,
+    stages: stageset.StageSet = _RESEARCH_STAGES,
 ) -> UnitResult:
     """Run a unit until a SPEC section 11 stopping condition.
 
     After a run, the stop checks apply in this fixed order (Decided, binding):
     1. execution failure: no envelope, or ``execution_status`` is not ``completed``.
-    2. ``impl`` and ``validate`` kinds: report status other than ``done``.
-    3. verify kinds (``helios.stages.VERIFY_STAGES``): verdict other than ``verified``,
-       judged on the report's findings, never on its status.
+    2. a stage whose ``gate`` is ``report``: report status other than ``done``.
+    3. a stage whose ``gate`` is ``verdict``: verdict other than ``verified``, judged
+       on the report's findings, never on its status.
     4. any other nonzero run code (a failed helios check).
     5. the bead's kind is the ``until`` stage.
-    Kinds that are neither ``impl``, ``validate`` nor a verify kind skip checks 2 and 3.
+    A stage whose ``gate`` is ``none`` skips checks 2 and 3.
     """
     if default not in {"manual", "until", "auto"}:
         raise ControlError(f"unknown control.default {default}")
-    effective_until = validate_until(beads, unit, until)
+    effective_until = validate_until(beads, unit, until, stages=stages)
     if effective_until is None:
         if default == "manual":
             raise ControlError("manual control requires --until")
         if default == "until":
             effective_until = configured_until
-            validate_until(beads, unit, effective_until)
+            validate_until(beads, unit, effective_until, stages=stages)
 
     seen: set[str] = set()
     last_code = 3
     while True:
-        available = candidates(beads, unit)
+        available = candidates(beads, unit, stages=stages)
         if not available:
             reason = "no ready bead"
             print(f"stopped: {reason}")
@@ -235,11 +246,12 @@ def unit_run(
 
         report = envelope.report  # completed always carries a report (Envelope's own rule)
         assert report is not None
-        if bead.kind in ("impl", "validate") and report.status != WorkStatus.DONE:
+        stage = stages.get(bead.kind)
+        if stage.gate == "report" and report.status != WorkStatus.DONE:
             reason = f"bead {bead.id} report status {report.status}"
             print(f"stopped: {reason}")
             return UnitResult(code, reason)
-        if bead.kind in VERIFY_STAGES:
+        if stage.gate == "verdict":
             verdict = overall_verdict(report.findings)
             if verdict != Verdict.VERIFIED:
                 reason = f"bead {bead.id} verdict {verdict if verdict is not None else '-'}"

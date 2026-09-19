@@ -6,8 +6,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from helios import stageset
 from helios.beads import Bead, BeadNotFound, BeadsLike
-from helios.stages import STAGES
 
 # ASCII digits only, at most 9 of them, and the bead group cannot span "]", "#" or a newline
 # (Decided, replacing the SPEC section 14 regex).
@@ -15,6 +15,10 @@ LINE_RE = re.compile(
     r"^(learned|missing_context): \[([A-Za-z0-9][A-Za-z0-9._-]*)#([0-9]{1,9})#([0-9]{1,9})\] (.*)\Z",
     re.DOTALL,
 )
+
+#: The stage set a caller gets when it passes none of its own (see control.py's constant
+#: of the same purpose).
+_RESEARCH_STAGES = stageset.research()
 
 
 @dataclass(frozen=True)
@@ -30,11 +34,13 @@ class LearnedLine:
         return {"unit": self.unit, "bead": self.bead, "attempt": self.attempt, "kind": self.kind, "k": self.k, "text": self.text}
 
 
-def _helios_beads(beads: Any) -> list[Bead]:
-    return [bead for bead in beads.list() if bead.kind in STAGES and f"kind:{bead.kind}" in bead.labels]
+def _helios_beads(beads: Any, stages: stageset.StageSet = _RESEARCH_STAGES) -> list[Bead]:
+    return [bead for bead in beads.list() if bead.kind in stages and f"kind:{bead.kind}" in bead.labels]
 
 
-def _all_markers(beads: Any, unit: str | None = None) -> dict[str, tuple[Bead, LearnedLine]]:
+def _all_markers(
+    beads: Any, unit: str | None = None, *, stages: stageset.StageSet = _RESEARCH_STAGES
+) -> dict[str, tuple[Bead, LearnedLine]]:
     """Every distinct marker found on a helios-kind bead's comments, curated or not.
 
     Keyed by the exact bracketed marker text (``[<kind>:<bead>#<attempt>#<k>]``); the
@@ -44,7 +50,7 @@ def _all_markers(beads: Any, unit: str | None = None) -> dict[str, tuple[Bead, L
     unknown, and a replay of an already-curated marker still finds it).
     """
     found: dict[str, tuple[Bead, LearnedLine]] = {}
-    for bead in _helios_beads(beads):
+    for bead in _helios_beads(beads, stages):
         if unit is not None and f"unit:{unit}" not in bead.labels:
             continue
         bead_unit = next((label[5:] for label in bead.labels if label.startswith("unit:")), "-")
@@ -85,9 +91,11 @@ def _curated_texts(beads: Any, targets: set[str], *, strict: bool = False) -> li
     return curated
 
 
-def _lines(beads: Any, unit: str | None = None) -> list[tuple[Bead, LearnedLine]]:
-    found = _all_markers(beads, unit)
-    targets = {bead.id for bead in _helios_beads(beads)} | {item.bead for _bead, item in found.values()}
+def _lines(
+    beads: Any, unit: str | None = None, *, stages: stageset.StageSet = _RESEARCH_STAGES
+) -> list[tuple[Bead, LearnedLine]]:
+    found = _all_markers(beads, unit, stages=stages)
+    targets = {bead.id for bead in _helios_beads(beads, stages)} | {item.bead for _bead, item in found.values()}
     curated = _curated_texts(beads, targets)
     kept = [
         (marker, bead, item)
@@ -101,12 +109,14 @@ def _lines(beads: Any, unit: str | None = None) -> list[tuple[Bead, LearnedLine]
     return [(bead, item) for _marker, bead, item in ordered]
 
 
-def list_lines(beads: Any, unit: str | None = None) -> list[LearnedLine]:
+def list_lines(
+    beads: Any, unit: str | None = None, *, stages: stageset.StageSet = _RESEARCH_STAGES
+) -> list[LearnedLine]:
     """Return the curated-filtered learned queue."""
-    return [item for _bead, item in _lines(beads, unit)]
+    return [item for _bead, item in _lines(beads, unit, stages=stages)]
 
 
-def mark(beads: Any, marker: str, decision: str) -> int:
+def mark(beads: Any, marker: str, decision: str, *, stages: stageset.StageSet = _RESEARCH_STAGES) -> int:
     """Curate one queue entry, replaying an existing mark as a no-op.
 
     Decided: ``marker`` (``<kind>:<bead>#<attempt>#<k>``) must equal, as text, one of
@@ -124,7 +134,7 @@ def mark(beads: Any, marker: str, decision: str) -> int:
     if decision not in {"memory", "template", "drop"}:
         raise ValueError(f"unknown decision {decision}")
     bracketed = f"[{marker}]"
-    found = _all_markers(beads)
+    found = _all_markers(beads, stages=stages)
     if bracketed not in found:
         raise ValueError(f"unknown marker {marker}")
     source, item = found[bracketed]
@@ -138,12 +148,12 @@ def mark(beads: Any, marker: str, decision: str) -> int:
         target_exists = False
     write_bead = target_bead if target_exists else source.id
 
-    targets = {bead.id for bead in _helios_beads(beads)}
+    targets = {bead.id for bead in _helios_beads(beads, stages)}
     if target_exists:
         targets.add(target_bead)
     already = any(c.startswith(prefix) for c in _curated_texts(beads, targets, strict=True))
     if not already:
         beads.add_comment(write_bead, f"{prefix} -> {decision}")
-    if target_exists and not any(item.bead == target_bead for _bead, item in _lines(beads)):
+    if target_exists and not any(item.bead == target_bead for _bead, item in _lines(beads, stages=stages)):
         beads.add_label(target_bead, "curated")
     return 0
