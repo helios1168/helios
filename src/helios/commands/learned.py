@@ -25,13 +25,14 @@ def run(args: argparse.Namespace) -> int:
         print("helios: invalid learned options", file=sys.stderr)
         return 2
     try:
-        beads = Beads(load(Path.cwd()).hub)
+        config = load(Path.cwd())
     except (ValueError, TypeError, RecursionError) as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 2
+    beads = Beads(config.hub)
     if args.mark:
         try:
-            return queue.mark(beads, args.mark, args.decision)
+            return queue.mark(beads, args.mark, args.decision, stages=config.stages)
         except ValueError as exc:
             print(f"helios: {exc}", file=sys.stderr)
             return 2
@@ -39,7 +40,7 @@ def run(args: argparse.Namespace) -> int:
             print(f"helios: {exc}", file=sys.stderr)
             return 1
     try:
-        lines = queue.list_lines(beads, args.unit)
+        lines = queue.list_lines(beads, args.unit, stages=config.stages)
     except RuntimeError as exc:
         print(f"helios: {exc}", file=sys.stderr)
         return 1
