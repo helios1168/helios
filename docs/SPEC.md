@@ -136,11 +136,12 @@ builds a chain in (§10.2). The fields:
 - `scaffold`, whether `helios unit new` offers the stage (§10.2). Default true.
 
 A stage set is refused with `helios: ` and exit 2 when an id repeats or is malformed, when
-`verifies` names an undeclared stage or one not declared earlier in the list (which also refuses a
-verify cycle, since neither side of a cycle is declared earlier than the other), when `author`
-names a role that `[agents]` does not declare, when `requires`, `gate` or `ownership` takes a value
-outside its list, or when the array of `[[stage]]` entries is present and empty. The refusal names
-the stage and the field, except the empty set, which has no stage to name.
+`verifies` names the stage itself, an undeclared stage, or one not declared earlier in the list
+(which also refuses a verify cycle, since neither side of a cycle is declared earlier than the
+other), when `author` is `other` on a stage that declares no `verifies` to differ from, when
+`author` names a role that `[agents]` does not declare, when `requires`, `gate` or `ownership`
+takes a value outside its list, or when the array of `[[stage]]` entries is present and empty. The
+refusal names the stage and the field, except the empty set, which has no stage to name.
 
 ### 3.2 The shipped research stage set
 
