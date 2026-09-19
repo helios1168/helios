@@ -515,24 +515,21 @@ def test_no_core_module_tests_a_kind_against_a_stage_id_prefix() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_verifies_may_point_at_a_stage_declared_later() -> None:
-    """Verdict: accepted by the parser, and ``helios unit new`` can never use it.
+def test_verifies_may_not_point_at_a_stage_declared_later() -> None:
+    """Closed by hel-viy: a forward verifies is refused.
 
-    ``parse`` collects every id before it checks ``verifies``, so a forward reference is
-    legal. ``units._validate`` then refuses the stage whatever ``--stages`` says,
-    because the parent must appear *earlier* in the requested list, and the requested
-    list must be in declaration order. The set is accepted and one of its stages is
-    dead. SPEC section 3.1's refusal list does not cover this, so it is a spec gap
-    rather than a code defect, and the assertion below records today's behavior.
+    This was recorded as a spec gap, a set the parser accepted while units._validate could
+    never scaffold the stage, since the verified stage must appear earlier in the requested
+    list. SPEC section 3.1 now lists it and parse refuses it.
     """
-    stages = stageset.parse(
-        [
-            {"id": "checker", "author": "orchestrate", "verifies": "worker"},
-            {"id": "worker", "author": "orchestrate"},
-        ]
-    )
-    assert stages.parent_of("checker") == "worker"
-    assert stages.index("checker") < stages.index("worker")
+    with pytest.raises(stageset.StageSetError) as caught:
+        stageset.parse(
+            [
+                {"id": "checker", "author": "orchestrate", "verifies": "worker"},
+                {"id": "worker", "author": "orchestrate"},
+            ]
+        )
+    assert "checker" in str(caught.value) and "not declared earlier" in str(caught.value)
 
 
 def test_two_stages_may_verify_the_same_stage() -> None:
@@ -553,43 +550,35 @@ def test_two_stages_may_verify_the_same_stage() -> None:
     assert stages.parent_of("check-one") == stages.parent_of("check-two") == "worker"
 
 
-def test_verifies_cycle_is_accepted() -> None:
-    """Finding, suspected spec gap: two stages can verify each other.
+def test_verifies_cycle_is_refused() -> None:
+    """Closed by hel-viy: two stages verifying each other is refused.
 
-    ``parse`` refuses only self-verification and an undeclared target, so a cycle is
-    legal. Neither stage can then ever be scaffolded (each needs the other earlier in
-    the requested list, and both cannot be first), and SPEC section 7.3 has no base
-    commit for either, so the set is accepted and unusable. Recorded rather than
-    asserted as a refusal, because SPEC section 3.1's refusal list does not name it.
+    One rule closes this and the forward reference together, because neither side of a cycle
+    is declared earlier than the other.
     """
-    stages = stageset.parse(
-        [
-            {"id": "one", "author": "orchestrate", "verifies": "two"},
-            {"id": "two", "author": "orchestrate", "verifies": "one"},
-        ]
-    )
-    assert stages.parent_of("one") == "two" and stages.parent_of("two") == "one"
+    with pytest.raises(stageset.StageSetError) as caught:
+        stageset.parse(
+            [
+                {"id": "one", "author": "orchestrate", "verifies": "two"},
+                {"id": "two", "author": "orchestrate", "verifies": "one"},
+            ]
+        )
+    assert "one" in str(caught.value) and "not declared earlier" in str(caught.value)
 
 
-def test_an_empty_declared_stage_set_is_accepted(tmp_path: Path) -> None:
-    """Finding, minor: ``stage = []`` declares a hub where nothing can run.
+def test_an_empty_declared_stage_set_is_refused(tmp_path: Path) -> None:
+    """Closed by hel-viy: ``stage = []`` is refused at load.
 
-    ``config._load_file`` treats the key's presence as a declaration, so the research
-    default is not used, and every later refusal ends in an empty list: ``'impl' is not
-    a declared stage; declared: ``. ``control.until`` is emptied as well, so
-    ``control.default = "until"`` then fails with ``unknown until stage ;``. Recorded,
-    not asserted as a refusal: SPEC section 3.1 does not list an empty set among what is
-    refused.
+    The key's presence counts as a declaration, so an empty array used to skip the research
+    default and leave a hub where every refusal ended in an empty list and control.default =
+    "until" failed with ``unknown until stage ;``.
     """
     hub = tmp_path / "hub"
     (hub / ".agents").mkdir(parents=True)
     (hub / ".agents" / "workflow.toml").write_text("stage = []\n[control]\ndefault = \"until\"\n")
-    cfg = config_mod.load(hub)
-    assert len(cfg.stages) == 0
-    assert cfg.control.until == ""
-    with pytest.raises(KeyError) as caught:
-        cfg.stages.get("impl")
-    assert caught.value.args[0].endswith("declared: ")
+    with pytest.raises(config_mod.ConfigError) as caught:
+        config_mod.load(hub)
+    assert "at least one stage" in str(caught.value)
 
 
 def test_control_until_is_not_validated_at_load(tmp_path: Path) -> None:
