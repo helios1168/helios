@@ -133,9 +133,9 @@ def test_default_backends_path_resolves_from_the_package_alone(tmp_path: Path) -
     shutil.copytree(src_helios / "templates", package_dir / "templates")
     shutil.copytree(src_helios / "claims", package_dir / "claims")
 
-    # Nothing three directories above the stand-in claims module holds a templates/
-    # directory; that is exactly what the pre-fix parents[3] lookup depended on.
-    assert not (site_packages / "templates").exists()
+    # parents[3] of <tmp>/site-packages/helios/claims/__init__.py is tmp_path itself, and
+    # nothing puts a templates/ directory there; that is what the pre-fix lookup depended on.
+    assert not (tmp_path / "templates").exists()
 
     probe = "from helios.claims import default_backends_path\nprint(default_backends_path())"
     result = subprocess.run(
