@@ -47,6 +47,21 @@ verify_order = ["claude", "codex", "opencode", "agy"]
 
 [harness.agy]
 
+# A hub declares its own stages instead of the shipped research set of ten with one or more
+# [[stage]] entries (SPEC §3.1); declaring any of them replaces all ten, and control.until and
+# control.stop_at below then default to "" and [] rather than the research values shown. id,
+# author and requires are the fields most stages need; gate, ownership, verifies and scaffold
+# keep the defaults shown here unless a stage's role in the hub's own workflow differs.
+# [[stage]]
+# id = "impl"                        # becomes the bead's kind, its kind:<id> label, and
+#                                     # skills/<id>/SKILL.md
+# author = "implement"               # a key of [agents], or "other" for not-the-author
+# requires = ["files", "test"]       # any of files, test, unit, parent, model
+# gate = "report"                    # report | verdict | none
+# ownership = "files"                # files | artifacts | none
+# verifies = "model"                 # the stage this stage checks; absent otherwise
+# scaffold = true                    # whether `helios unit new` offers this stage
+
 [control]
 default = "manual"                 # manual | until | auto
 until = "verify-code"
