@@ -152,6 +152,13 @@ author = "implement"
         ("[[stage]]\nid = 'a'\nauthor = 'implement'\nscaffold = 'yes'\n",
          "scaffold must be true or false"),
         (GENERAL + "\n[control]\nstop_at = ['nonesuch']\n", "control.stop_at names 'nonesuch'"),
+        ("[[stage]]\nid = 'one'\nauthor = 'implement'\nverifies = 'two'\n\n"
+         "[[stage]]\nid = 'two'\nauthor = 'implement'\nverifies = 'one'\n",
+         "stage one verifies two, which is not declared earlier"),
+        ("[[stage]]\nid = 'a'\nauthor = 'implement'\nverifies = 'b'\n\n"
+         "[[stage]]\nid = 'b'\nauthor = 'implement'\n",
+         "stage a verifies b, which is not declared earlier"),
+        ("stage = []\n", "config key 'stage' must declare at least one stage"),
     ],
 )
 def test_a_bad_stage_set_is_refused(tmp_path: Path, body: str, names: str) -> None:

@@ -120,6 +120,8 @@ def parse(tables: list[Any]) -> StageSet:
     """Build a StageSet from parsed ``[[stage]]`` tables, refusing what SPEC §3.1 refuses."""
     if not isinstance(tables, list):
         raise StageSetError("config key 'stage' must be an array of tables")
+    if not tables:
+        raise StageSetError("config key 'stage' must declare at least one stage")
     stages: list[StageSpec] = []
     seen: set[str] = set()
     for i, table in enumerate(tables):
@@ -128,6 +130,7 @@ def parse(tables: list[Any]) -> StageSet:
             raise StageSetError(f"stage {stage.id} is declared twice")
         seen.add(stage.id)
         stages.append(stage)
+    earlier: set[str] = set()
     for stage in stages:
         if stage.verifies is not None:
             if stage.verifies == stage.id:
@@ -136,10 +139,15 @@ def parse(tables: list[Any]) -> StageSet:
                 raise StageSetError(
                     f"stage {stage.id} verifies {stage.verifies}, which is not declared"
                 )
+            if stage.verifies not in earlier:
+                raise StageSetError(
+                    f"stage {stage.id} verifies {stage.verifies}, which is not declared earlier"
+                )
         elif stage.author == OTHER:
             raise StageSetError(
                 f"stage {stage.id} author is {OTHER!r}, which needs a `verifies` to differ from"
             )
+        earlier.add(stage.id)
     return StageSet(tuple(stages))
 
 
