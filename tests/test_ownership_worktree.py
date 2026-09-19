@@ -51,7 +51,7 @@ def test_ownership_sorts_allowed_and_rejected(tmp_path: Path) -> None:
     assert "secret.txt" in result.detail
 
 
-def test_ownership_verify_kinds_are_scoped(tmp_path: Path) -> None:
+def test_ownership_artifacts_mode_is_scoped(tmp_path: Path) -> None:
     hub = make_repo(tmp_path / "hub")
     base = head(hub)
     (hub / "tools" / "verify" / "U1").mkdir(parents=True)
@@ -59,10 +59,37 @@ def test_ownership_verify_kinds_are_scoped(tmp_path: Path) -> None:
     (hub / "src").mkdir()
     (hub / "src" / "a.py").write_text("x\n")
     result = ownership.check(
-        worktree=hub, base_commit=base, files=["src/"], kind="verify-code", unit="U1"
+        worktree=hub, base_commit=base, files=["src/"], mode="artifacts", unit="U1"
     )
     assert result.allowed == ("tools/verify/U1/check.py",)
     assert result.rejected == ("src/a.py",)
+
+
+def test_ownership_none_mode_allows_unmatched_but_rejects_unconditional(tmp_path: Path) -> None:
+    """Under ``none`` every changed path passes the files/artifacts test, but the
+    unconditional rejections (SPEC §7.4) still apply: a directory in
+    ALWAYS_REJECTED, the memory export directory, and a confidential path."""
+    hub = make_repo(tmp_path / "hub")
+    base = head(hub)
+    (hub / "anything").mkdir()
+    (hub / "anything" / "a.txt").write_text("x\n")
+    (hub / ".helios").mkdir()
+    (hub / ".helios" / "events.jsonl").write_text("{}\n")
+    (hub / "memory-exports").mkdir()
+    (hub / "memory-exports" / "m.md").write_text("m\n")
+    (hub / "secret.pem").write_text("s\n")
+    result = ownership.check(
+        worktree=hub,
+        base_commit=base,
+        files=[],
+        mode="none",
+        confidential=("*.pem",),
+        memory_export_dir="memory-exports",
+    )
+    assert "anything/a.txt" in result.allowed
+    assert ".helios/events.jsonl" in result.rejected
+    assert "memory-exports/m.md" in result.rejected
+    assert "secret.pem" in result.rejected
 
 
 def test_ownership_rename_checks_both_sides(tmp_path: Path) -> None:

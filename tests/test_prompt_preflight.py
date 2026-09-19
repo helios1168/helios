@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from helios import prompt as pr
+from helios import stageset
 from helios.beads import Bead
 from helios.preflight import PreflightContext, check, globs_overlap, memory_map
 
@@ -305,6 +306,56 @@ def test_preflight_verify_math_model_and_overlap(tmp_path: Path) -> None:
         [impl_bead(id="a", files=["src/helios/"]), impl_bead(id="b", files=["tests/"])], ctx
     )
     assert disjoint == []
+
+
+def test_preflight_undeclared_kind_is_refused(tmp_path: Path) -> None:
+    """A bead whose kind names no declared stage is refused naming the
+    declared ids, rather than silently passing every check (hel-4e2)."""
+    hub = make_hub(tmp_path)
+    ctx = PreflightContext(hub=hub, memory_has=memory_map({}))
+    errors = check([Bead(id="b1", kind="not-a-stage")], ctx)
+    assert any(
+        "not-a-stage" in e and "not a declared stage" in e and "impl" in e for e in errors
+    )
+
+
+def test_preflight_stage_requires_drive_the_checks(tmp_path: Path) -> None:
+    """Preflight demands exactly what a stage's ``requires`` lists, for a
+    stage set with ids the shipped research pack does not use, proving the
+    checks are data driven rather than a kind-prefix test (hel-4e2)."""
+    hub = make_hub(tmp_path)
+    (hub / "docs" / "units").mkdir(parents=True)
+    (hub / "docs" / "units" / "U1.md").write_text(
+        "# U1\n\n## Model\n\n" + "claim words " * 30 + "\n"
+    )
+    stages = stageset.StageSet(
+        (
+            stageset.StageSpec(
+                id="draft", author="writer", requires=frozenset({"files", "test"})
+            ),
+            stageset.StageSpec(
+                id="check-draft",
+                author="checker",
+                requires=frozenset({"unit", "parent", "model"}),
+                verifies="draft",
+            ),
+        )
+    )
+    ctx = PreflightContext(
+        hub=hub, memory_has=memory_map({}), stages=stages, units_dir="docs/units"
+    )
+
+    errors = check([Bead(id="b1", kind="draft")], ctx)
+    assert any("needs `files`" in e for e in errors)
+    assert any("needs `test`" in e for e in errors)
+    assert check([Bead(id="b1", kind="draft", files=["src/"], test="pytest")], ctx) == []
+
+    errors = check([Bead(id="v1", kind="check-draft", unit="U1")], ctx)
+    assert any("needs `parent`" in e for e in errors)
+
+    (hub / "docs" / "units" / "U1.md").write_text("# U1\n\n## Model\n\n_empty_\n")
+    errors = check([Bead(id="v1", kind="check-draft", unit="U1", parent="b1")], ctx)
+    assert any("substantive" in e for e in errors)
 
 
 def test_preflight_model_counts_text_not_newlines(tmp_path: Path) -> None:
