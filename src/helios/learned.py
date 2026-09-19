@@ -16,10 +16,6 @@ LINE_RE = re.compile(
     re.DOTALL,
 )
 
-#: The stage set a caller gets when it passes none of its own (see control.py's constant
-#: of the same purpose).
-_RESEARCH_STAGES = stageset.research()
-
 
 @dataclass(frozen=True)
 class LearnedLine:
@@ -34,12 +30,12 @@ class LearnedLine:
         return {"unit": self.unit, "bead": self.bead, "attempt": self.attempt, "kind": self.kind, "k": self.k, "text": self.text}
 
 
-def _helios_beads(beads: Any, stages: stageset.StageSet = _RESEARCH_STAGES) -> list[Bead]:
+def _helios_beads(beads: Any, stages: stageset.StageSet) -> list[Bead]:
     return [bead for bead in beads.list() if bead.kind in stages and f"kind:{bead.kind}" in bead.labels]
 
 
 def _all_markers(
-    beads: Any, unit: str | None = None, *, stages: stageset.StageSet = _RESEARCH_STAGES
+    beads: Any, unit: str | None = None, *, stages: stageset.StageSet
 ) -> dict[str, tuple[Bead, LearnedLine]]:
     """Every distinct marker found on a helios-kind bead's comments, curated or not.
 
@@ -92,7 +88,7 @@ def _curated_texts(beads: Any, targets: set[str], *, strict: bool = False) -> li
 
 
 def _lines(
-    beads: Any, unit: str | None = None, *, stages: stageset.StageSet = _RESEARCH_STAGES
+    beads: Any, unit: str | None = None, *, stages: stageset.StageSet
 ) -> list[tuple[Bead, LearnedLine]]:
     found = _all_markers(beads, unit, stages=stages)
     targets = {bead.id for bead in _helios_beads(beads, stages)} | {item.bead for _bead, item in found.values()}
@@ -110,13 +106,13 @@ def _lines(
 
 
 def list_lines(
-    beads: Any, unit: str | None = None, *, stages: stageset.StageSet = _RESEARCH_STAGES
+    beads: Any, unit: str | None = None, *, stages: stageset.StageSet
 ) -> list[LearnedLine]:
     """Return the curated-filtered learned queue."""
     return [item for _bead, item in _lines(beads, unit, stages=stages)]
 
 
-def mark(beads: Any, marker: str, decision: str, *, stages: stageset.StageSet = _RESEARCH_STAGES) -> int:
+def mark(beads: Any, marker: str, decision: str, *, stages: stageset.StageSet) -> int:
     """Curate one queue entry, replaying an existing mark as a no-op.
 
     Decided: ``marker`` (``<kind>:<bead>#<attempt>#<k>``) must equal, as text, one of

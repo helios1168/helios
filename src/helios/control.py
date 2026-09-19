@@ -10,18 +10,13 @@ from helios import stageset
 from helios.beads import Bead, BeadsLike
 from helios.envelope import Envelope, ExecutionStatus, Verdict, WorkStatus, overall_verdict
 
-#: The stage set a caller gets when it passes none of its own: the SPEC section 3.2 research
-#: set, the same default ``config.Config.stages`` falls back to for a hub with no ``[[stage]]``
-#: entries. A caller with its own configured stage set passes it as ``stages=``.
-_RESEARCH_STAGES = stageset.research()
-
 
 class ControlError(ValueError):
     """A control setting or unit request is invalid."""
 
 
 def candidates(
-    beads: BeadsLike, unit: str | None = None, *, stages: stageset.StageSet = _RESEARCH_STAGES
+    beads: BeadsLike, unit: str | None = None, *, stages: stageset.StageSet
 ) -> list[Bead]:
     """Return open, staged ready beads in bd order (SPEC section 11)."""
     wanted = f"unit:{unit}" if unit else None
@@ -130,7 +125,7 @@ def next_bead(
     run: Callable[[Bead], int],
     read_envelope: Callable[[Bead], Envelope | None],
     attempt_state: Callable[[Bead], AttemptState] | None = None,
-    stages: stageset.StageSet = _RESEARCH_STAGES,
+    stages: stageset.StageSet,
 ) -> int:
     """Run the first candidate not covered by ``stop_at`` (SPEC section 11).
 
@@ -163,7 +158,7 @@ class UnitResult:
 
 
 def validate_until(
-    beads: Any, unit: str, until: str | None, *, stages: stageset.StageSet = _RESEARCH_STAGES
+    beads: Any, unit: str, until: str | None, *, stages: stageset.StageSet
 ) -> str | None:
     """Validate control values and return the effective until stage."""
     if until is not None and until not in stages:
@@ -187,7 +182,7 @@ def unit_run(
     run: Callable[[Bead], int],
     read_envelope: Callable[[Bead], Envelope | None],
     attempt_state: Callable[[Bead], AttemptState] | None = None,
-    stages: stageset.StageSet = _RESEARCH_STAGES,
+    stages: stageset.StageSet,
 ) -> UnitResult:
     """Run a unit until a SPEC section 11 stopping condition.
 
