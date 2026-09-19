@@ -19,6 +19,7 @@ from helios import cli
 from helios.beads import Bead, FakeBeads
 from helios.commands import unit_new
 from helios.config import AgentsConfig, Config
+from helios.stageset import StageSet, StageSpec
 from helios.units import (
     StageRow,
     UnitNewError,
@@ -1274,3 +1275,99 @@ def test_reused_bead_with_blank_author_shows_dash(tmp_path: Path, author: str) -
         files=None, test=None,
     )
     assert [(row.bead, row.author) for row in rows] == [("b-frame", "-")]
+
+
+# ============================================================
+# hel-263: stages come from config.stages (StageSet), not a second stage list.
+# ============================================================
+
+
+def _custom_stage_set() -> StageSet:
+    """Two stages the hub itself declares, plus one it opts out of scaffolding.
+
+    Named unlike any research stage, so a pass here is a pass on the ``scaffold``
+    and ``verifies`` fields themselves, not on a coincidence of stage names.
+    """
+    return StageSet(
+        (
+            StageSpec(
+                id="alpha",
+                author="lead",
+                requires=frozenset({"files", "test"}),
+            ),
+            StageSpec(
+                id="beta",
+                author="second",
+                verifies="alpha",
+                requires=frozenset({"unit", "parent"}),
+                gate="verdict",
+                ownership="artifacts",
+            ),
+            StageSpec(id="omega", author="lead", scaffold=False),
+        )
+    )
+
+
+def _custom_config(hub: Path) -> Config:
+    return Config(
+        hub=hub,
+        agents=AgentsConfig(
+            roles={"lead": "claude", "second": "other"}, verify_order=("claude", "codex")
+        ),
+        stages=_custom_stage_set(),
+    )
+
+
+def test_undeclared_stage_names_the_declared_ids(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    config = _custom_config(hub)
+    with pytest.raises(UnitNewError) as excinfo:
+        create_unit(
+            beads=FakeBeads(), config=config, unit="U1", title="T", stages="bogus",
+            files=None, test=None,
+        )
+    message = str(excinfo.value)
+    assert "bogus" in message
+    for stage_id in config.stages.ids:
+        assert stage_id in message
+
+
+def test_stage_with_scaffold_false_refuses_naming_the_stage(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    config = _custom_config(hub)
+    with pytest.raises(UnitNewError, match=r"^stage omega cannot be scaffolded$"):
+        create_unit(
+            beads=FakeBeads(), config=config, unit="U1", title="T", stages="omega",
+            files=None, test=None,
+        )
+
+
+def test_hub_declared_stages_scaffold_their_own_chain(tmp_path: Path) -> None:
+    hub = _hub(tmp_path)
+    config = _custom_config(hub)
+    fake = FakeBeads()
+    rows = create_unit(
+        beads=fake,
+        config=config,
+        unit="U1",
+        title="T",
+        stages="alpha,beta",
+        files="src/*.py",
+        test="pytest",
+    )
+    assert [row.stage for row in rows] == ["alpha", "beta"]
+    assert [row.bead for row in rows] == ["fake-1", "fake-2"]
+    # alpha's author is claude; beta's `other` resolves to the next harness in
+    # verify_order that differs from it.
+    assert rows[0].author == "claude"
+    assert rows[1].author == "codex"
+    assert fake.show("fake-1").metadata == {
+        "unit": "U1",
+        "kind": "alpha",
+        "author": "claude",
+        "files": ["src/*.py"],
+        "test": "pytest",
+    }
+    assert fake.show("fake-2").metadata["parent"] == "fake-1"
+    assert ["dep", "add", "fake-2", "fake-1"] in fake.argv_log
+    assert (hub / "docs" / "units" / "U1.md").is_file()

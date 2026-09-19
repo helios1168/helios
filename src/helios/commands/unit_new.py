@@ -24,12 +24,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--files",
         default=None,
-        help="Comma-separated globs; required when impl or validate is present.",
+        help="Comma-separated globs; required when a listed stage requires files.",
     )
     parser.add_argument(
         "--test",
         default=None,
-        help="Bead test command; required when impl or validate is present.",
+        help="Bead test command; required when a listed stage requires test.",
     )
 
 
