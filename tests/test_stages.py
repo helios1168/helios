@@ -125,7 +125,7 @@ CORE_MODULES = tuple(
         "run.py",
         "sessions.py",
         "telemetry.py",
-        "templates.py",
+        "templates/__init__.py",
         "tmux.py",
         "units.py",
         "worktree.py",

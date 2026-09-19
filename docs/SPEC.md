@@ -33,9 +33,11 @@ src/helios/              the CLI package
   commands/<name>.py     one module per subcommand
   envelope.py            result contracts (§4)
   harness/base.py        adapter interface (§6); one module per harness
+  templates/__init__.py  template lookup; workflow.toml and unit.md sit beside it as
+                         package data, so they ship inside the wheel
 schemas/                 generated JSON Schemas; never edit by hand
 skills/<name>/SKILL.md   stage skills, Agent Skills format; skills/report-block.md shared
-templates/               workflow.toml, backends.toml, unit.md shipped to projects
+templates/               backends.toml shipped to projects
 tests/                   pytest; tests/fixtures/native/<harness>/ holds recorded CLI output
 docs/SPEC.md             this file
 AGENTS.md                the worker contract (its "Worker contract" section)
@@ -72,9 +74,13 @@ arguments and calls it.
   rule covers a program or claims module that fails to import: the import is caught as
   `BaseException`, and the command prints `helios: cannot import <module>: <exception
   type>: <message>` to stderr and exits 2.
-- `helios.templates.path(name)` returns `<repository>/templates/<name>` (the directory two levels
-  above the package) and raises `FileNotFoundError` naming the path. Shipping templates inside a
-  wheel is not in this wave.
+- `helios.templates.path(name)` returns `src/helios/templates/<name>` and raises
+  `FileNotFoundError` naming the path. The templates are package data inside the `templates`
+  package itself, resolved from `Path(__file__).parent` the way `stageset.RESEARCH_PATH`
+  resolves `stagesets/research.toml`, so they ship inside the wheel rather than depending on a
+  repository checkout above the package. The lookup lives in `templates/__init__.py` rather
+  than in a `templates.py` beside a `templates/` data directory, because a module and a
+  directory of the same name shadow each other.
 
 ## 3. Stages
 
@@ -261,7 +267,8 @@ File: `.agents/workflow.toml` at the project root, read with `tomllib`. The load
 `.agents/workflow.toml`, else the first holding `.git`, else `start`; that directory is the
 hub. Without the file helios runs in ad hoc mode with the defaults below. An unknown key, at any
 depth including `[harness.<name>]` and `[tolerance.<tier>]`, and a value of the wrong type are
-errors naming the dotted key. `templates/workflow.toml` is the commented template.
+errors naming the dotted key. `src/helios/templates/workflow.toml` (§2.1) is the commented
+template.
 
 | key | default | meaning |
 | --- | --- | --- |
@@ -1027,8 +1034,8 @@ UTC `yyyy-mm-ddThh:mm:ssZ`; the 8 hex digits come from `secrets.token_hex(4)`; `
 
 ### 10.1 Unit file
 
-Created from `templates/unit.md` with `{unit}`, `{title}` and `{stages}` substituted: title
-line, `Status:` (`open`, `in-progress`, `done`, `dropped`), `Stages:`, and sections `## Brief`,
+Created from `src/helios/templates/unit.md` with `{unit}`, `{title}` and `{stages}` substituted:
+title line, `Status:` (`open`, `in-progress`, `done`, `dropped`), `Stages:`, and sections `## Brief`,
 `## Model`, `## Verify`, `## Code verify`, `## Validate`, `## Report`, each holding `_empty_`.
 
 ### 10.2 `helios unit new <unit> "<title>" --stages s1,s2,... [--files glob,...] [--test CMD]`
@@ -1091,10 +1098,10 @@ with `helios: unit <unit> is being created by another process`.
    realpath-inside-hub check, and writability) immediately before writing, then create missing
    parent directories and write with `open(path, "x")`. A failed re-check or an `OSError` here
    prints `helios: cannot write unit file <path>: <message>` and exits 1; the beads already
-   created stay. It is `templates/unit.md` (through `helios.templates.path`) with `{unit}`,
-   `{title}` and `{stages}` replaced in one `re.sub` pass, never `str.format`; `{stages}` is the
-   stage ids joined with `,`. A crash before this step leaves no unit file, so a rerun reuses the
-   beads made so far.
+   created stay. It is `src/helios/templates/unit.md` (through `helios.templates.path`) with
+   `{unit}`, `{title}` and `{stages}` replaced in one `re.sub` pass, never `str.format`;
+   `{stages}` is the stage ids joined with `,`. A crash before this step leaves no unit file, so
+   a rerun reuses the beads made so far.
 6. Print to stdout a tab-separated table with the header line `bead`, `stage`, `author`,
    `blocked-by` and one row per stage, `-` for none. A reused bead shows its recorded `author`
    metadata, or `-` when it has none. Exit 0.
