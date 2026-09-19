@@ -1175,7 +1175,14 @@ def _finish_attempt(
         except RuntimeError:
             cached_head = []
         seen = set(ownership.allowed) | set(ownership.rejected)
-        extra = [p for p in [*cached_base, *cached_head] if p not in seen]
+        # HEAD equals base_commit in a fresh worktree, so the two git calls above can
+        # return the same list; de-duplicate while keeping order, or a staged-only path
+        # is classified, and reported, twice.
+        extra: list[str] = []
+        for path in [*cached_base, *cached_head]:
+            if path in seen or path in extra:
+                continue
+            extra.append(path)
         if extra:
             extra_allowed, extra_rejected = _classify_extra_paths(
                 extra,
@@ -1786,6 +1793,14 @@ def _run_one_inner(
     hub = hub.resolve()
     cfg = config if config is not None else config_mod.load(hub)
     bead = beads.show(bead_id)
+    try:
+        cfg.stages.get(bead.kind)
+    except KeyError as exc:
+        # Catch this before _missing_skill: an empty kind collapses that check's path to
+        # hub/skills/SKILL.md, so a hub that happens to have that file would otherwise
+        # pass the only guard and hit a bare ValueError out of config.harness_for_kind.
+        print(f"preflight: {bead_id}: {exc.args[0]}", file=sys.stderr)
+        return 2
     skill_error = _missing_skill(hub, bead.kind)
     if skill_error is not None:
         print(f"preflight: {bead_id}: {skill_error}", file=sys.stderr)

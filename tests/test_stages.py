@@ -4,6 +4,7 @@ layer boundary between the dispatch core and the research pack.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -76,13 +77,14 @@ def test_parent_of_raises_for_an_undeclared_stage() -> None:
 
 # ---------------------------------------------------------------------------
 # Layer boundary (SPEC section 3, "Core and pack"): no module of the dispatch core names a
-# research stage id. src/helios/stagesets/research.toml (the section 3.2 declaration) and the
-# research sections of SPEC.md are the research pack and are exempt, along with
-# src/helios/program.py and src/helios/claims/* (SPEC section 15), which the same paragraph
-# names as pack. src/helios/stageset.py is neither: it is the schema stage ids are checked
-# against (REQUIREMENTS, GATES, OWNERSHIP_MODES), so it legitimately spells "model" and
-# "report" as vocabulary entries; the brief for this bead also says not to edit it. It is left
-# out of CORE_MODULES rather than silently passed, so this comment is the record of why.
+# research stage id, whether hardcoded whole, split across two literals Python concatenates,
+# folded into a multi-word literal ("frame model report".split()), or tested by a
+# startswith/endswith prefix shape (the branch family the refactor deleted). PACK below is the
+# research pack this excludes from CORE_MODULES: the section 3.2 declaration, the program and
+# claims modules of SPEC section 15 and the commands over them, and src/helios/stageset.py,
+# which is neither core nor pack but the schema stage ids are checked against (REQUIREMENTS,
+# GATES, OWNERSHIP_MODES), so it legitimately spells "model" and "report" as vocabulary
+# entries; the brief for this bead also says not to edit it.
 # ---------------------------------------------------------------------------
 
 RESEARCH_STAGE_IDS = (
@@ -98,83 +100,73 @@ RESEARCH_STAGE_IDS = (
     "remember",
 )
 
-# Listed by hand, one entry per file, so a new module under src/helios has to be added here on
-# purpose before this test can see it. commands/claims_attack.py, commands/claims_check.py,
-# commands/program_check.py, commands/program_diff.py and commands/program_show.py are left
-# out: they are commands over program.py and claims/*, SPEC section 15, so they are pack too.
-CORE_MODULES = tuple(
-    f"src/helios/{name}"
-    for name in (
-        "attempt.py",
-        "beads.py",
-        "cli.py",
-        "config.py",
-        "control.py",
-        "envelope.py",
-        "events.py",
-        "gates.py",
-        "jsonio.py",
-        "learned.py",
-        "memory.py",
-        "merge.py",
-        "messages.py",
-        "ownership.py",
-        "preflight.py",
-        "prompt.py",
-        "resume.py",
-        "run.py",
-        "sessions.py",
-        "telemetry.py",
-        "templates/__init__.py",
-        "tmux.py",
-        "units.py",
-        "worktree.py",
-    )
-) + tuple(
-    f"src/helios/commands/{name}"
-    for name in (
-        "__init__.py",
-        "attach.py",
-        "gate.py",
-        "learned.py",
-        "merge.py",
-        "next.py",
-        "ps.py",
-        "resume.py",
-        "run.py",
-        "say.py",
-        "stop.py",
-        "unit_new.py",
-        "unit_run.py",
-    )
-) + tuple(
-    f"src/helios/harness/{name}"
-    for name in (
-        "__init__.py",
-        "agy.py",
-        "base.py",
-        "claude.py",
-        "codex.py",
-        "fake.py",
-        "opencode.py",
-    )
+PACK = (
+    "src/helios/program.py",
+    "src/helios/stageset.py",
+    "src/helios/claims/__init__.py",
+    "src/helios/claims/runner.py",
+    "src/helios/commands/claims_attack.py",
+    "src/helios/commands/claims_check.py",
+    "src/helios/commands/program_check.py",
+    "src/helios/commands/program_diff.py",
+    "src/helios/commands/program_show.py",
 )
 
-# A stage id used AS a stage id is always a quoted Python string literal equal to the id: a
-# hardcoded default kind, a `kind ==`/`stage ==` comparison, a control default naming one.
-# An unquoted occurrence is an identifier, an attribute or a docstring word, never a stage id
-# by itself (`AgentReport`, `harness_config.model`, `model_validate_json`, "validate the
-# workflow.toml" all fail this pattern, correctly). So the rule below looks only inside
-# matching quotes, not for the word anywhere on the line. This is deliberately narrower than a
-# plain word-boundary grep, which is why every occurrence it does flag needs a look rather than
-# a blanket exclusion list per word.
-_QUOTED = {
-    stage_id: re.compile(r"""(["'])%s\1""" % re.escape(stage_id)) for stage_id in RESEARCH_STAGE_IDS
-}
+
+def _core_modules_from_disk() -> tuple[str, ...]:
+    """Every module under src/helios that is not in PACK.
+
+    Derived from the filesystem rather than hand-listed, so a new core module (this test's
+    own finding: src/helios/__init__.py was missing from the old hand list) is covered from
+    the moment it exists rather than on whoever remembers to add it here.
+    """
+    return tuple(
+        str(path.relative_to(REPO))
+        for path in sorted((REPO / "src" / "helios").rglob("*.py"))
+        if str(path.relative_to(REPO)) not in PACK
+    )
 
 
-def _quoted_stage_ids_in(line: str) -> set[str]:
-    return {stage_id for stage_id, pattern in _QUOTED.items() if pattern.search(line)}
+CORE_MODULES = _core_modules_from_disk()
+
+
+def _string_constants(text: str) -> list[tuple[int, str]]:
+    """Every string literal in a module's source except a docstring, with its line number.
+
+    ``ast`` joins adjacent literals into one constant, so this sees an id Python
+    concatenates from two source literals, which a line-based regex cannot. A docstring is
+    a string that is the whole of an expression statement; prose is not a hardcoded stage
+    id and would drown the signal.
+    """
+    tree = ast.parse(text)
+    docstrings = {
+        id(node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+    }
+    return [
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    ]
+
+
+def _hardcoded_ids(value: str) -> set[str]:
+    """The stage ids a string literal hardcodes.
+
+    Two forms count: the literal is exactly one stage id, or every whitespace separated
+    word of it is a stage id and there are at least two (the ``"frame model
+    report".split()`` form). An English sentence that happens to contain "report" or
+    "model" fails both, so neither needs an exclusion.
+    """
+    words = value.split()
+    if len(words) == 1 and words[0] == value and value in RESEARCH_STAGE_IDS:
+        return {value}
+    if len(words) > 1 and all(word in RESEARCH_STAGE_IDS for word in words):
+        return set(words)
+    return set()
 
 
 # Reviewed exceptions, keyed by the exact source line so an unrelated edit elsewhere cannot
@@ -225,25 +217,65 @@ ALLOWED_LINES: dict[str, str] = {
         "bd's memory verb, not a stage id",
     # harness/fake.py: the fake harness script's "report" key holds the AgentReport JSON a
     # test wants written out (SPEC section 4.1) -- a field name of the result contract, not a
-    # stage id, the same field envelope.py's own "report" field names.
-    '"report": {...} | null, "report_text": "..." | null,':
-        "AgentReport field name in the fake harness script, not a stage id",
+    # stage id, the same field envelope.py's own "report" field names. The illustration of
+    # this in the module docstring needs no entry here: _string_constants skips docstrings.
     'report = script.get("report", None)':
         "AgentReport field name in the fake harness script, not a stage id",
 }
 
 
 def test_core_modules_name_no_research_stage_id() -> None:
+    """No core module hardcodes a stage id: whole, concatenated across adjacent literals, or
+    folded into a multi-word literal like ``"frame model report".split()``.
+    """
     violations = []
     for rel in CORE_MODULES:
-        path = REPO / rel
-        for lineno, line in enumerate(path.read_text().splitlines(), 1):
-            hits = _quoted_stage_ids_in(line)
+        text = (REPO / rel).read_text()
+        lines = text.splitlines()
+        for lineno, value in _string_constants(text):
+            hits = _hardcoded_ids(value)
             if not hits:
                 continue
-            if line.strip() in ALLOWED_LINES:
+            if lines[lineno - 1].strip() in ALLOWED_LINES:
                 continue
-            violations.append(f"{rel}:{lineno}: names {sorted(hits)!r}: {line.strip()}")
+            violations.append(f"{rel}:{lineno}: names {sorted(hits)!r}: {lines[lineno - 1].strip()}")
+    assert not violations, "\n".join(violations)
+
+
+def test_core_modules_test_no_kind_against_a_stage_id_prefix() -> None:
+    """No core module tests a kind or stage against a piece of a research stage id by shape,
+    such as ``kind.startswith("verify")``, the branch family the refactor deleted. Neither
+    the whole-literal rule above nor a line-based one can see this: "verify" is not itself a
+    stage id, only a prefix several of them share.
+    """
+    violations = []
+    pieces = {
+        (stage_id[:n], stage_id)
+        for stage_id in RESEARCH_STAGE_IDS
+        for n in range(1, len(stage_id) + 1)
+    } | {
+        (stage_id[-n:], stage_id)
+        for stage_id in RESEARCH_STAGE_IDS
+        for n in range(1, len(stage_id) + 1)
+    }
+    for rel in CORE_MODULES:
+        for node in ast.walk(ast.parse((REPO / rel).read_text())):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in ("startswith", "endswith") or not node.args:
+                continue
+            receiver = ast.unparse(node.func.value)
+            if "kind" not in receiver and "stage" not in receiver:
+                continue
+            arg = node.args[0]
+            if not isinstance(arg, ast.Constant) or not isinstance(arg.value, str):
+                continue
+            named = sorted({full for piece, full in pieces if piece == arg.value})
+            if named:
+                violations.append(
+                    f"{rel}:{node.lineno}: {receiver}.{node.func.attr}({arg.value!r}) "
+                    f"is a piece of {named!r}"
+                )
     assert not violations, "\n".join(violations)
 
 
