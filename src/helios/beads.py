@@ -69,7 +69,10 @@ class Bead:
     id: str
     title: str = ""
     description: str = ""
-    kind: str = "impl"
+    # A bead with no kind has no stage: guessing the old research implementation stage here
+    # predates the stage set and would silently mislabel a bead on a hub that declares no such
+    # stage. Empty gets the same refusal preflight already gives an undeclared kind.
+    kind: str = ""
     unit: str | None = None
     parent: str | None = None
     accept: str = ""
@@ -87,7 +90,9 @@ class Bead:
         """Build a Bead from one decoded `bd show` or `bd list` object."""
         labels = _as_list(payload.get("labels"))
         metadata = _decode_show_metadata(dict(payload.get("metadata") or {}))
-        kind = _to_text(metadata.get("kind")) or _label_kind(labels) or "impl"
+        # No kind metadata and no kind:<id> label leaves the bead with no stage rather than
+        # a guessed default (see the field default above).
+        kind = _to_text(metadata.get("kind")) or _label_kind(labels) or ""
         accept = _to_text(metadata.get("accept")) or str(payload.get("acceptance_criteria") or "")
         return cls(
             id=str(payload["id"]),
