@@ -2,17 +2,22 @@
 
 All failures exit 2 before anything is created:
 
-- ``impl`` and ``validate`` need ``files`` and ``test``; verify kinds need
-  ``unit`` and ``parent``.
+- a bead's kind must be a stage its hub's stage set declares (SPEC §3.1); an
+  undeclared kind is refused naming the declared ids.
+- the bead carries whatever its stage's ``requires`` lists: ``files``,
+  ``test``, ``unit``, ``parent``, ``model``. A stage that declares
+  ``verifies`` and has a ``parent`` also needs ``output_commit`` metadata on
+  that parent bead (SPEC §7.3).
 - every name in ``memories`` exists (the memory lookup is a required
   argument); every path in ``docs`` exists, and every ``path#key`` resolves
   to a section (SPEC §7.2).
-- ``verify-math`` needs a substantive ``## Model``: the section starts at the
-  first level 2 heading whose text is exactly ``Model`` and runs to the next
-  heading of level 1 or 2. Its body counts the stripped lines that
-  are not headings in the SPEC §7.2 sense, not blank and not the ``_empty_``
-  placeholder, totaling at least 200 characters; line breaks do not count. A line
-  inside a code fence, or without a space after ``#``, counts like any other.
+- a stage whose ``requires`` lists ``model`` needs a substantive ``## Model``:
+  the section starts at the first level 2 heading whose text is exactly
+  ``Model`` and runs to the next heading of level 1 or 2. Its body counts the
+  stripped lines that are not headings in the SPEC §7.2 sense, not blank and
+  not the ``_empty_`` placeholder, totaling at least 200 characters; line
+  breaks do not count. A line inside a code fence, or without a space after
+  ``#``, counts like any other.
 - beads launched together have disjoint ``files``. Two entries overlap when
   either matches the other read as a literal path, or when neither is a
   literal path and the literal prefix of one starts with the literal prefix
@@ -30,10 +35,11 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from helios import attempt as attempt_mod
+from helios import stageset
 from helios.beads import Bead
 from helios.ownership import glob_match
 from helios.prompt import find_section, heading_lines, model_section
@@ -53,6 +59,7 @@ class PreflightError(RuntimeError):
 class PreflightContext:
     hub: Path
     memory_has: Callable[[str], bool]
+    stages: stageset.StageSet = field(default_factory=stageset.research)
     runs_rel: str = ".helios/runs"
     units_dir: str = "docs/units"
     worktrees_rel: str = ".claude/worktrees"
@@ -80,26 +87,38 @@ def _check_bead(bead: Bead, ctx: PreflightContext) -> list[str]:
     errors: list[str] = []
     if bead.status == "closed":
         errors.append(f"{bead.id}: bead is closed")
-    if bead.kind in ("impl", "validate"):
-        if not bead.files:
-            errors.append(f"{bead.id}: impl bead needs `files`")
-        if not bead.test:
-            errors.append(f"{bead.id}: impl bead needs `test`")
-    if bead.kind.startswith("verify"):
-        if not bead.unit:
-            errors.append(f"{bead.id}: verify bead needs `unit`")
-        if not bead.parent:
-            errors.append(f"{bead.id}: verify bead needs `parent`")
-        elif ctx.bead_show is not None:
-            errors.extend(_check_verify_worktree_start(bead, ctx))
+    try:
+        stage = ctx.stages.get(bead.kind)
+    except KeyError as exc:
+        errors.append(f"{bead.id}: {exc.args[0]}")
+    else:
+        errors.extend(_check_requires(bead, stage, ctx))
     for key in bead.memories:
         if not ctx.memory_has(key):
             errors.append(f"{bead.id}: memory {key!r} does not exist")
     for entry in bead.docs:
         errors.extend(_check_doc(bead.id, entry, ctx))
-    if bead.kind == "verify-math" and bead.unit:
-        errors.extend(_check_model(bead, ctx))
     errors.extend(_check_attempt_finalized(bead, ctx))
+    return errors
+
+
+def _check_requires(bead: Bead, stage: stageset.StageSpec, ctx: PreflightContext) -> list[str]:
+    """Demand what the stage's ``requires`` lists (SPEC §3.1, §7.1 step 2)."""
+    errors: list[str] = []
+    if stage.demands("files") and not bead.files:
+        errors.append(f"{bead.id}: bead needs `files`")
+    if stage.demands("test") and not bead.test:
+        errors.append(f"{bead.id}: bead needs `test`")
+    if stage.demands("unit") and not bead.unit:
+        errors.append(f"{bead.id}: bead needs `unit`")
+    if stage.demands("parent") and not bead.parent:
+        errors.append(f"{bead.id}: bead needs `parent`")
+    # A stage that verifies another needs the parent's output_commit as the
+    # worktree's base, whether or not `parent` itself is a listed demand.
+    if stage.verifies is not None and bead.parent and ctx.bead_show is not None:
+        errors.extend(_check_verify_worktree_start(bead, ctx))
+    if stage.demands("model") and bead.unit:
+        errors.extend(_check_model(bead, ctx))
     return errors
 
 

@@ -34,6 +34,7 @@ from helios import jsonio
 from helios import memory as memory_mod
 from helios import ownership as ownership_mod
 from helios import prompt as prompt_mod
+from helios import stageset
 from helios import telemetry as telemetry_mod
 from helios import worktree as worktree_mod
 from helios.harness.base import Harness, LaunchSpec
@@ -635,13 +636,20 @@ def _classify_extra_paths(
     *,
     files: list[str],
     always_allowed: tuple[str, ...],
-    kind: str,
+    mode: str,
     verify_artifacts: str,
     unit: str | None,
     confidential: tuple[str, ...],
     memory_export_dir: str,
 ) -> tuple[list[str], list[str]]:
-    """Sort cached-only paths into allowed and rejected (SPEC §7.4)."""
+    """Sort cached-only paths into allowed and rejected (SPEC §7.4).
+
+    ``mode`` is the bead's stage's ownership mode; this mirrors
+    ``ownership.check``'s per-path rule exactly so the two never disagree on
+    a path. It stays a separate copy because ``ownership.check`` derives its
+    path list from git itself and has nowhere to take an arbitrary list of
+    already-known paths instead.
+    """
     rejected_prefixes = (
         *ownership_mod.ALWAYS_REJECTED,
         memory_export_dir.rstrip("/") + "/",
@@ -655,12 +663,15 @@ def _classify_extra_paths(
         if ownership_mod._matches_confidential(path, confidential):
             rejected.append(path)
             continue
-        if kind.startswith("verify"):
+        if mode == "artifacts":
             scope = f"{verify_artifacts.rstrip('/')}/{unit}/" if unit else None
             if scope is not None and _is_prefix_match(path, scope):
                 allowed.append(path)
             else:
                 rejected.append(path)
+            continue
+        if mode == "none":
+            allowed.append(path)
             continue
         if ownership_mod._matches_any(path, files) or any(
             _is_prefix_match(path, prefix) for prefix in always_allowed
@@ -722,19 +733,24 @@ def _stage_and_commit(
 
 def _exit_code_for(
     *,
-    kind: str,
+    gate: str,
     execution_status: envelope_mod.ExecutionStatus,
     report: envelope_mod.AgentReport | None,
     checks_passed: bool,
 ) -> int:
-    """Exit codes of SPEC §7.1: 0 done/verified, 3 waiting, 4 failure, 5 check."""
+    """Exit codes of SPEC §7.1, keyed on the bead's stage ``gate``: 0 done under
+    ``report``, verified under ``verdict``, or a finalized attempt under ``none``
+    (judged on neither report status nor verdict); 3 waiting; 4 failure; 5 check.
+    """
     if execution_status is not envelope_mod.ExecutionStatus.COMPLETED:
         return 4
     if not checks_passed:
         return 5
+    if gate == "none":
+        return 0
     if report is None:
         return 4
-    if kind.startswith("verify"):
+    if gate == "verdict":
         verdict = envelope_mod.overall_verdict(list(report.findings))
         return 0 if verdict is envelope_mod.Verdict.VERIFIED else 3
     return 0 if report.status is envelope_mod.WorkStatus.DONE else 3
@@ -997,6 +1013,7 @@ def _finish_attempt(
 ) -> int:
     """Validate, check, commit, envelop, write back and finalize one attempt."""
     bead = args.bead
+    stage = args.config.stages.get(bead.kind)
     attempt_dir = args.attempt.dir
     n = args.attempt.n
     attempt_id = args.attempt.attempt_id
@@ -1136,7 +1153,7 @@ def _finish_attempt(
             base_commit=args.base_commit,
             files=list(bead.files),
             always_allowed=args.config.project.always_allowed,
-            kind=bead.kind,
+            mode=stage.ownership,
             verify_artifacts=args.config.project.verify_artifacts,
             unit=bead.unit,
             confidential=args.config.project.confidential,
@@ -1164,7 +1181,7 @@ def _finish_attempt(
                 extra,
                 files=list(bead.files),
                 always_allowed=args.config.project.always_allowed,
-                kind=bead.kind,
+                mode=stage.ownership,
                 verify_artifacts=args.config.project.verify_artifacts,
                 unit=bead.unit,
                 confidential=args.config.project.confidential,
@@ -1223,7 +1240,7 @@ def _finish_attempt(
         if note is not None:
             notes.append(note)
     verdict: str | None = None
-    if report is not None and bead.kind.startswith("verify"):
+    if report is not None and stage.gate == "verdict":
         overall = envelope_mod.overall_verdict(list(report.findings))
         verdict = overall.value if overall is not None else None
     if execution is envelope_mod.ExecutionStatus.COMPLETED and report is None:
@@ -1286,7 +1303,7 @@ def _finish_attempt(
 
     plan = beads_mod.plan_writeback(
         attempt_id=attempt_id,
-        bead_kind=bead.kind,
+        gate=stage.gate,
         harness=args.harness_name,
         session_id=native_session,
         worktree=str(args.worktree_path),
@@ -1335,7 +1352,7 @@ def _finish_attempt(
     if _INTERRUPT.is_set():
         return 4
     return _exit_code_for(
-        kind=bead.kind,
+        gate=stage.gate,
         execution_status=execution,
         report=report,
         checks_passed=checks_passed,
@@ -1545,12 +1562,16 @@ class _BeadLock:
 
 
 def _verify_start_kwargs(
-    hub: Path, worktrees_rel: str, beads: beads_mod.BeadsLike, bead: beads_mod.Bead
+    hub: Path,
+    worktrees_rel: str,
+    beads: beads_mod.BeadsLike,
+    bead: beads_mod.Bead,
+    stage: stageset.StageSpec,
 ) -> dict[str, str]:
-    """``start=`` for ``worktree.prepare``: a verify kind starts at its parent's
-    ``output_commit`` metadata (SPEC §7.3). An existing worktree ignores
-    ``start`` (``worktree.prepare`` just reuses it), and any other kind keeps
-    ``worktree.prepare``'s own ``main`` default.
+    """``start=`` for ``worktree.prepare``: a bead of a stage declaring ``verifies``
+    starts at its parent's ``output_commit`` metadata (SPEC §7.3). An existing
+    worktree ignores ``start`` (``worktree.prepare`` just reuses it), and any
+    stage with no ``verifies`` keeps ``worktree.prepare``'s own ``main`` default.
 
     Preflight (``_check_verify_worktree_start``) already refuses a fresh
     verify worktree with no such metadata in every production path (it is
@@ -1559,7 +1580,7 @@ def _verify_start_kwargs(
     to ``main`` (round-1-fix item 2); it is defense in depth for a caller
     that bypasses preflight.
     """
-    if not bead.kind.startswith("verify") or not bead.parent:
+    if stage.verifies is None or not bead.parent:
         return {}
     if (hub / worktrees_rel / bead.id).exists():
         return {}
@@ -1864,7 +1885,9 @@ def _run_one_inner(
                         pass
 
         try:
-            verify_kwargs = _verify_start_kwargs(hub, cfg.project.worktrees, beads, bead)
+            verify_kwargs = _verify_start_kwargs(
+                hub, cfg.project.worktrees, beads, bead, cfg.stages.get(bead.kind)
+            )
         except VerifyStartError as exc:
             print(str(exc), file=sys.stderr)
             return 2
@@ -2318,6 +2341,7 @@ def preflight_errors(
     ctx = preflight_mod.PreflightContext(
         hub=hub,
         memory_has=memory_has if memory_has is not None else (lambda key: False),
+        stages=config.stages,
         runs_rel=config.project.runs,
         units_dir=config.project.units,
         worktrees_rel=config.project.worktrees,

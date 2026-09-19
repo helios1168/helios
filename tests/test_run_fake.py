@@ -24,6 +24,7 @@ from helios import beads as beads_mod
 from helios import config as config_mod
 from helios import envelope as envelope_mod
 from helios import run as run_mod
+from helios import stageset
 from helios import worktree as worktree_mod
 from helios.harness import get as harness_get
 from helios.harness.base import LaunchSpec
@@ -452,7 +453,7 @@ def test_j_writeback_twice_adds_no_duplicates(
     before = list(beads.comments("b1"))
     env = read_envelope(hub, "b1", 1)
     plan = beads_mod.plan_writeback(
-        attempt_id="b1#1", bead_kind="impl", harness="fake",
+        attempt_id="b1#1", gate="report", harness="fake",
         session_id=env["session_id"], worktree="wt", attempt=1,
         execution_status="completed", verdict=None,
         output_commit=env["output_commit"], report_status="done",
@@ -640,6 +641,65 @@ def test_blocked_report_sets_blocked_state(tmp_path: Path, monkeypatch) -> None:
                          config=config_mod.load(hub), harness_override="fake")
     assert rc == 3
     assert beads.states["b1"]["run"] == "blocked"
+
+
+def test_gate_none_exits_zero_and_closes_without_judging_report_status(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A stage whose gate is `none` (frame, survey, model, report, remember today)
+    is judged on neither report status nor verdict: exit 0 and close follow only
+    execution completing with passing checks, unlike `test_blocked_report_sets_
+    blocked_state` above where the same `blocked` report under gate `report`
+    exits 3 and stays open.
+    """
+    hub = make_hub(tmp_path)
+    (hub / "skills" / "solo").mkdir(parents=True)
+    (hub / "skills" / "solo" / "SKILL.md").write_text(
+        "---\nname: solo\n---\n\n# Solo bead\n\nDo the work.\n"
+    )
+    cfg = config_mod.Config(
+        hub=hub,
+        stages=stageset.StageSet((
+            stageset.StageSpec(
+                id="solo", author="implement", gate="none",
+                requires=frozenset({"files", "test"}),
+            ),
+        )),
+    )
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="solo", files=["src/"],
+        test="mkdir -p src && echo hi > src/out.txt && exit 0")])
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "blocked", "summary": "s"}}))
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 0
+    assert "b1" in beads.closed
+    env = read_envelope(hub, "b1", 1)
+    assert env["report"]["status"] == "blocked"
+    assert "verdict" not in beads.beads["b1"].metadata
+
+
+def test_preflight_errors_uses_hub_declared_stages(tmp_path: Path) -> None:
+    """A hub declaring its own stage set is preflighted against its own stages,
+    not the shipped research set (`stageset.research()` is `PreflightContext`'s
+    default, a trap `preflight_errors` must not fall into). `task` is not a
+    research stage id, so before the fix this would fail with `'task' is not
+    a declared stage`.
+    """
+    hub = make_hub(tmp_path)
+    (hub / ".agents").mkdir()
+    (hub / ".agents" / "workflow.toml").write_text(
+        '[[stage]]\nid = "task"\nauthor = "implement"\nrequires = ["files"]\n'
+    )
+    (hub / "skills" / "task").mkdir(parents=True)
+    (hub / "skills" / "task" / "SKILL.md").write_text(
+        "---\nname: task\n---\n\n# Task bead\n\nDo it.\n"
+    )
+    cfg = config_mod.load(hub)
+    beads = beads_mod.FakeBeads([beads_mod.Bead(id="b1", kind="task", files=["src/"])])
+    errors = run_mod.preflight_errors(["b1"], hub=hub, beads=beads, config=cfg)
+    assert errors == []
 
 
 def test_missing_skill_is_preflight(tmp_path: Path, monkeypatch) -> None:
@@ -999,6 +1059,40 @@ def test_pre_staged_unowned_never_committed(
     assert subprocess.run(
         ["git", "show", "HEAD:README.md"], cwd=wt, check=True,
         capture_output=True, text=True).stdout == "hi\n"
+
+
+def test_ownership_none_commits_a_path_no_files_entry_matches(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Under ownership `none`, every changed path passes ownership, unlike
+    the default `files` mode `test_pre_staged_unowned_never_committed` covers
+    above, where an unlisted path is rejected and never committed.
+    """
+    hub = make_hub(tmp_path)
+    cfg = config_mod.Config(
+        hub=hub,
+        stages=stageset.StageSet((
+            stageset.StageSpec(
+                id="impl", author="implement", gate="report", ownership="none",
+                requires=frozenset({"files", "test"}),
+            ),
+        )),
+    )
+    beads = beads_mod.FakeBeads([beads_mod.Bead(
+        id="b1", kind="impl", files=[],
+        test="mkdir -p random && echo hi > random/out.txt && exit 0")])
+    set_fake(monkeypatch, write_script(
+        tmp_path, {"exit_code": 0, "stdout": "x", "session_id": "s1",
+                   "report": {"status": "done", "summary": "ok"}}))
+    rc = run_mod.run_one("b1", hub=hub, beads=beads, config=cfg, harness_override="fake")
+    assert rc == 0
+    env = read_envelope(hub, "b1", 1)
+    assert any(c["name"] == "ownership" and c["passed"] for c in env["checks"])
+    wt = hub / ".claude" / "worktrees" / "b1"
+    tree = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=wt, check=True,
+        capture_output=True, text=True).stdout.splitlines()
+    assert "random/out.txt" in tree
 
 
 def test_pre_staged_confidential_never_committed(

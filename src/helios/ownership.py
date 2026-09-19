@@ -2,19 +2,21 @@
 
 Changed paths are the tracked changes since ``base_commit`` (renames listed
 on both sides) plus untracked files, all NUL separated so non-ASCII paths
-stay unquoted. Each path must match a ``files`` entry or start with a prefix
-in ``project.always_allowed``. A ``files`` entry ending in ``/`` covers
-everything below that directory. Any other entry is a glob matched against
-the whole path: ``*`` and ``?`` never match ``/``, ``**`` matches any number
-of path segments, ``[...]`` is a character class that never matches ``/`` and
-is negated by a leading ``!``. So ``src/*.py`` owns ``src/a.py`` but not
-``src/sub/a.py``. Verify kinds may touch only
-``<verify_artifacts>/<unit>/``. Always rejected, whatever the globs say:
-``.beads/``, ``.helios/``, ``.agents/``, the memory export directory, and
-anything matching ``project.confidential``. A confidential glob without ``/``
-matches the last path segment at any depth, so ``*.pem`` matches
-``keys/a.pem``. An untracked symlink whose path matches a
-``project.link_into_worktrees`` glob is not a change.
+stay unquoted. Which paths a bead may own follows its stage's ownership mode
+(SPEC §3.1): under ``files``, each path must match a ``files`` entry or start
+with a prefix in ``project.always_allowed`` (a ``files`` entry ending in
+``/`` covers everything below that directory; any other entry is a glob
+matched against the whole path, where ``*`` and ``?`` never match ``/``,
+``**`` matches any number of path segments, ``[...]`` is a character class
+that never matches ``/`` and is negated by a leading ``!``, so ``src/*.py``
+owns ``src/a.py`` but not ``src/sub/a.py``); under ``artifacts``, only
+``<verify_artifacts>/<unit>/`` is owned; under ``none``, every path passes
+this test. Always rejected, whatever the mode: ``.beads/``, ``.helios/``,
+``.agents/``, the memory export directory, and anything matching
+``project.confidential``. A confidential glob without ``/`` matches the last
+path segment at any depth, so ``*.pem`` matches ``keys/a.pem``. An untracked
+symlink whose path matches a ``project.link_into_worktrees`` glob is not a
+change.
 """
 
 from __future__ import annotations
@@ -136,14 +138,18 @@ def check(
     base_commit: str,
     files: list[str],
     always_allowed: tuple[str, ...] = ("tests/",),
-    kind: str = "impl",
+    mode: str = "files",
     verify_artifacts: str = "tools/verify",
     unit: str | None = None,
     confidential: tuple[str, ...] = (),
     memory_export_dir: str = ".helios/memories",
     link_into_worktrees: tuple[str, ...] = (),
 ) -> OwnershipResult:
-    """Sort the changed paths into allowed and rejected (SPEC §7.4)."""
+    """Sort the changed paths into allowed and rejected (SPEC §7.4).
+
+    ``mode`` is the bead's stage's ownership mode, one of
+    ``stageset.OWNERSHIP_MODES``.
+    """
     rejected_prefixes = (*ALWAYS_REJECTED, memory_export_dir.rstrip("/") + "/")
     allowed: list[str] = []
     rejected: list[str] = []
@@ -154,12 +160,15 @@ def check(
         if _matches_confidential(path, confidential):
             rejected.append(path)
             continue
-        if kind.startswith("verify"):
+        if mode == "artifacts":
             scope = f"{verify_artifacts.rstrip('/')}/{unit}/" if unit else None
             if scope is not None and _is_prefix_match(path, scope):
                 allowed.append(path)
             else:
                 rejected.append(path)
+            continue
+        if mode == "none":
+            allowed.append(path)
             continue
         if _matches_any(path, files) or any(
             _is_prefix_match(path, prefix) for prefix in always_allowed
