@@ -33,7 +33,8 @@ src/helios/              the CLI package
   commands/<name>.py     one module per subcommand
   envelope.py            result contracts (§4)
   harness/base.py        adapter interface (§6); one module per harness
-  templates/             workflow.toml, unit.md; package data, ships inside the wheel
+  templates/__init__.py  template lookup; workflow.toml and unit.md sit beside it as
+                         package data, so they ship inside the wheel
 schemas/                 generated JSON Schemas; never edit by hand
 skills/<name>/SKILL.md   stage skills, Agent Skills format; skills/report-block.md shared
 templates/               backends.toml shipped to projects
@@ -74,9 +75,12 @@ arguments and calls it.
   `BaseException`, and the command prints `helios: cannot import <module>: <exception
   type>: <message>` to stderr and exits 2.
 - `helios.templates.path(name)` returns `src/helios/templates/<name>` and raises
-  `FileNotFoundError` naming the path. The directory is package data, resolved beside the module
-  the way `stageset.RESEARCH_PATH` resolves `stagesets/research.toml`, so it ships inside the
-  wheel rather than depending on a repository checkout above the package.
+  `FileNotFoundError` naming the path. The templates are package data inside the `templates`
+  package itself, resolved from `Path(__file__).parent` the way `stageset.RESEARCH_PATH`
+  resolves `stagesets/research.toml`, so they ship inside the wheel rather than depending on a
+  repository checkout above the package. The lookup lives in `templates/__init__.py` rather
+  than in a `templates.py` beside a `templates/` data directory, because a module and a
+  directory of the same name shadow each other.
 
 ## 3. Stages
 

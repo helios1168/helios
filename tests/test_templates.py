@@ -27,28 +27,27 @@ def test_path_raises_for_missing_template() -> None:
 def test_path_resolves_from_the_package_alone(tmp_path: Path) -> None:
     """Prove the lookup needs nothing above the package directory, the way a wheel install is.
 
-    Builds a stand-in for an installed copy: a directory under an unrelated temp path holding
-    only ``templates.py`` and its ``templates/`` sibling, with no repository checkout above it.
-    The pre-fix implementation read ``Path(__file__).resolve().parents[2] / "templates"``, which
-    for a module at ``<stand-in>/helios/templates.py`` lands on ``tmp_path``, not the stand-in's
-    own ``templates/`` directory, so it would raise FileNotFoundError against this layout. A test
-    that only checked the file exists in the checkout would have passed before the fix too.
+    Builds a stand-in for an installed copy: a package directory under an unrelated temp path
+    holding only ``__init__.py`` and ``workflow.toml``, with no repository checkout above it. The
+    pre-fix implementation read ``Path(__file__).resolve().parents[2] / "templates"``, which for a
+    module at ``<tmp>/site-packages/helios/templates/__init__.py`` lands on ``site-packages``, not
+    the package's own directory, so it raises FileNotFoundError against this layout. A test that
+    only checked the file exists in the checkout would have passed before the fix too.
     """
     # Located independently of helios.templates.path, so the setup does not depend on the
     # implementation under test.
     src_helios = Path(__file__).resolve().parents[1] / "src" / "helios"
 
-    package_dir = tmp_path / "site-packages" / "helios"
-    templates_dir = package_dir / "templates"
-    templates_dir.mkdir(parents=True)
-    shutil.copyfile(src_helios / "templates" / "workflow.toml", templates_dir / "workflow.toml")
+    package_dir = tmp_path / "site-packages" / "helios" / "templates"
+    package_dir.mkdir(parents=True)
+    shutil.copyfile(src_helios / "templates" / "workflow.toml", package_dir / "workflow.toml")
 
-    module_file = package_dir / "templates.py"
-    shutil.copyfile(src_helios / "templates.py", module_file)
+    module_file = package_dir / "__init__.py"
+    shutil.copyfile(src_helios / "templates" / "__init__.py", module_file)
 
-    # Nothing two directories above the stand-in module is a checkout with a templates/ dir;
-    # that is exactly what the pre-fix parents[2] lookup depended on.
-    assert not (tmp_path / "templates").exists()
+    # Nothing two directories above the stand-in module holds a templates/ directory; that is
+    # exactly what the pre-fix parents[2] lookup depended on.
+    assert not (tmp_path / "site-packages" / "templates").exists()
 
     spec = importlib.util.spec_from_file_location("helios_templates_standin", module_file)
     assert spec is not None and spec.loader is not None
@@ -56,7 +55,7 @@ def test_path_resolves_from_the_package_alone(tmp_path: Path) -> None:
     spec.loader.exec_module(standin)
 
     result = standin.path("workflow.toml")
-    assert result == templates_dir / "workflow.toml"
+    assert result == package_dir / "workflow.toml"
     assert result.is_file()
 
 
