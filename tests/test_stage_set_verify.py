@@ -272,13 +272,13 @@ def test_candidate_selection_and_learned_skip_an_empty_kind() -> None:
 def test_run_one_refuses_an_empty_kind_before_anything_is_created(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """Verdict, no defect found in the outcome, one in the wording.
+    """Verdict, no defect found, in outcome or wording: closed by the finding 2 fix.
 
-    ``run_one`` exits 2 and creates no attempt, but the reason it prints is
-    ``skills//SKILL.md does not exist in the hub``: ``_missing_skill`` builds
-    ``hub / "skills" / kind / "SKILL.md"``, and an empty kind collapses that to
-    ``hub/skills/SKILL.md``. Every ``helios run`` path also runs preflight, which says
-    the real reason, so this is a wording defect rather than a wrong outcome.
+    ``run_one`` exits 2 and creates no attempt. Before the fix the printed reason was
+    ``skills//SKILL.md does not exist in the hub``, the wording defect described below,
+    because ``_missing_skill`` builds ``hub / "skills" / kind / "SKILL.md"`` and an empty
+    kind collapses that to ``hub/skills/SKILL.md``. Now the stage check runs first, so
+    the reason is always that the kind is undeclared, the same wording preflight uses.
     """
     hub = _hub(tmp_path)
     _fake(monkeypatch, tmp_path, {"report": {"status": "done", "summary": "ok"}})
@@ -288,7 +288,7 @@ def test_run_one_refuses_an_empty_kind_before_anything_is_created(
     )
     assert code == 2
     assert not (hub / ".helios" / "runs" / "hel-x1").exists()
-    assert "skills//SKILL.md" in capsys.readouterr().err
+    assert "preflight: hel-x1: '' is not a declared stage; declared: " in capsys.readouterr().err
 
 
 def test_run_one_refuses_an_undeclared_kind_behind_a_hub_skill_file(
@@ -351,18 +351,14 @@ HIDDEN_FORMS = {
     'default_kind = "imp" "l"': {"impl"},
 }
 
-
-@pytest.mark.parametrize("line,want", sorted(HIDDEN_FORMS.items()))
-def test_quoted_literal_rule_sees_every_hardcoded_stage_id(line: str, want: set[str]) -> None:
-    """DEFECT, proved: the rule only sees an id that is a whole quoted literal on one line.
-
-    ``_quoted_stage_ids_in`` matches ``(["'])<id>\\1``, so a stage id loses its guard as
-    soon as it shares a literal with another word (``"frame model report".split()``) or
-    is written as two adjacent literals, which Python concatenates at compile time. Both
-    are ordinary Python, and both are how a hardcoded stage id gets back into a core
-    module with this guard still green.
-    """
-    assert boundary._quoted_stage_ids_in(line) == want, line
+# DEFECT, closed: the old rule was ``_quoted_stage_ids_in``, a per-line regex matching
+# ``(["'])<id>\1``, so a stage id lost its guard as soon as it shared a literal with another
+# word (``"frame model report".split()``) or was written as two adjacent literals, which
+# Python concatenates at compile time. Both are ordinary Python, and both were how a
+# hardcoded stage id got back into a core module with the guard still green. The fix deletes
+# that rule from tests/test_stages.py rather than patch it, so there is nothing left to call
+# here; ``test_stronger_rule_catches_every_hidden_form`` below proves its replacement sees
+# every one of these forms, on the same four inputs this dict recorded the finding with.
 
 
 def test_core_module_list_covers_every_core_module() -> None:
