@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
+import subprocess
+import sys
 import textwrap
 import threading
 import time
@@ -105,6 +108,47 @@ def test_backends_project_file_wins(tmp_path: Path) -> None:
     hub = make_hub(tmp_path, "bk", BASE_PROG, "")
     backends = claims_lib.load_backends(hub)
     assert set(backends) == {"prover", "meter", "manual"}
+
+
+def test_default_backends_path_resolves_from_the_package_alone(tmp_path: Path) -> None:
+    """Prove default_backends_path needs nothing above the helios package, the way a wheel
+    install is. Same defect and proof shape as
+    tests/test_templates.py::test_path_resolves_from_the_package_alone: the pre-fix
+    ``parents[3] / "templates" / "backends.toml"`` only reaches the repository's own
+    templates/ directory from a checkout, and is absent once helios is installed from a wheel.
+
+    Builds a stand-in installed layout under tmp_path: a copy of just the modules
+    default_backends_path's import chain needs (program, envelope, templates, claims), with
+    nothing repository shaped above it. It runs in a subprocess, importing this copy as
+    "helios", so the real helios package already imported by this test process cannot mask
+    the bug.
+    """
+    src_helios = Path(__file__).resolve().parents[1] / "src" / "helios"
+    site_packages = tmp_path / "site-packages"
+    package_dir = site_packages / "helios"
+    package_dir.mkdir(parents=True)
+    shutil.copyfile(src_helios / "__init__.py", package_dir / "__init__.py")
+    shutil.copyfile(src_helios / "program.py", package_dir / "program.py")
+    shutil.copyfile(src_helios / "envelope.py", package_dir / "envelope.py")
+    shutil.copytree(src_helios / "templates", package_dir / "templates")
+    shutil.copytree(src_helios / "claims", package_dir / "claims")
+
+    # Nothing three directories above the stand-in claims module holds a templates/
+    # directory; that is exactly what the pre-fix parents[3] lookup depended on.
+    assert not (site_packages / "templates").exists()
+
+    probe = "from helios.claims import default_backends_path\nprint(default_backends_path())"
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(site_packages)},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    resolved = Path(result.stdout.strip())
+    assert resolved == package_dir / "templates" / "backends.toml"
+    assert resolved.is_file()
 
 
 def test_validate_problems() -> None:
