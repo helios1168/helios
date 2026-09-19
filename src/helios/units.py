@@ -24,36 +24,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from helios import harness, stageset
 from helios.beads import Bead
-from helios.config import Config, resolve_harness
+from helios.config import Config, resolve_harness, spec_for_kind
 from helios.templates import path as template_path
-
-STAGE_ORDER: tuple[str, ...] = (
-    "frame",
-    "survey",
-    "model",
-    "verify-math",
-    "impl",
-    "verify-code",
-    "validate",
-    "verify-validate",
-    "report",
-)
-"""Row order of the SPEC §3 table, without ``remember`` (it gets no bead)."""
-
-_VERIFY_STAGES: frozenset[str] = frozenset(
-    {"verify-math", "verify-code", "verify-validate"}
-)
-_NEEDS_FILES: frozenset[str] = frozenset({"impl", "validate"})
-_VERIFY_AGENT_KEY: dict[str, str] = {
-    "verify-math": "verify_math",
-    "verify-code": "verify_code",
-    "verify-validate": "verify_validate",
-}
 
 _UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _PLACEHOLDER_RE = re.compile(r"\{(unit|title|stages)\}")
-_USABLE_AUTHOR_RE = re.compile(r"^(claude|codex|opencode|agy)(:[^\s]+)?$")
 
 
 class UnitNewError(Exception):
@@ -148,24 +125,19 @@ def validate_unit_id(unit: str) -> None:
         )
 
 
-def _parent_index(stages: list[str], index: int) -> int | None:
-    """Index of the nearest earlier non-verify stage (SPEC §10.2 step 4)."""
+def _parent_index(config: Config, requested: list[str], index: int) -> int | None:
+    """Index within the requested ``--stages`` list of the stage this one verifies.
+
+    The parent is ``StageSet.parent_of`` the stage at ``index``; it counts only
+    when it also appears earlier in the requested list (SPEC §10.2 step 4).
+    """
+    parent_id = config.stages.parent_of(requested[index])
+    if parent_id is None:
+        return None
     for j in range(index - 1, -1, -1):
-        if stages[j] not in _VERIFY_STAGES:
+        if requested[j] == parent_id:
             return j
     return None
-
-
-def _spec_for_stage(config: Config, stage: str) -> str:
-    """The configured agent spec for a stage (SPEC §10.2 step 3)."""
-    agents = config.agents
-    if stage in ("frame", "survey", "report"):
-        return agents.orchestrate
-    if stage == "model":
-        return agents.model
-    if stage in ("impl", "validate"):
-        return agents.implement
-    return getattr(agents, _VERIFY_AGENT_KEY[stage])
 
 
 def _resolve_author(
@@ -181,9 +153,9 @@ def _resolve_author(
             spec, author=parent_author, verify_order=config.agents.verify_order
         )
     except ValueError:
-        harness = parent_author.partition(":")[0]
+        harness_name = parent_author.partition(":")[0]
         raise UnitNewError(
-            f"no harness in agents.verify_order differs from {harness}"
+            f"no harness in agents.verify_order differs from {harness_name}"
         ) from None
 
 
@@ -198,6 +170,19 @@ def _recorded_author(bead: Bead) -> str | None:
         return bead.author
     value = bead.metadata.get("author")
     return value if isinstance(value, str) else None
+
+
+def _usable_author(recorded: str) -> bool:
+    """True when ``recorded``'s harness, before any ``:``, is one the adapter
+    registry knows (SPEC §10.2 step 3). ``harness.get`` is the registry's only
+    lookup, so asking it is what "the registry knows a harness" means; a
+    harness added there later needs no matching change here.
+    """
+    try:
+        harness.get(recorded.partition(":")[0])
+    except ValueError:
+        return False
+    return True
 
 
 def _display_author(bead: Bead) -> str:
@@ -296,6 +281,7 @@ def _validate(
     hub: Path,
     units: str,
     unit_path: Path,
+    config: Config,
 ) -> tuple[list[str], list[str] | None]:
     """Check every SPEC §10.2 step 1 rule before anything is written."""
     validate_unit_id(unit)
@@ -304,31 +290,33 @@ def _validate(
         raise UnitNewError("--stages has an empty item")
     if len(set(stages)) != len(stages):
         raise UnitNewError("--stages has duplicate items")
-    order = {stage: index for index, stage in enumerate(STAGE_ORDER)}
+    declared = config.stages
     for stage in stages:
-        if stage == "remember":
+        spec = declared.find(stage)
+        if spec is None:
             raise UnitNewError(
-                '"remember" never blocks so it gets no bead (SPEC §10.2 step 1)'
+                f"unknown stage {stage!r}; declared: {', '.join(declared.ids)}"
             )
-        if stage not in order:
-            raise UnitNewError(f"unknown stage {stage!r}")
+        if not spec.scaffold:
+            raise UnitNewError(f"stage {stage} cannot be scaffolded")
     for earlier, later in zip(stages, stages[1:]):
-        if order[later] <= order[earlier]:
+        if declared.index(later) <= declared.index(earlier):
             raise UnitNewError(
                 f"--stages are not in stage order: {later!r} comes after {earlier!r}"
             )
     for index, stage in enumerate(stages):
-        if stage in _VERIFY_STAGES and _parent_index(stages, index) is None:
+        if stage in declared.verify_ids and _parent_index(config, stages, index) is None:
             raise UnitNewError(f"{stage} has no earlier stage to verify")
     files: list[str] | None = None
-    if any(stage in _NEEDS_FILES for stage in stages):
+    if any(declared.get(stage).demands("files") for stage in stages):
         if files_raw is None:
-            raise UnitNewError("--files is required when impl or validate is present")
+            raise UnitNewError("--files is required when a listed stage requires files")
         files = files_raw.split(",")
         if any(item == "" for item in files):
             raise UnitNewError("--files has an empty item")
+    if any(declared.get(stage).demands("test") for stage in stages):
         if test is None or test.strip() == "":
-            raise UnitNewError("--test is required when impl or validate is present")
+            raise UnitNewError("--test is required when a listed stage requires test")
     _check_paths(hub=hub, units=units, unit_path=unit_path)
     return stages, files
 
@@ -365,6 +353,7 @@ def create_unit(
         hub=config.hub,
         units=units_dir,
         unit_path=unit_path,
+        config=config,
     )
     reused: list[Bead | None] = []
     for stage in stage_ids:
@@ -379,17 +368,18 @@ def create_unit(
                 f"more than one open bead for stage {stage}: {names}"
             )
         reused.append(candidates[0] if candidates else None)
+    verify_ids = config.stages.verify_ids
     authors: list[str] = []
     for index, stage in enumerate(stage_ids):
-        spec = _spec_for_stage(config, stage)
-        if stage in _VERIFY_STAGES:
-            if spec == "other":
-                parent = _parent_index(stage_ids, index)
+        spec = spec_for_kind(config, stage)
+        if stage in verify_ids:
+            if spec == stageset.OTHER:
+                parent = _parent_index(config, stage_ids, index)
                 assert parent is not None  # refused by _validate
                 parent_bead = reused[parent]
                 if parent_bead is not None:
                     recorded = _recorded_author(parent_bead)
-                    if recorded is None or _USABLE_AUTHOR_RE.fullmatch(recorded) is None:
+                    if recorded is None or not _usable_author(recorded):
                         raise UnitNewError(
                             f"parent bead {parent_bead.id} has no usable author"
                         )
@@ -404,9 +394,10 @@ def create_unit(
             else:
                 authors.append(spec)
         else:
-            if spec == "other":
+            if spec == stageset.OTHER:
                 raise UnitNewError(
-                    f"agent spec other is valid only for verify stages, not {stage}"
+                    f"agent spec other is valid only for a stage that verifies "
+                    f"another stage, not {stage}"
                 )
             authors.append(spec)
     bead_ids: list[str] = []
@@ -414,19 +405,21 @@ def create_unit(
         hit = reused[index]
         if hit is not None:
             bead_id = hit.id
-            if stage in _VERIFY_STAGES:
-                parent = _parent_index(stage_ids, index)
+            if stage in verify_ids:
+                parent = _parent_index(config, stage_ids, index)
                 assert parent is not None  # refused by _validate
                 if hit.parent != bead_ids[parent]:
                     beads.set_metadata(bead_id, {"parent": bead_ids[parent]})
         else:
+            stage_spec = config.stages.get(stage)
             metadata: dict[str, Any] = {"unit": unit, "kind": stage, "author": author}
-            if stage in _NEEDS_FILES:
+            if stage_spec.demands("files"):
                 assert file_list is not None  # required by _validate
                 metadata["files"] = file_list
+            if stage_spec.demands("test"):
                 metadata["test"] = test
-            if stage in _VERIFY_STAGES:
-                parent = _parent_index(stage_ids, index)
+            if stage in verify_ids:
+                parent = _parent_index(config, stage_ids, index)
                 assert parent is not None  # refused by _validate
                 metadata["parent"] = bead_ids[parent]
             bead_id = beads.create(
