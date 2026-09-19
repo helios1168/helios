@@ -21,6 +21,7 @@ from helios.beads import (
     comment_has,
     decode_metadata,
     plan_writeback,
+    should_close,
 )
 
 HEL_A6Z = "hel-a6z"
@@ -91,7 +92,7 @@ def test_replay_skips_existing_kind_and_marker() -> None:
     fake = FakeBeads([Bead(id="b1")])
     plan = plan_writeback(
         attempt_id="b1#1",
-        bead_kind="impl",
+        gate="report",
         harness="codex",
         session_id="s1",
         worktree="/wt",
@@ -115,11 +116,39 @@ def test_replay_skips_existing_kind_and_marker() -> None:
     assert len(fake.comments("b1")) == 3
 
 
+def test_should_close_follows_gate() -> None:
+    """SPEC §7.5: `report` needs a `done` report, `verdict` additionally needs
+    `verified`, `none` needs neither and closes on execution plus checks alone.
+    """
+    base = dict(execution_status="completed", checks_passed=True)
+    # gate "report": needs report done; a non-done status does not close.
+    assert should_close(gate="report", report_status="done", verdict=None, **base)
+    assert not should_close(gate="report", report_status="blocked", verdict=None, **base)
+    # gate "verdict": needs report done and verdict verified.
+    assert should_close(gate="verdict", report_status="done", verdict="verified", **base)
+    assert not should_close(
+        gate="verdict", report_status="done", verdict="inconclusive", **base
+    )
+    assert not should_close(gate="verdict", report_status="blocked", verdict="verified", **base)
+    # gate "none": closes on execution plus checks, whatever the report status.
+    assert should_close(gate="none", report_status="blocked", verdict=None, **base)
+    assert should_close(gate="none", report_status=None, verdict=None, **base)
+    # Every gate still needs execution completed and checks passed.
+    assert not should_close(
+        gate="none", execution_status="crashed", report_status=None,
+        checks_passed=True, verdict=None,
+    )
+    assert not should_close(
+        gate="none", execution_status="completed", report_status=None,
+        checks_passed=False, verdict=None,
+    )
+
+
 def test_non_closing_plan_records_run_state() -> None:
     fake = FakeBeads([Bead(id="b2")])
     plan = plan_writeback(
         attempt_id="b2#1",
-        bead_kind="verify-code",
+        gate="verdict",
         harness="claude",
         session_id=None,
         worktree="/wt",
@@ -149,7 +178,7 @@ def test_event_comment_writes_dash_for_missing_status_and_summary() -> None:
     """
     plan = plan_writeback(
         attempt_id="b#1",
-        bead_kind="impl",
+        gate="report",
         harness="codex",
         session_id=None,
         worktree="/wt",
@@ -176,7 +205,7 @@ def test_event_comment_replay_recognizes_old_format_marker() -> None:
     fake.add_comment("b1", "event: [b1#1] crashed None None")
     plan = plan_writeback(
         attempt_id="b1#1",
-        bead_kind="impl",
+        gate="report",
         harness="codex",
         session_id=None,
         worktree="/wt",

@@ -179,7 +179,7 @@ class Writeback:
 def plan_writeback(
     *,
     attempt_id: str,
-    bead_kind: str,
+    gate: str,
     harness: str,
     session_id: str | None,
     worktree: str,
@@ -220,7 +220,7 @@ def plan_writeback(
     if question:
         comments.append(f"question: [{attempt_id}] {question}")
     close = should_close(
-        bead_kind,
+        gate=gate,
         execution_status=execution_status,
         report_status=report_status,
         checks_passed=checks_passed,
@@ -237,17 +237,27 @@ def plan_writeback(
 
 
 def should_close(
-    bead_kind: str,
     *,
+    gate: str,
     execution_status: str,
     report_status: str | None,
     checks_passed: bool,
     verdict: str | None,
 ) -> bool:
-    """Close rule of SPEC §7.5: done plus passing checks, plus verified for verify."""
-    if execution_status != "completed" or report_status != "done" or not checks_passed:
+    """Close rule of SPEC §7.5, keyed on the bead's stage ``gate``.
+
+    Under ``report`` a bead closes when execution completed, the report is
+    ``done`` and all checks passed. Under ``verdict`` it additionally needs
+    the overall verdict ``verified``. Under ``none`` it closes when execution
+    completed and the checks passed, without looking at the report status.
+    """
+    if execution_status != "completed" or not checks_passed:
         return False
-    if bead_kind.startswith("verify"):
+    if gate == "none":
+        return True
+    if report_status != "done":
+        return False
+    if gate == "verdict":
         return verdict == "verified"
     return True
 
