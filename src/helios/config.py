@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from helios import stageset
+
 WORKFLOW_REL = Path(".agents/workflow.toml")
 
 
@@ -25,8 +27,6 @@ class ConfigError(ValueError):
     prints it with a ``helios: `` prefix and exits 2 instead of showing a traceback (SPEC §2.3).
     It subclasses ``ValueError`` because the handlers written before it catch that.
     """
-
-_VERIFY_KINDS = ("verify-code", "verify-math", "verify-validate")
 
 _STR = "str"
 _OPT_STR = "opt_str"
@@ -49,15 +49,6 @@ _PROJECT_TYPES: dict[str, str] = {
     "claims": _OPT_STR,
 }
 
-_AGENTS_TYPES: dict[str, str] = {
-    "orchestrate": _STR,
-    "implement": _STR,
-    "model": _STR,
-    "verify_code": _STR,
-    "verify_math": _STR,
-    "verify_validate": _STR,
-    "verify_order": _STR_LIST,
-}
 
 _HARNESS_TYPES: dict[str, str] = {
     "binary": _STR,
@@ -88,7 +79,7 @@ _TELEMETRY_TYPES: dict[str, str] = {
     "service_name": _STR,
 }
 
-_SECTIONS = {"project", "agents", "harness", "control", "memory", "telemetry", "tolerance"}
+_SECTIONS = {"project", "agents", "harness", "control", "memory", "telemetry", "tolerance", "stage"}
 
 _CHECK_TYPES: dict[str, str] = {
     "name": _STR,
@@ -127,15 +118,74 @@ class ProjectConfig:
     claims: str | None = None
 
 
-@dataclass(frozen=True)
+#: The roles the shipped research stage set names, with their defaults (SPEC §5).
+DEFAULT_ROLES: dict[str, str] = {
+    "orchestrate": "claude",
+    "implement": "codex",
+    "model": "claude",
+    "verify_code": "other",
+    "verify_math": "other",
+    "verify_validate": "other",
+}
+
+
+@dataclass(frozen=True, init=False)
 class AgentsConfig:
-    orchestrate: str = "claude"
-    implement: str = "codex"
-    model: str = "claude"
-    verify_code: str = "other"
-    verify_math: str = "other"
-    verify_validate: str = "other"
-    verify_order: tuple[str, ...] = ("claude", "codex", "opencode", "agy")
+    """``[agents]`` (SPEC §5). Open keyed: any key is a role a stage's ``author`` may name.
+
+    The six documented roles keep their defaults and their attribute names, because the shipped
+    research stage set names them, but a hub may declare any role its own stages ask for. A role
+    may be passed by name, so ``AgentsConfig(verify_code="claude")`` still reads as it did when
+    the six were fields.
+    """
+
+    roles: dict[str, str]
+    verify_order: tuple[str, ...]
+
+    def __init__(
+        self,
+        roles: dict[str, str] | None = None,
+        verify_order: tuple[str, ...] | list[str] = ("claude", "codex", "opencode", "agy"),
+        **named_roles: str,
+    ) -> None:
+        merged = dict(DEFAULT_ROLES)
+        merged.update(roles or {})
+        merged.update(named_roles)
+        object.__setattr__(self, "roles", merged)
+        object.__setattr__(self, "verify_order", tuple(verify_order))
+
+    def spec(self, role: str) -> str:
+        """The agent spec configured for a role, or raise ``KeyError`` naming the declared roles."""
+        try:
+            return self.roles[role]
+        except KeyError:
+            raise KeyError(
+                f"{role!r} is not a key of [agents]; declared: {', '.join(sorted(self.roles))}"
+            ) from None
+
+    @property
+    def orchestrate(self) -> str:
+        return self.roles.get("orchestrate", DEFAULT_ROLES["orchestrate"])
+
+    @property
+    def implement(self) -> str:
+        return self.roles.get("implement", DEFAULT_ROLES["implement"])
+
+    @property
+    def model(self) -> str:
+        return self.roles.get("model", DEFAULT_ROLES["model"])
+
+    @property
+    def verify_code(self) -> str:
+        return self.roles.get("verify_code", DEFAULT_ROLES["verify_code"])
+
+    @property
+    def verify_math(self) -> str:
+        return self.roles.get("verify_math", DEFAULT_ROLES["verify_math"])
+
+    @property
+    def verify_validate(self) -> str:
+        return self.roles.get("verify_validate", DEFAULT_ROLES["verify_validate"])
 
 
 @dataclass(frozen=True)
@@ -186,6 +236,7 @@ class Config:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
     tolerance: dict[str, float] = field(default_factory=dict)
+    stages: stageset.StageSet = field(default_factory=stageset.research)
 
 
 def find_hub(start: Path) -> Path:
@@ -306,11 +357,23 @@ def effective_checks(project: ProjectConfig) -> tuple[CheckEntry, ...]:
 
 
 def _agents(table: dict) -> AgentsConfig:
-    _check_table(table, _AGENTS_TYPES, "agents")
-    data = dict(table)
-    if "verify_order" in data:
-        data["verify_order"] = tuple(data["verify_order"])
-    return AgentsConfig(**data)
+    """Read ``[agents]`` as roles plus ``verify_order`` (SPEC §5).
+
+    Any key other than ``verify_order`` is a role name whose value is an agent spec. A typo is
+    caught where it matters, when a stage's ``author`` names a role that is not here (§3.1).
+    """
+    if not isinstance(table, dict):
+        raise TypeError("config key 'agents' must be a table")
+    roles = dict(DEFAULT_ROLES)
+    verify_order = AgentsConfig().verify_order
+    for key, value in table.items():
+        if key == "verify_order":
+            _check_type("agents.verify_order", value, _STR_LIST)
+            verify_order = tuple(value)
+            continue
+        _check_type(f"agents.{key}", value, _STR)
+        roles[key] = value
+    return AgentsConfig(roles=roles, verify_order=verify_order)
 
 
 def _harness(table: dict) -> dict[str, HarnessConfig]:
@@ -370,10 +433,24 @@ def _load_file(hub: Path, path: Path) -> Config:
             raise ValueError(f"unknown config key {key!r}")
     project = _project(raw.get("project", {}))
     agents = _agents(raw.get("agents", {}))
+    declared = "stage" in raw
+    stages = stageset.parse(raw["stage"]) if declared else stageset.research()
+    _check_stage_authors(stages, agents)
     control_raw = _validated_table(raw.get("control", {}), _CONTROL_TYPES, "control")
     for key in ("stop_at", "confirm"):
         if key in control_raw:
             control_raw[key] = tuple(control_raw[key])
+    if declared:
+        # The research defaults name research stages, so a hub with its own stage set starts from
+        # nothing rather than from ids it never declared (SPEC §5).
+        control_raw.setdefault("until", "")
+        control_raw.setdefault("stop_at", ())
+    for stage_id in control_raw.get("stop_at", ()):
+        if stage_id not in stages:
+            raise ValueError(
+                f"control.stop_at names {stage_id!r}, which is not a declared stage; "
+                f"declared: {', '.join(stages.ids)}"
+            )
     memory_raw = _validated_table(raw.get("memory", {}), _MEMORY_TYPES, "memory")
     telemetry_raw = _validated_table(raw.get("telemetry", {}), _TELEMETRY_TYPES, "telemetry")
     telemetry = TelemetryConfig(**telemetry_raw)
@@ -388,7 +465,24 @@ def _load_file(hub: Path, path: Path) -> Config:
         memory=MemoryConfig(**memory_raw),
         telemetry=telemetry,
         tolerance=_tolerance(raw.get("tolerance", {})),
+        stages=stages,
     )
+
+
+def _check_stage_authors(stages: stageset.StageSet, agents: AgentsConfig) -> None:
+    """Every stage's ``author`` must name a role ``[agents]`` declares (SPEC §3.1).
+
+    This refusal is what replaces the closed key list on ``[agents]`` as the defence against a
+    typo: a misspelled role is caught here instead of at the moment a run needs it.
+    """
+    for stage in stages:
+        if stage.author == stageset.OTHER:
+            continue
+        if stage.author not in agents.roles:
+            raise ValueError(
+                f"stage {stage.id} author {stage.author!r} is not a key of [agents]; "
+                f"declared: {', '.join(sorted(agents.roles))}"
+            )
 
 
 def split_spec(spec: str) -> tuple[str, str | None]:
@@ -423,19 +517,16 @@ def resolve_harness(spec: str, *, author: str | None, verify_order: tuple[str, .
 
 
 def spec_for_kind(config: Config, kind: str) -> str:
-    """Return the configured agent spec for a bead kind (SPEC §5)."""
-    agents = config.agents
-    if kind in ("impl", "validate"):
-        return agents.implement
-    if kind == "model":
-        return agents.model
-    if kind == "verify-code":
-        return agents.verify_code
-    if kind == "verify-math":
-        return agents.verify_math
-    if kind == "verify-validate":
-        return agents.verify_validate
-    raise ValueError(f"unknown bead kind {kind!r}")
+    """The configured agent spec for a bead kind, through its stage (SPEC §3.1, §5)."""
+    stage = config.stages.find(kind)
+    if stage is None:
+        raise ValueError(f"unknown bead kind {kind!r}")
+    if stage.author == stageset.OTHER:
+        return stageset.OTHER
+    try:
+        return config.agents.spec(stage.author)
+    except KeyError as exc:
+        raise ValueError(f"stage {kind} author {stage.author!r} is not a key of [agents]") from exc
 
 
 def harness_for_kind(
@@ -444,7 +535,3 @@ def harness_for_kind(
     """Resolve the harness for a bead kind; ``override`` wins (SPEC §7.1 step 3)."""
     spec = override if override is not None else spec_for_kind(config, kind)
     return resolve_harness(spec, author=author, verify_order=config.agents.verify_order)
-
-
-def is_verify_kind(kind: str) -> bool:
-    return kind in _VERIFY_KINDS

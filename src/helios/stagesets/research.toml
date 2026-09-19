@@ -1,0 +1,67 @@
+# The shipped research stage set (SPEC §3.2), read when a hub declares no [[stage]] entry.
+# This file is the research pack. Editing it changes what an undeclared hub gets, so it must stay
+# row for row with the SPEC section 3.2 table; tests/test_stages.py holds that parity.
+
+[[stage]]
+id = "frame"
+author = "orchestrate"
+gate = "none"
+
+[[stage]]
+id = "survey"
+author = "orchestrate"
+gate = "none"
+
+[[stage]]
+id = "model"
+author = "model"
+gate = "none"
+
+[[stage]]
+id = "verify-math"
+author = "verify_math"
+verifies = "model"
+requires = ["unit", "parent", "model"]
+gate = "verdict"
+ownership = "artifacts"
+
+[[stage]]
+id = "impl"
+author = "implement"
+requires = ["files", "test"]
+gate = "report"
+ownership = "files"
+
+[[stage]]
+id = "verify-code"
+author = "verify_code"
+verifies = "impl"
+requires = ["unit", "parent"]
+gate = "verdict"
+ownership = "artifacts"
+
+[[stage]]
+id = "validate"
+author = "implement"
+requires = ["files", "test"]
+gate = "report"
+ownership = "files"
+
+[[stage]]
+id = "verify-validate"
+author = "verify_validate"
+verifies = "validate"
+requires = ["unit", "parent"]
+gate = "verdict"
+ownership = "artifacts"
+
+[[stage]]
+id = "report"
+author = "orchestrate"
+gate = "none"
+
+[[stage]]
+id = "remember"
+author = "orchestrate"
+gate = "none"
+scaffold = false
